@@ -8,6 +8,7 @@ import logging
 import re
 import socket
 from typing import Any
+import urllib.parse
 import urllib.request
 
 import aiohttp
@@ -18,6 +19,119 @@ FREEBOX_API_URL = "http://mafreebox.freebox.fr/api/v8/api_version"
 FREEBOX_API_IP = "http://192.168.1.254/api/v8/api_version"
 FREEBOX_M3U_URL = "http://mafreebox.freebox.fr/freeboxtv/playlist.m3u"
 
+# Channel color themes for high-contrast vector SVG logos
+CHANNEL_SVG_THEMES: dict[str, tuple[str, str, str, str, int]] = {
+    # key: (bg_color, fg_color, main_text, sub_text, font_size)
+    "tf1": ("#004CA3", "#FFFFFF", "TF1", "", 24),
+    "france 2": ("#E20025", "#FFFFFF", "2", "FRANCE", 28),
+    "france 3": ("#0067A5", "#FFFFFF", "3", "FRANCE", 28),
+    "france 4": ("#BA007C", "#FFFFFF", "4", "FRANCE", 28),
+    "france 5": ("#009E49", "#FFFFFF", "5", "FRANCE", 28),
+    "m6": ("#1A1D20", "#FFFFFF", "M6", "", 26),
+    "arte": ("#FA5000", "#FFFFFF", "arte", "", 24),
+    "c8": ("#1D70B8", "#FFFFFF", "C8", "", 24),
+    "w9": ("#822980", "#FFFFFF", "W9", "", 24),
+    "tmc": ("#0078D7", "#FFFFFF", "TMC", "", 24),
+    "tfx": ("#E6007E", "#FFFFFF", "TFX", "", 24),
+    "nrj 12": ("#E2001A", "#FFFFFF", "NRJ", "12", 22),
+    "lcp": ("#004B87", "#FFFFFF", "LCP", "SÉNAT", 22),
+    "la chaîne parlementaire": ("#004B87", "#FFFFFF", "LCP", "SÉNAT", 22),
+    "gulli": ("#7DBE00", "#FFFFFF", "gulli", "", 24),
+    "bfm tv": ("#00428A", "#FFFFFF", "BFM", "TV", 22),
+    "bfmtv": ("#00428A", "#FFFFFF", "BFM", "TV", 22),
+    "cnews": ("#1E252B", "#FFFFFF", "CNEWS", "", 18),
+    "cstar": ("#111827", "#38BDF8", "C★", "STAR", 22),
+    "gulli": ("#7DBE00", "#FFFFFF", "gulli", "", 24),
+    "tf1 séries films": ("#7B2CBF", "#FFFFFF", "TF1", "SÉRIES", 20),
+    "l'équipe": ("#ED1C24", "#FFFFFF", "L'EQ", "SPORT", 20),
+    "la chaîne l'equipe": ("#ED1C24", "#FFFFFF", "L'EQ", "SPORT", 20),
+    "6ter": ("#5C2D91", "#FFFFFF", "6ter", "", 24),
+    "rmc story": ("#0055A5", "#FFFFFF", "RMC", "STORY", 20),
+    "rmc découverte": ("#002D62", "#FFFFFF", "RMC", "DÉCOUV.", 18),
+    "chérie 25": ("#E4007D", "#FFFFFF", "chérie", "25", 20),
+    "lci": ("#003875", "#FFFFFF", "LCI", "", 24),
+    "franceinfo": ("#FFE400", "#111827", "info:", "FRANCE", 22),
+    "paris première": ("#2B2D42", "#FFFFFF", "PARIS", "1ÈRE", 18),
+    "canal+": ("#000000", "#FFFFFF", "CANAL+", "", 18),
+    "france 24": ("#0055A5", "#FFFFFF", "F24", "FRANCE", 22),
+    "euronews": ("#002D62", "#FFFFFF", "EURO", "NEWS", 20),
+    "tv5 monde": ("#009EE0", "#FFFFFF", "TV5", "MONDE", 20),
+    "kto": ("#003366", "#FFFFFF", "KTO", "TV", 22),
+    "t18": ("#1F2937", "#60A5FA", "T18", "TV", 22),
+    "novo19": ("#374151", "#F59E0B", "19", "NOVO", 22),
+}
+
+
+def generate_svg_channel_logo(name: str, num: int | None = None, category: str = "") -> str:
+    """Generate a crisp, self-contained SVG Data URI logo for a channel."""
+    clean = name.lower().strip()
+    theme = None
+
+    for k, v in CHANNEL_SVG_THEMES.items():
+        if k == clean or k in clean or clean in k:
+            theme = v
+            break
+
+    if theme:
+        bg, fg, text, sub, fz = theme
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 60" width="100" height="60">'
+            f'<rect width="100" height="60" rx="10" fill="{bg}"/>'
+            f'<text x="50" y="{36 if not sub else 32}" fill="{fg}" font-family="system-ui, -apple-system, sans-serif" font-size="{fz}" font-weight="900" text-anchor="middle">{text}</text>'
+        )
+        if sub:
+            svg += f'<text x="50" y="49" fill="{fg}" opacity="0.9" font-family="system-ui, -apple-system, sans-serif" font-size="10" font-weight="700" text-anchor="middle">{sub}</text>'
+        svg += "</svg>"
+        return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
+
+    # Fallback styled badge using channel number or initials
+    label = str(num) if num is not None else re.sub(r"[^A-Za-z0-9]", "", name)[:4].upper()
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 60" width="100" height="60">'
+        '<defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">'
+        '<stop offset="0%" stop-color="#1e293b"/><stop offset="100%" stop-color="#0f172a"/>'
+        '</linearGradient></defs>'
+        '<rect width="100" height="60" rx="10" fill="url(#g)" stroke="#334155" stroke-width="1.5"/>'
+        f'<text x="50" y="38" fill="#60A5FA" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="800" text-anchor="middle">{label}</text>'
+        '</svg>'
+    )
+    return "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
+
+
+def canonical_channel_key(name: str) -> str:
+    """Normalize channel name to match duplicates across Freebox and Web feeds."""
+    n = name.lower().strip()
+    for src, dst in (
+        ("é", "e"), ("è", "e"), ("ê", "e"), ("ë", "e"),
+        ("à", "a"), ("î", "i"), ("ï", "i"), ("ô", "o"),
+        ("ù", "u"), ("ç", "c"), ("'", ""), ("-", " "),
+    ):
+        n = n.replace(src, dst)
+    n = re.sub(r"[^a-z0-9]+", "", n)
+
+    if "parlementaire" in n or "lcp" in n:
+        return "lcp"
+    if "franceinfo" in n:
+        return "franceinfo"
+    if "equipe" in n:
+        return "lequipe"
+    if "bfm" in n:
+        return "bfmtv"
+    if "cnews" in n:
+        return "cnews"
+    if "cstar" in n:
+        return "cstar"
+    if "arte" in n:
+        return "arte"
+    if "tv5" in n:
+        return "tv5monde"
+    if "euronews" in n:
+        return "euronews"
+    if "kto" in n:
+        return "kto"
+    return n
+
+
 # Universal TNT & Info Free Web Streams (Legal public HLS feeds available for all ISPs)
 UNIVERSAL_TNT_CHANNELS: list[dict[str, Any]] = [
     {
@@ -25,7 +139,7 @@ UNIVERSAL_TNT_CHANNELS: list[dict[str, Any]] = [
         "num": 7,
         "name": "Arte",
         "category": "Culture",
-        "logo": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e0/Arte_logo_2017.svg/320px-Arte_logo_2017.svg.png",
+        "logo": generate_svg_channel_logo("Arte", 7, "Culture"),
         "stream_url": "https://artesimulcast.akamaized.net/hls/live/2031003/artelive_fr/index.m3u8",
         "type": "hls",
         "quality": "1080p Full HD",
@@ -35,7 +149,7 @@ UNIVERSAL_TNT_CHANNELS: list[dict[str, Any]] = [
         "num": 15,
         "name": "BFM TV",
         "category": "Information",
-        "logo": "https://upload.wikimedia.org/wikipedia/commons/thumb/8/87/BFMTV_logo_2019.svg/320px-BFMTV_logo_2019.svg.png",
+        "logo": generate_svg_channel_logo("BFM TV", 15, "Information"),
         "stream_url": "https://stream.bfmtv.com/bfmtv/hls/live.m3u8",
         "type": "hls",
         "quality": "1080p HD",
@@ -45,8 +159,8 @@ UNIVERSAL_TNT_CHANNELS: list[dict[str, Any]] = [
         "num": 27,
         "name": "franceinfo:",
         "category": "Information",
-        "logo": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e2/Franceinfo_logo_2016.svg/320px-Franceinfo_logo_2016.svg.png",
-        "stream_url": "https://static.france24.com/live/F24_FR_LO_HLS/live_tv.m3u8",  # French public info feed
+        "logo": generate_svg_channel_logo("franceinfo", 27, "Information"),
+        "stream_url": "https://static.france24.com/live/F24_FR_LO_HLS/live_tv.m3u8",
         "type": "hls",
         "quality": "1080p HD",
     },
@@ -55,7 +169,7 @@ UNIVERSAL_TNT_CHANNELS: list[dict[str, Any]] = [
         "num": 33,
         "name": "France 24",
         "category": "Information",
-        "logo": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d5/France_24_logo_2013.svg/320px-France_24_logo_2013.svg.png",
+        "logo": generate_svg_channel_logo("France 24", 33, "Information"),
         "stream_url": "https://static.france24.com/live/F24_FR_LO_HLS/live_tv.m3u8",
         "type": "hls",
         "quality": "1080p HD",
@@ -65,7 +179,7 @@ UNIVERSAL_TNT_CHANNELS: list[dict[str, Any]] = [
         "num": 34,
         "name": "Euronews Français",
         "category": "Information",
-        "logo": "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Euronews_2016_logo.svg/320px-Euronews_2016_logo.svg.png",
+        "logo": generate_svg_channel_logo("Euronews", 34, "Information"),
         "stream_url": "https://euronews-fr-p2p.secure.footprint.net/live/fr.m3u8",
         "type": "hls",
         "quality": "720p HD",
@@ -75,7 +189,7 @@ UNIVERSAL_TNT_CHANNELS: list[dict[str, Any]] = [
         "num": 35,
         "name": "TV5 Monde",
         "category": "Généraliste",
-        "logo": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/30/TV5Monde_logo.svg/320px-TV5Monde_logo.svg.png",
+        "logo": generate_svg_channel_logo("TV5 Monde", 35, "Généraliste"),
         "stream_url": "https://ott.tv5monde.com/Content/HLS/Live/channel(fbs)/index.m3u8",
         "type": "hls",
         "quality": "1080p HD",
@@ -85,7 +199,7 @@ UNIVERSAL_TNT_CHANNELS: list[dict[str, Any]] = [
         "num": 13,
         "name": "LCP / Public Sénat",
         "category": "Information",
-        "logo": "https://upload.wikimedia.org/wikipedia/fr/thumb/5/52/LCP_logo_2019.svg/320px-LCP_logo_2019.svg.png",
+        "logo": generate_svg_channel_logo("LCP", 13, "Information"),
         "stream_url": "https://lcp.senat.fr/live/stream.m3u8",
         "type": "hls",
         "quality": "1080p HD",
@@ -95,30 +209,12 @@ UNIVERSAL_TNT_CHANNELS: list[dict[str, Any]] = [
         "num": 40,
         "name": "KTO Télévision",
         "category": "Culture",
-        "logo": "https://upload.wikimedia.org/wikipedia/fr/thumb/a/a2/KTO_logo_2018.svg/320px-KTO_logo_2018.svg.png",
+        "logo": generate_svg_channel_logo("KTO", 40, "Culture"),
         "stream_url": "https://live.ktotv.com/hls/kto_live.m3u8",
         "type": "hls",
         "quality": "1080p HD",
     },
 ]
-
-# Known Channel Logos for Freebox Channels
-CHANNEL_LOGOS: dict[str, str] = {
-    "france 2": "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b3/France_2_2018.svg/320px-France_2_2018.svg.png",
-    "france 3": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d4/France_3_2018.svg/320px-France_3_2018.svg.png",
-    "france 4": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/France_4_2021.svg/320px-France_4_2021.svg.png",
-    "france 5": "https://upload.wikimedia.org/wikipedia/commons/thumb/8/87/France_5_2018.svg/320px-France_5_2018.svg.png",
-    "arte": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e0/Arte_logo_2017.svg/320px-Arte_logo_2017.svg.png",
-    "la chaîne parlementaire": "https://upload.wikimedia.org/wikipedia/fr/thumb/5/52/LCP_logo_2019.svg/320px-LCP_logo_2019.svg.png",
-    "gulli": "https://upload.wikimedia.org/wikipedia/commons/thumb/6/64/Gulli_logo_2023.svg/320px-Gulli_logo_2023.svg.png",
-    "bfm tv": "https://upload.wikimedia.org/wikipedia/commons/thumb/8/87/BFMTV_logo_2019.svg/320px-BFMTV_logo_2019.svg.png",
-    "cnews": "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4b/CNews_logo_2017.svg/320px-CNews_logo_2017.svg.png",
-    "cstar": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dc/CStar_logo_2016.svg/320px-CStar_logo_2016.svg.png",
-    "franceinfo": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e2/Franceinfo_logo_2016.svg/320px-Franceinfo_logo_2016.svg.png",
-    "la chaîne l'equipe": "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b3/L%27%C3%89quipe_21_logo_2016.svg/320px-L%27%C3%89quipe_21_logo_2016.svg.png",
-    "tv5 monde": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/30/TV5Monde_logo.svg/320px-TV5Monde_logo.svg.png",
-    "euronews": "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Euronews_2016_logo.svg/320px-Euronews_2016_logo.svg.png",
-}
 
 
 class BoxDetectorService:
@@ -195,7 +291,7 @@ class BoxDetectorService:
                                 "multiposte_supported": True,
                                 "has_web_tv": True,
                                 "badge": "Freebox TV Multiposte Actif ⚡",
-                                "description": f"{model_name} détectée avec succès. Accès direct aux flux vidéo Multiposte RTSP locaux en qualité maximale.",
+                                "description": f"{model_name} détectée avec succès. Accès direct aux flux vidéo Multiposte locaux en qualité maximale.",
                                 "ip": "192.168.1.254",
                                 "m3u_url": FREEBOX_M3U_URL,
                             }
@@ -216,7 +312,7 @@ class BoxDetectorService:
                             "multiposte_supported": False,
                             "has_web_tv": True,
                             "badge": "Orange Livebox (TNT Web)",
-                            "description": "Livebox Orange détectée. Accès aux flux TNT Web légaux HD et possibilité de configurer votre décodeur.",
+                            "description": "Livebox Orange détectée. Accès aux flux TNT Web légaux HD.",
                             "ip": "192.168.1.1",
                         }
         except Exception:
@@ -238,7 +334,7 @@ class BoxDetectorService:
                                 "multiposte_supported": False,
                                 "has_web_tv": True,
                                 "badge": "Box SFR (TNT Web)",
-                                "description": "Box SFR détectée. Accès au bouquet direct TNT Web HD et chaînes d'information.",
+                                "description": "Box SFR détectée. Accès au bouquet direct TNT Web HD.",
                                 "ip": "192.168.1.1",
                             }
         except Exception:
@@ -258,7 +354,7 @@ class BoxDetectorService:
                             "multiposte_supported": False,
                             "has_web_tv": True,
                             "badge": "Bouygues Bbox (TNT Web)",
-                            "description": "Bbox détectée. Accès au bouquet TNT Web HD et chaînes d'actualité en continu.",
+                            "description": "Bbox détectée. Accès au bouquet TNT Web HD.",
                             "ip": "192.168.1.254",
                         }
         except Exception:
@@ -273,7 +369,7 @@ class BoxDetectorService:
         box = await self.async_detect_box()
         channels: list[dict[str, Any]] = []
 
-        # If Freebox, fetch and parse official Freebox TV Multiposte playlist
+        # 1. If Freebox, fetch and parse official Freebox TV Multiposte playlist
         if box.get("multiposte_supported"):
             try:
                 freebox_channels = await self._fetch_freebox_playlist()
@@ -282,29 +378,37 @@ class BoxDetectorService:
             except Exception as e:
                 _LOGGER.error("Failed to parse Freebox TV playlist: %s", e)
 
-        # Merge universal TNT & Web HLS channels (deduplicating or supplementing)
-        existing_names = {c["name"].lower().strip() for c in channels}
-        for u_ch in UNIVERSAL_TNT_CHANNELS:
-            clean_name = u_ch["name"].lower().strip()
-            # If Freebox channel exists, attach web HLS fallback URL
-            matched = False
-            for c in channels:
-                if c["name"].lower().strip() == clean_name or clean_name in c["name"].lower():
-                    c["web_hls_url"] = u_ch["stream_url"]
-                    if not c.get("logo"):
-                        c["logo"] = u_ch["logo"]
-                    matched = True
-                    break
-            if not matched:
-                channels.append(u_ch)
+        # 2. Canonical index of existing Freebox channels for deduplication
+        existing_keys = {canonical_channel_key(c["name"]): c for c in channels}
 
-        # Sort channels primarily by channel number
-        def _sort_key(ch: dict[str, Any]) -> int:
+        # 3. Merge universal TNT & Web HLS channels without creating duplicates
+        for u_ch in UNIVERSAL_TNT_CHANNELS:
+            ck = canonical_channel_key(u_ch["name"])
+            matched_channel = existing_keys.get(ck)
+
+            if matched_channel:
+                # Channel already available from Freebox: attach web HLS stream as fallback
+                matched_channel["web_hls_url"] = u_ch["stream_url"]
+                if not matched_channel.get("logo"):
+                    matched_channel["logo"] = u_ch["logo"]
+            else:
+                # Add channel from universal TNT list (e.g. if absent from Freebox multiposte)
+                channels.append(u_ch)
+                existing_keys[ck] = u_ch
+
+        # Ensure all channels have a high-contrast SVG logo
+        for ch in channels:
+            if not ch.get("logo") or "wikimedia.org" in ch.get("logo", ""):
+                ch["logo"] = generate_svg_channel_logo(ch["name"], ch.get("num"), ch.get("category", ""))
+
+        # Sort channels by channel number, then by name
+        def _sort_key(ch: dict[str, Any]) -> tuple[int, str]:
             num = ch.get("num")
             try:
-                return int(num) if num is not None else 999
+                n = int(num) if num is not None else 999
             except Exception:
-                return 999
+                n = 999
+            return (n, ch.get("name", ""))
 
         channels.sort(key=_sort_key)
         self._cached_channels = channels
@@ -318,7 +422,11 @@ class BoxDetectorService:
                 headers={"User-Agent": "DomoLink-Camera/1.0"},
             )
             with urllib.request.urlopen(req, timeout=4.0) as response:
-                return response.read().decode("latin-1")
+                content = response.read()
+                try:
+                    return content.decode("utf-8")
+                except UnicodeDecodeError:
+                    return content.decode("latin-1", errors="replace")
 
         raw_text = await self.hass.async_add_executor_job(_download_m3u)
         lines = raw_text.splitlines()
@@ -362,7 +470,7 @@ class BoxDetectorService:
                     elif any(w in lower_name for w in ("music", "cstar", "radio", "m6 music", "trace")):
                         cat = "Musique"
 
-                    logo_url = CHANNEL_LOGOS.get(lower_name, "")
+                    logo_url = generate_svg_channel_logo(canonical_name, current_num, cat)
 
                     parsed[channel_id] = {
                         "id": channel_id,
@@ -372,13 +480,17 @@ class BoxDetectorService:
                         "logo": logo_url,
                         "stream_url": url,
                         "streams": {},
+                        "fallback_urls": [],
                         "type": "rtsp",
                         "quality": "HD (Freebox Multiposte)",
                     }
 
                 # Store stream flavour
                 parsed[channel_id]["streams"][flavour] = url
-                # Default to HD or auto stream URL
+                if url not in parsed[channel_id]["fallback_urls"]:
+                    parsed[channel_id]["fallback_urls"].append(url)
+
+                # Prefer HD or auto stream as the primary stream URL
                 if flavour in ("hd", "auto") or not parsed[channel_id].get("stream_url"):
                     parsed[channel_id]["stream_url"] = url
 

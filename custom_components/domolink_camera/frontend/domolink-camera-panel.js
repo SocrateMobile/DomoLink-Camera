@@ -1913,7 +1913,16 @@ class DomolinkCameraPanel extends HTMLElement {
     const video = this.shadowRoot.querySelector("#tv-video-player");
     if (!video) return;
 
-    this._showToast(`Chargement du direct : ${channel.name}...`);
+    // Reset existing stream
+    if (this._hlsPlayer) {
+      this._hlsPlayer.destroy();
+      this._hlsPlayer = null;
+    }
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+
+    this._showToast(`Chargement de ${channel.name}...`);
     try {
       const resp = await this._hass.callWS({
         type: "domolink_camera/get_tv_stream",
@@ -1928,16 +1937,24 @@ class DomolinkCameraPanel extends HTMLElement {
       const streamUrl = resp.url;
       const isHls = streamUrl.includes(".m3u8") || resp.format === "hls";
 
+      const startPlayback = () => {
+        video.muted = false;
+        video.play().catch((err) => {
+          if (err && err.name === "NotAllowedError") {
+            video.muted = true;
+            video.play().catch(() => {});
+            this._showToast("Lecture démarrée en sourdine (cliquez pour le son)");
+          }
+        });
+      };
+
       if (isHls) {
         if (video.canPlayType("application/vnd.apple.mpegurl")) {
           video.src = streamUrl;
-          video.play().catch(() => {});
+          startPlayback();
         } else {
           await this._ensureHlsJs();
           if (window.Hls && window.Hls.isSupported()) {
-            if (this._hlsPlayer) {
-              this._hlsPlayer.destroy();
-            }
             this._hlsPlayer = new window.Hls({
               enableWorker: true,
               lowLatencyMode: true,
@@ -1945,16 +1962,26 @@ class DomolinkCameraPanel extends HTMLElement {
             this._hlsPlayer.loadSource(streamUrl);
             this._hlsPlayer.attachMedia(video);
             this._hlsPlayer.on(window.Hls.Events.MANIFEST_PARSED, () => {
-              video.play().catch(() => {});
+              startPlayback();
+            });
+            this._hlsPlayer.on(window.Hls.Events.ERROR, (event, data) => {
+              if (data && data.fatal) {
+                console.warn("HLS fatal error, switching to proxy:", data);
+                video.src = `/api/domolink_camera/tv_live/${channel.id}?t=${Date.now()}`;
+                startPlayback();
+              }
             });
           } else {
             video.src = streamUrl;
-            video.play().catch(() => {});
+            startPlayback();
           }
         }
       } else {
-        video.src = streamUrl;
-        video.play().catch(() => {});
+        const fullUrl = streamUrl.startsWith("http") || streamUrl.startsWith("/")
+          ? `${streamUrl}${streamUrl.includes("?") ? "&" : "?"}t=${Date.now()}`
+          : streamUrl;
+        video.src = fullUrl;
+        startPlayback();
       }
     } catch (err) {
       console.error("TV stream error:", err);
@@ -2123,7 +2150,7 @@ class DomolinkCameraPanel extends HTMLElement {
                     <div class="channel-logo-box">
                       ${
                         item.logo
-                          ? `<img src="${item.logo}" class="channel-logo-img" alt="${item.name}" />`
+                          ? `<img src="${item.logo}" class="channel-logo-img" alt="${item.name}" onerror="this.onerror=null; this.src='data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20100%2060%22%3E%3Crect%20width%3D%22100%22%20height%3D%2260%22%20rx%3D%2210%22%20fill%3D%22%231e293b%22/%3E%3Ctext%20x%3D%2250%22%20y%3D%2238%22%20fill%3D%22%2360A5FA%22%20font-family%3D%22sans-serif%22%20font-size%3D%2222%22%20font-weight%3D%22800%22%20text-anchor%3D%22middle%22%3E${item.num || "TV"}%3C/text%3E%3C/svg%3E';" />`
                           : `<span style="font-weight: 800; color: #3b82f6;">${item.num || "TV"}</span>`
                       }
                     </div>
@@ -2689,12 +2716,13 @@ class DomolinkCameraPanel extends HTMLElement {
       tvVideo.ondblclick = () => this._toggleFullscreen();
     }
 
-    // Category pills filter
+    // Category pills filter (without destroying playing video)
     const catPills = this.shadowRoot.querySelectorAll(".category-pill");
     catPills.forEach((pill) => {
       pill.onclick = () => {
         this._tvFilter = pill.dataset.category;
-        this.render();
+        catPills.forEach((p) => p.classList.toggle("active", p === pill));
+        this._updateChannelGrid();
       };
     });
 
@@ -2703,47 +2731,50 @@ class DomolinkCameraPanel extends HTMLElement {
     if (searchInp) {
       searchInp.oninput = (e) => {
         this._tvSearch = e.target.value;
-        const grid = this.shadowRoot.querySelector(".channel-grid");
-        if (grid) {
-          const filtered = (this._tvChannels || []).filter((c) => {
-            const matchFilter = this._tvFilter === "all" || c.category === this._tvFilter;
-            const matchSearch =
-              !this._tvSearch ||
-              c.name.toLowerCase().includes(this._tvSearch.toLowerCase()) ||
-              (c.num && String(c.num).includes(this._tvSearch));
-            return matchFilter && matchSearch;
-          });
-
-          grid.innerHTML =
-            filtered.length > 0
-              ? filtered
-                  .map((item) => {
-                    const isActive = this._selectedChannel && this._selectedChannel.id === item.id;
-                    return `
-                  <div class="channel-card ${isActive ? "active" : ""}" data-channel-id="${item.id}">
-                    <div class="channel-logo-box">
-                      ${
-                        item.logo
-                          ? `<img src="${item.logo}" class="channel-logo-img" alt="${item.name}" />`
-                          : `<span style="font-weight: 800; color: #3b82f6;">${item.num || "TV"}</span>`
-                      }
-                    </div>
-                    <div class="channel-details">
-                      <div class="channel-name">${item.num ? `${item.num}. ` : ""}${item.name}</div>
-                      <div class="channel-sub">${item.category || "Direct"} • ${item.quality || "HD"}</div>
-                    </div>
-                  </div>
-                `;
-                  })
-                  .join("")
-              : `<div style="grid-column: 1 / -1; text-align: center; color: #8b949e; padding: 40px 0;">Aucune chaîne trouvée.</div>`;
-
-          this._bindChannelCards();
-        }
+        this._updateChannelGrid();
       };
     }
 
     // Channel cards click
+    this._bindChannelCards();
+  }
+
+  _updateChannelGrid() {
+    const grid = this.shadowRoot.querySelector(".channel-grid");
+    if (!grid) return;
+    const filtered = (this._tvChannels || []).filter((c) => {
+      const matchFilter = this._tvFilter === "all" || c.category === this._tvFilter;
+      const matchSearch =
+        !this._tvSearch ||
+        c.name.toLowerCase().includes(this._tvSearch.toLowerCase()) ||
+        (c.num && String(c.num).includes(this._tvSearch));
+      return matchFilter && matchSearch;
+    });
+
+    grid.innerHTML =
+      filtered.length > 0
+        ? filtered
+            .map((item) => {
+              const isActive = this._selectedChannel && this._selectedChannel.id === item.id;
+              return `
+            <div class="channel-card ${isActive ? "active" : ""}" data-channel-id="${item.id}">
+              <div class="channel-logo-box">
+                ${
+                  item.logo
+                    ? `<img src="${item.logo}" class="channel-logo-img" alt="${item.name}" onerror="this.onerror=null; this.src='data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20100%2060%22%3E%3Crect%20width%3D%22100%22%20height%3D%2260%22%20rx%3D%2210%22%20fill%3D%22%231e293b%22/%3E%3Ctext%20x%3D%2250%22%20y%3D%2238%22%20fill%3D%22%2360A5FA%22%20font-family%3D%22sans-serif%22%20font-size%3D%2222%22%20font-weight%3D%22800%22%20text-anchor%3D%22middle%22%3E${item.num || "TV"}%3C/text%3E%3C/svg%3E';" />`
+                    : `<span style="font-weight: 800; color: #3b82f6;">${item.num || "TV"}</span>`
+                }
+              </div>
+              <div class="channel-details">
+                <div class="channel-name">${item.num ? `${item.num}. ` : ""}${item.name}</div>
+                <div class="channel-sub">${item.category || "Direct"} • ${item.quality || "HD"}</div>
+              </div>
+            </div>
+          `;
+            })
+            .join("")
+        : `<div style="grid-column: 1 / -1; text-align: center; color: #8b949e; padding: 40px 0;">Aucune chaîne trouvée.</div>`;
+
     this._bindChannelCards();
   }
 

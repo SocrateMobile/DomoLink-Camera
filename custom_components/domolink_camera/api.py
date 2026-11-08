@@ -141,6 +141,131 @@ class DomolinkCameraStreamView(HomeAssistantView):
         return response
 
 
+class DomolinkTvLiveStreamView(HomeAssistantView):
+    """Serve real-time transcoded/remuxed TV stream via FFmpeg for browser playback."""
+
+    url = "/api/domolink_camera/tv_live/{channel_id}"
+    name = "api:domolink_camera:tv_live"
+    requires_auth = False
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize TV live stream view."""
+        self.hass = hass
+
+    async def get(self, request: web.Request, channel_id: str) -> web.StreamResponse:
+        """Remux RTSP/UDP stream to fragmented MP4 for browser HTML5 video playback."""
+        mgr = self.hass.data[DOMAIN]["manager"]
+        channels = await mgr.box_detector.async_get_tv_channels()
+        channel = next((c for c in channels if c["id"] == channel_id), None)
+        if not channel:
+            return web.Response(status=404, text=f"Chaîne '{channel_id}' non trouvée.")
+
+        candidate_urls: list[str] = []
+        if channel.get("stream_url"):
+            candidate_urls.append(channel["stream_url"])
+        for fb in channel.get("fallback_urls", []):
+            if fb not in candidate_urls:
+                candidate_urls.append(fb)
+
+        if not candidate_urls:
+            return web.Response(status=404, text="Aucun flux disponible pour cette chaîne.")
+
+        response = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": "video/mp4",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Connection": "close",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+        await response.prepare(request)
+
+        for target_url in candidate_urls:
+            is_rtsp = target_url.startswith("rtsp://")
+            ffmpeg_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+            if is_rtsp:
+                ffmpeg_cmd.extend(["-rtsp_transport", "udp", "-timeout", "4000000"])
+            ffmpeg_cmd.extend([
+                "-i", target_url,
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-ac", "2",
+                "-b:a", "128k",
+                "-f", "mp4",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                "pipe:1",
+            ])
+
+            _LOGGER.info("Starting TV FFmpeg stream for %s from %s", channel_id, target_url)
+            proc = None
+            first_chunk = True
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                while True:
+                    chunk = await proc.stdout.read(32768)
+                    if not chunk:
+                        break
+                    first_chunk = False
+                    await response.write(chunk)
+            except (asyncio.CancelledError, ConnectionResetError):
+                _LOGGER.debug("Client disconnected from TV stream %s", channel_id)
+                return response
+            except Exception as exc:
+                _LOGGER.warning("FFmpeg TV stream error on %s: %s", target_url, exc)
+            finally:
+                if proc and proc.returncode is None:
+                    try:
+                        proc.terminate()
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except Exception:
+                        proc.kill()
+
+            if not first_chunk:
+                break
+
+        return response
+
+
+class DomolinkTvProxyView(HomeAssistantView):
+    """CORS proxy for web HLS streams and playlists."""
+
+    url = "/api/domolink_camera/tv_proxy"
+    name = "api:domolink_camera:tv_proxy"
+    requires_auth = False
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize proxy view."""
+        self.hass = hass
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Proxy external HLS stream bypassing browser CORS constraints."""
+        import aiohttp
+        url = request.query.get("url")
+        if not url:
+            return web.Response(status=400, text="Paramètre url requis.")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5.0) as resp:
+                    data = await resp.read()
+                    ct = resp.headers.get("Content-Type", "application/vnd.apple.mpegurl")
+                    return web.Response(
+                        body=data,
+                        content_type=ct,
+                        headers={"Access-Control-Allow-Origin": "*"},
+                    )
+        except Exception as e:
+            return web.Response(status=502, text=str(e))
+
+
 @callback
 def register_websocket_handlers(hass: HomeAssistant) -> None:
     """Register all DomoLink Camera WebSocket commands."""
@@ -380,16 +505,16 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
             )
             return
 
-        # 3. For Freebox RTSP stream, try HA stream component to get an HLS master playlist
+        # 3. For Freebox RTSP stream, try HA stream component with UDP transport
         rtsp_url = channel.get("stream_url")
         if rtsp_url and "stream" in hass.config.components:
             try:
-                stream_comp = getattr(hass.components, "stream", None)
-                if stream_comp and hasattr(stream_comp, "async_create_stream"):
-                    stream = await stream_comp.async_create_stream(hass, rtsp_url)
-                    stream.add_provider("hls")
-                    await stream.start()
-                    hls_url = stream.endpoint_url("hls")
+                from homeassistant.components.stream import create_stream
+                stream = create_stream(hass, rtsp_url, options={"rtsp_transport": "udp"})
+                stream.add_provider("hls")
+                await stream.start()
+                hls_url = stream.endpoint_url("hls")
+                if hls_url:
                     connection.send_result(
                         msg["id"],
                         {
@@ -402,12 +527,13 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
             except Exception as e:
                 _LOGGER.debug("Error creating HA HLS stream for %s: %s", channel_id, e)
 
-        # Fallback to direct stream_url
+        # 4. Fallback to FFmpeg live stream proxy view (Fragmented MP4)
         connection.send_result(
             msg["id"],
             {
-                "url": channel.get("stream_url", ""),
-                "format": channel.get("type", "rtsp"),
+                "url": f"/api/domolink_camera/tv_live/{channel_id}",
+                "format": "mp4",
+                "proxied": True,
                 "channel": channel,
             },
         )
