@@ -120,14 +120,17 @@ class DomolinkCameraStreamView(HomeAssistantView):
                     # Send last known snapshot if available
                     jpeg = await mgr.async_get_snapshot(camera_id)
 
-                part = (
-                    b"--frameboundary\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("utf-8")
-                    + jpeg
-                    + b"\r\n"
-                )
-                await response.write(part)
+                if jpeg and not jpeg.startswith(b"<svg"):
+                    part = (
+                        b"--frameboundary\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("utf-8")
+                        + jpeg
+                        + b"\r\n"
+                    )
+                    await response.write(part)
+                else:
+                    await asyncio.sleep(0.5)
         except (asyncio.CancelledError, ConnectionResetError, Exception):
             pass
         finally:

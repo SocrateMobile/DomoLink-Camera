@@ -2,7 +2,7 @@
 
 DOMAIN = "domolink_camera"
 NAME = "DomoLink Camera"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # Storage
 STORAGE_KEY = "domolink_camera_data"
@@ -42,25 +42,64 @@ PPPP_CMD_SYSTEM_REBOOT = 0x0007
 PPPP_CMD_WIFI_SET = 0x0008
 PPPP_CMD_DEV_SEARCH = 0x0009
 
-# Known Camera Access Point SSID prefixes in factory mode
-CAMERA_AP_SSID_PREFIXES = (
+# Known Camera Access Point keywords matched with wildcards (*keyword*) and P2P UID regex
+CAMERA_AP_KEYWORDS = (
+    "BAT",
+    "TBAT",
+    "AYS",
+    "ACCQ",
+    "BCCQ",
+    "CCCQ",
+    "DG",
+    "XY",
+    "A9",
+    "X5",
+    "IPC",
+    "CLOUDCAM",
+    "V380",
+    "MC",
+    "PTZ",
+    "Q6",
+    "HD",
+    "ILNK",
+    "YSX",
+    "CAM",
+    "BELL",
+    "CARE",
+    "SONOFF",
+)
+
+# Domestic router and ISP networks excluded from camera AP detection
+CAMERA_AP_EXCLUDE = (
+    "FREEBOX",
+    "LIVEBOX",
+    "BBOX",
+    "SFR",
+    "ORANGE",
+    "NETGEAR",
+    "TP-LINK",
+    "ASUS",
+    "ORBI",
+    "DECO",
+    "SOCRATE",
+    "BOUYGUES",
+)
+
+# Backward-compatibility alias containing both stripped keywords and legacy dashed prefixes
+CAMERA_AP_SSID_PREFIXES = CAMERA_AP_KEYWORDS + (
     "AYS-",
     "ACCQ-",
     "BCCQ-",
     "CCCQ-",
-    "DG-",
-    "XY-",
     "A9-",
     "X5-",
-    "IPC-",
-    "CLOUDCAM",
-    "V380",
-    "MC-",
-    "BAT-",
     "PTZ-",
-    "Q6-",
-    "HD-",
+    "BAT-",
+    "TBAT-",
 )
+
+# P2P UID Regex pattern for camera APs (e.g., TBAT652718GRDCE, AYS-123456-ABCDE, ACCQ-998877)
+CAMERA_AP_UID_REGEX = r"^[A-Z]{3,6}[-_]?\d{5,8}[-_]?[A-Z]{3,6}$"
 
 # Camera Statuses
 STATUS_ONLINE = "online"

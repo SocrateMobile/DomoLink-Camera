@@ -7,6 +7,8 @@ import logging
 import time
 from typing import Any, Callable
 
+import aiohttp
+
 from .base import BaseCameraDriver
 from ..const import (
     STATUS_CONNECTING,
@@ -68,22 +70,50 @@ class HaProxyDriver(BaseCameraDriver):
         self.status = STATUS_OFFLINE
 
     async def async_get_snapshot(self) -> bytes | None:
-        """Fetch snapshot directly from Home Assistant camera component."""
+        """Fetch snapshot directly from Home Assistant camera component with multi-level fallback."""
         if not self.hass or not self.entity_id:
             return self.last_snapshot
 
+        # 1. Primary method: async_get_image from camera component
         try:
-            # Query Home Assistant camera platform directly
-            camera_comp = getattr(self.hass.components, "camera", None)
-            if camera_comp and hasattr(camera_comp, "async_get_image"):
-                image = await camera_comp.async_get_image(self.hass, self.entity_id, timeout=4.0)
-                if image and image.content:
-                    self.last_snapshot = image.content
-                    self.last_snapshot_time = time.time()
-                    self.status = STATUS_ONLINE
-                    return image.content
+            from homeassistant.components.camera import async_get_image
+            image = await async_get_image(self.hass, self.entity_id, timeout=8.0)
+            if image and image.content:
+                self.last_snapshot = image.content
+                self.last_snapshot_time = time.time()
+                self.status = STATUS_ONLINE
+                return image.content
+        except Exception:
+            # Fallback to hass.components.camera.async_get_image(entity_id) without duplicate hass arg
+            try:
+                camera_comp = getattr(self.hass.components, "camera", None)
+                if camera_comp and hasattr(camera_comp, "async_get_image"):
+                    image = await camera_comp.async_get_image(self.entity_id, timeout=8.0)
+                    if image and image.content:
+                        self.last_snapshot = image.content
+                        self.last_snapshot_time = time.time()
+                        self.status = STATUS_ONLINE
+                        return image.content
+            except Exception as err:
+                _LOGGER.debug("[%s] async_get_image failed: %s", self.entity_id, err)
+
+        # 2. Secondary fallback: check entity attributes (last_thumbnail for Arlo / cloud cameras)
+        try:
+            state = self.hass.states.get(self.entity_id)
+            if state and state.attributes:
+                last_thumb = state.attributes.get("last_thumbnail")
+                if last_thumb and str(last_thumb).startswith("http"):
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(last_thumb, timeout=6.0) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                if data and len(data) > 100:
+                                    self.last_snapshot = data
+                                    self.last_snapshot_time = time.time()
+                                    self.status = STATUS_ONLINE
+                                    return data
         except Exception as err:
-            _LOGGER.debug("[%s] Failed fetching snapshot from HA entity: %s", self.entity_id, err)
+            _LOGGER.debug("[%s] Fallback to last_thumbnail failed: %s", self.entity_id, err)
 
         return self.last_snapshot
 
@@ -96,13 +126,19 @@ class HaProxyDriver(BaseCameraDriver):
             return
 
         try:
-            camera_comp = getattr(self.hass.components, "camera", None)
-            if camera_comp and hasattr(camera_comp, "async_request_stream"):
-                url = await camera_comp.async_request_stream(self.hass, self.entity_id, fmt="hls")
-                if url:
-                    self._stream_url = url
-        except Exception as err:
-            _LOGGER.debug("[%s] Stream request to HA failed: %s", self.entity_id, err)
+            from homeassistant.components.camera import async_request_stream
+            url = await async_request_stream(self.hass, self.entity_id, fmt="hls")
+            if url:
+                self._stream_url = url
+        except Exception:
+            try:
+                camera_comp = getattr(self.hass.components, "camera", None)
+                if camera_comp and hasattr(camera_comp, "async_request_stream"):
+                    url = await camera_comp.async_request_stream(self.entity_id, fmt="hls")
+                    if url:
+                        self._stream_url = url
+            except Exception as err:
+                _LOGGER.debug("[%s] Stream request to HA failed: %s", self.entity_id, err)
 
     async def async_stop_stream(self) -> None:
         """Stop streaming."""
@@ -120,4 +156,8 @@ class HaProxyDriver(BaseCameraDriver):
             "audio": bool(attrs.get("supported_features", 0) & 2),
             "reboot": False,
             "ha_entity": self.entity_id,
+            "entity_picture": attrs.get("entity_picture"),
+            "access_token": attrs.get("access_token"),
+            "brand": attrs.get("brand") or attrs.get("device_brand") or "Home Assistant",
+            "model": attrs.get("model_name") or attrs.get("device_model") or "Caméra",
         }

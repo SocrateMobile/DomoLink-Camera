@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import socket
 import struct
@@ -13,7 +14,10 @@ import urllib.parse
 import urllib.request
 
 from .const import (
+    CAMERA_AP_EXCLUDE,
+    CAMERA_AP_KEYWORDS,
     CAMERA_AP_SSID_PREFIXES,
+    CAMERA_AP_UID_REGEX,
     DEFAULT_PPPP_DISCOVERY_PORT,
     DOMAIN,
     DRIVER_GENERIC_MJPEG,
@@ -27,6 +31,25 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_RE_CAMERA_UID = re.compile(CAMERA_AP_UID_REGEX, re.IGNORECASE)
+
+
+def is_camera_ssid(ssid: str) -> bool:
+    """Check if an SSID is likely a camera access point using wildcards (*keyword*) and UID regex."""
+    if not ssid:
+        return False
+    upper = ssid.strip().upper()
+    # Exclude standard domestic routers & ISPs
+    if any(ex in upper for ex in CAMERA_AP_EXCLUDE):
+        return False
+    # 1. Wildcard check: match if any camera manufacturer/model keyword is inside the SSID (e.g. *TBAT*, *BAT*, *AYS*)
+    for kw in CAMERA_AP_KEYWORDS:
+        if kw in upper:
+            return True
+    # 2. Match standard camera AP UID structure (e.g. TBAT652718GRDCE, AYS-123456-ABCDE)
+    if _RE_CAMERA_UID.match(upper):
+        return True
+    return False
 
 # Protocol classification dictionary for known Home Assistant platforms
 KNOWN_INCOMPATIBLE_PLATFORMS: dict[str, dict[str, str]] = {
@@ -480,8 +503,87 @@ class WifiPairingEngine:
 
         return [p1, p2, p3, p4, p5]
 
+    async def _async_supervisor_scan_wlan0(self) -> list[dict[str, Any]]:
+        """Query Home Assistant OS Supervisor API to scan Wi-Fi access points via host wireless interface."""
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if not token:
+            return []
+
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        try:
+            # Import aiohttp or use HA helper
+            if hasattr(self.hass.helpers, "aiohttp_client"):
+                session = self.hass.helpers.aiohttp_client.async_get_clientsession(self.hass)
+            else:
+                import aiohttp
+                session = aiohttp.ClientSession()
+
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+
+            # Find wireless interface name (default wlan0)
+            iface = "wlan0"
+            try:
+                async with session.get(
+                    "http://supervisor/network/info",
+                    headers=headers,
+                    timeout=4.0,
+                ) as info_resp:
+                    if info_resp.status == 200:
+                        info_data = await info_resp.json()
+                        for if_item in info_data.get("data", {}).get("interfaces", []):
+                            if if_item.get("type") == "wireless":
+                                iface = if_item.get("interface", "wlan0")
+                                break
+            except Exception:
+                pass
+
+            # Trigger Wi-Fi scan on interface
+            scan_url = f"http://supervisor/network/interface/{iface}/accesspoints"
+            try:
+                async with session.post(scan_url, headers=headers, timeout=5.0) as post_resp:
+                    pass
+            except Exception:
+                pass
+
+            # Read scanned access points
+            async with session.get(scan_url, headers=headers, timeout=5.0) as get_resp:
+                if get_resp.status == 200:
+                    ap_data = await get_resp.json()
+                    accesspoints = ap_data.get("data", {}).get("accesspoints", [])
+                    for ap in accesspoints:
+                        s_name = ap.get("ssid", "").strip()
+                        if not s_name or s_name in seen:
+                            continue
+                        seen.add(s_name)
+                        sig = ap.get("signal", 70)
+                        sec = ap.get("security", "OPEN")
+                        results.append({
+                            "ssid": s_name,
+                            "signal": sig,
+                            "security": sec,
+                            "mac": ap.get("mac", ""),
+                            "frequency": ap.get("frequency", 2412),
+                            "is_camera": is_camera_ssid(s_name),
+                        })
+        except Exception as err:
+            _LOGGER.debug("Supervisor wlan scan unavailable or failed: %s", err)
+
+        return results
+
     async def async_scan_camera_aps(self) -> list[dict[str, Any]]:
-        """Scan nearby Wi-Fi Access Points to find cameras in AP mode."""
+        """Scan nearby Wi-Fi Access Points to find cameras in AP mode (Supervisor wlan0 + nmcli + airport)."""
+        # 1. Primary: Try Home Assistant OS Supervisor API (wlan0)
+        supervisor_aps = await self._async_supervisor_scan_wlan0()
+        if supervisor_aps:
+            supervisor_aps.sort(key=lambda x: (not x["is_camera"], -x["signal"]))
+            return supervisor_aps
+
+        # 2. Secondary fallback: Host nmcli or macOS airport
         def _scan() -> list[dict[str, Any]]:
             results: list[dict[str, Any]] = []
             seen: set[str] = set()
@@ -502,7 +604,7 @@ class WifiPairingEngine:
                         seen.add(s_name)
                         sig = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 70
                         sec = parts[2] if len(parts) > 2 else "OPEN"
-                        is_cam = any(s_name.upper().startswith(p) for p in CAMERA_AP_SSID_PREFIXES)
+                        is_cam = is_camera_ssid(s_name)
                         results.append({
                             "ssid": s_name,
                             "signal": sig,
@@ -528,7 +630,7 @@ class WifiPairingEngine:
                             if s_name in seen:
                                 continue
                             seen.add(s_name)
-                            is_cam = any(s_name.upper().startswith(p) for p in CAMERA_AP_SSID_PREFIXES)
+                            is_cam = is_camera_ssid(s_name)
                             results.append({
                                 "ssid": s_name,
                                 "signal": 75,
@@ -578,12 +680,43 @@ class WifiPairingEngine:
     async def _async_bridge_camera_ap(
         self, camera_ssid: str | None, target_ssid: str, target_pass: str, camera_ap_ip: str
     ) -> bool:
-        """Attempt autonomous server-side Wi-Fi bridge to camera AP using secondary interface."""
-        def _bridge() -> bool:
-            if not camera_ssid:
-                return False
+        """Attempt autonomous server-side Wi-Fi bridge to camera AP using secondary interface or Supervisor."""
+        if not camera_ssid:
+            return False
+
+        # 1. Try Home Assistant OS Supervisor API bridge
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if token:
             try:
-                # Check if secondary wlan interface exists on HA host
+                if hasattr(self.hass.helpers, "aiohttp_client"):
+                    session = self.hass.helpers.aiohttp_client.async_get_clientsession(self.hass)
+                else:
+                    import aiohttp
+                    session = aiohttp.ClientSession()
+
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                }
+                update_url = "http://supervisor/network/interface/wlan0/update"
+                body = {
+                    "enabled": True,
+                    "wifi": {
+                        "mode": "infrastructure",
+                        "auth": "open",
+                        "ssid": camera_ssid,
+                    },
+                }
+                async with session.post(update_url, json=body, headers=headers, timeout=8.0) as resp:
+                    if resp.status in (200, 201):
+                        self.add_log(f"📶 [SUPERVISOR WLAN] Interface wlan0 connectée à l'AP '{camera_ssid}' !")
+                        return True
+            except Exception as e:
+                _LOGGER.debug("Supervisor bridge attempt failed: %s", e)
+
+        # 2. Try host nmcli
+        def _bridge() -> bool:
+            try:
                 out = subprocess.check_output(
                     ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"],
                     timeout=3,
@@ -599,7 +732,6 @@ class WifiPairingEngine:
                 if not wlan_dev:
                     return False
 
-                # Connect secondary Wi-Fi device to camera AP
                 subprocess.run(
                     ["nmcli", "dev", "wifi", "connect", camera_ssid, "ifname", wlan_dev],
                     timeout=8,

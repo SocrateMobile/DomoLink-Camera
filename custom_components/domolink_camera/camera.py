@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, NAME, VERSION
+from .const import DOMAIN, DRIVER_HA_PROXY, NAME, VERSION
 from .manager import CameraManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -27,6 +27,9 @@ async def async_setup_entry(
 
     entities = []
     for cam_info in mgr.get_cameras_list():
+        # Do not re-create an entity for HA Proxy cameras, as they already exist in HA
+        if cam_info.get("driver") == DRIVER_HA_PROXY:
+            continue
         entities.append(DomoLinkCameraEntity(mgr, cam_info["id"], entry.entry_id))
 
     async_add_entities(entities)
@@ -37,7 +40,7 @@ async def async_setup_entry(
         new_cams = [
             DomoLinkCameraEntity(mgr, c["id"], entry.entry_id)
             for c in mgr.get_cameras_list()
-            if c["id"] not in current_ids
+            if c["id"] not in current_ids and c.get("driver") != DRIVER_HA_PROXY
         ]
         if new_cams:
             entities.extend(new_cams)
