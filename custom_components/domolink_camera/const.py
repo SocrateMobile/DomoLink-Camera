@@ -25,6 +25,10 @@ DEFAULT_RTSP_PORT = 554
 DEFAULT_HTTP_PORT = 80
 DEFAULT_SNAPSHOT_INTERVAL = 10  # seconds between snapshot updates in thumbnail mode
 
+# PPPP Packet Magic Headers
+PPPP_MAGIC = b"PPPP"
+ILNK_MAGIC = b"\x4c\x4e\x4b\x01"
+
 # YsxLite / iLnk PPPP Binary Command IDs (Extracted from APK reverse engineering)
 PPPP_CMD_LIVE_VIDEO_START = 0x0001
 PPPP_CMD_LIVE_VIDEO_STOP = 0x0002
