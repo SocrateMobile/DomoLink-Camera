@@ -247,7 +247,11 @@ class DomolinkCameraPanel extends HTMLElement {
 
     const ssid = ssidInput ? ssidInput.value.trim() : "";
     const pass = passInput ? passInput.value.trim() : "";
-    const apIp = apIpInput ? apIpInput.value.trim() || "192.168.10.1" : "192.168.10.1";
+    const apIp = apIpInput ? apIpInput.value.trim() || "192.168.1.1" : "192.168.1.1";
+
+    this._pairSsid = ssid;
+    this._pairPass = pass;
+    this._pairApIp = apIp;
 
     if (!ssid) {
       this._showToast("Veuillez saisir le SSID de votre réseau Wi-Fi.");
@@ -260,9 +264,9 @@ class DomolinkCameraPanel extends HTMLElement {
     this._appendLog(`🚀 [DÉMARRAGE] Assistant d'appairage lancé pour le réseau '${ssid}'...`);
     this._appendLog(`📋 [VÉRIFICATION] Longueur SSID=${ssid.length} car. | Longueur clé=${pass.length} car. | IP cible=${apIp}`);
 
-    if (apIp === "192.168.1.254" || apIp === "192.168.1.1") {
-      this._appendLog(`⚠️ [ATTENTION] L'adresse '${apIp}' est l'adresse de votre Freebox / Box Internet !`);
-      this._appendLog("💡 Assurez-vous d'avoir connecté votre PC ou smartphone au Wi-Fi propre de la caméra (ex: AYS-xxx, ACCQ-xxx) avant de lancer.");
+    if (apIp === "192.168.1.254") {
+      this._appendLog(`⚠️ [ATTENTION] L'adresse '${apIp}' est l'adresse de votre passerelle Freebox !`);
+      this._appendLog("💡 L'adresse par défaut du point d'accès de votre caméra est 192.168.1.1 ou 192.168.10.1.");
     }
 
     this.render();
@@ -301,13 +305,20 @@ class DomolinkCameraPanel extends HTMLElement {
         } catch (e) {
           clearInterval(pollTimer);
           this._pairingActive = false;
-          this._appendLog(`❌ [ERREUR APPAIRAGE] ${e.message || e}`);
+          const errMsg = e.message || (typeof e === "object" ? JSON.stringify(e) : String(e));
+          this._appendLog(`❌ [ERREUR APPAIRAGE] ${errMsg}`);
           this.render();
         }
       }, 2000);
     } catch (e) {
       this._pairingActive = false;
-      this._appendLog(`❌ [ÉCHEC DÉMARRAGE] ${e.message || e}`);
+      const errMsg = e.message || (typeof e === "object" ? JSON.stringify(e) : String(e));
+      this._appendLog(`❌ [ÉCHEC DÉMARRAGE] ${errMsg}`);
+      if (errMsg.includes("connection") || errMsg.includes("lost") || errMsg.includes("1006")) {
+        this._appendLog("💡 [DIAGNOSTIC] Perte de connexion WebSocket avec Home Assistant.");
+        this._appendLog("   Si votre appareil est connecté au Wi-Fi de la caméra, il ne peut plus joindre le serveur Home Assistant.");
+        this._appendLog("   Utilisez plutôt le script direct sur votre Mac : 'python3 scripts/pair_direct.py'");
+      }
       this._showToast("Échec du démarrage de l'appairage");
       this.render();
     }
@@ -1947,17 +1958,17 @@ class DomolinkCameraPanel extends HTMLElement {
           <div class="form-grid">
             <div class="form-group">
               <label for="pair-ssid">SSID de votre Box / Routeur Wi-Fi</label>
-              <input type="text" id="pair-ssid" class="form-input" placeholder="Ex: MonReseauWifi" />
+              <input type="text" id="pair-ssid" class="form-input" placeholder="Ex: MonReseauWifi" value="${this._pairSsid || ""}" />
             </div>
 
             <div class="form-group">
               <label for="pair-pass">Mot de passe du Wi-Fi</label>
-              <input type="password" id="pair-pass" class="form-input" placeholder="••••••••" />
+              <input type="password" id="pair-pass" class="form-input" placeholder="••••••••" value="${this._pairPass || ""}" />
             </div>
 
             <div class="form-group">
-              <label for="pair-ap-ip">IP par défaut de la caméra en mode AP</label>
-              <input type="text" id="pair-ap-ip" class="form-input" value="192.168.10.1" placeholder="Ex: 192.168.10.1 ou 192.168.1.254" />
+              <label for="pair-ap-ip">IP de la caméra en mode Point d'Accès (Routeur)</label>
+              <input type="text" id="pair-ap-ip" class="form-input" value="${this._pairApIp || "192.168.1.1"}" placeholder="Ex: 192.168.1.1 ou 192.168.10.1" />
             </div>
           </div>
 
