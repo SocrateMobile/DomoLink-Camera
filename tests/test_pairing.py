@@ -64,13 +64,33 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
         self.mock_hass.async_add_executor_job = _exec
         self.engine = WifiPairingEngine(self.mock_hass)
 
-    def test_camera_ap_prefixes(self) -> None:
-        """Verify presence of known camera AP prefixes."""
+    def test_camera_ap_prefixes_and_wildcards(self) -> None:
+        """Verify presence of known camera AP keywords and wildcard SSID matching."""
+        from custom_components.domolink_camera.pairing import is_camera_ssid
+
         self.assertIn("AYS-", CAMERA_AP_SSID_PREFIXES)
         self.assertIn("ACCQ-", CAMERA_AP_SSID_PREFIXES)
         self.assertIn("A9-", CAMERA_AP_SSID_PREFIXES)
         self.assertIn("PTZ-", CAMERA_AP_SSID_PREFIXES)
         self.assertIn("V380", CAMERA_AP_SSID_PREFIXES)
+        self.assertIn("TBAT", CAMERA_AP_SSID_PREFIXES)
+        self.assertIn("BAT", CAMERA_AP_SSID_PREFIXES)
+
+        # Test wildcard and regex matching for camera APs
+        # 1. User's camera AP
+        self.assertTrue(is_camera_ssid("TBAT652718GRDCE"))
+        self.assertTrue(is_camera_ssid("BAT-123456"))
+        self.assertTrue(is_camera_ssid("AYS-928172-ABCDE"))
+        self.assertTrue(is_camera_ssid("ACCQ-33129"))
+        self.assertTrue(is_camera_ssid("my_cam_BAT_test"))
+        self.assertTrue(is_camera_ssid("CAM_HD_1080P"))
+
+        # 2. Domestic routers and ISPs must be excluded
+        self.assertFalse(is_camera_ssid("Freebox_Media_5G"))
+        self.assertFalse(is_camera_ssid("Livebox-1234"))
+        self.assertFalse(is_camera_ssid("SocrateFreeLan_Media"))
+        self.assertFalse(is_camera_ssid("Bbox-A890"))
+        self.assertFalse(is_camera_ssid("SFR_Wifi_Guest"))
 
     def test_build_wifi_payloads_all_formats(self) -> None:
         """Test generation of all 5 PPPP / YsxLite Wi-Fi pairing variants."""
@@ -142,6 +162,39 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
         status = self.engine.get_status()
         self.assertFalse(status["active"])
         self.assertEqual(status["step"], "cancelled")
+
+    @patch.dict("os.environ", {"SUPERVISOR_TOKEN": "mock_supervisor_token"})
+    async def test_supervisor_wlan0_scanning(self) -> None:
+        """Test scanning APs via HAOS Supervisor API with wildcard camera detection."""
+        from unittest.mock import AsyncMock
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={
+            "result": "ok",
+            "data": {
+                "accesspoints": [
+                    {"ssid": "TBAT652718GRDCE", "signal": 85, "security": "open"},
+                    {"ssid": "SocrateFreeLan_Media", "signal": 95, "security": "wpa2"},
+                    {"ssid": "AYS-12345", "signal": 70, "security": "open"},
+                ]
+            }
+        })
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_resp
+        mock_session.post.return_value.__aenter__.return_value = mock_resp
+
+        with patch("custom_components.domolink_camera.pairing.os.environ.get", return_value="mock_token"):
+            self.mock_hass.helpers.aiohttp_client.async_get_clientsession.return_value = mock_session
+            aps = await self.engine.async_scan_camera_aps()
+            self.assertTrue(len(aps) >= 2)
+            # The detected camera APs must be flagged is_camera = True
+            cams = [ap for ap in aps if ap["is_camera"]]
+            cam_ssids = [c["ssid"] for c in cams]
+            self.assertIn("TBAT652718GRDCE", cam_ssids)
+            self.assertIn("AYS-12345", cam_ssids)
+            self.assertNotIn("SocrateFreeLan_Media", [c["ssid"] for c in cams])
 
     @patch("socket.socket")
     async def test_send_wifi_config_multi_target(self, mock_sock_cls) -> None:
