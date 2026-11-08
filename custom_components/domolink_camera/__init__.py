@@ -57,6 +57,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     try:
+        frontend.async_remove_panel(hass, "domolink_camera")
+    except Exception:
+        pass
+
+    try:
         frontend.async_register_built_in_panel(
             hass,
             component_name="custom",
