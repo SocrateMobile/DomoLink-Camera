@@ -12,6 +12,8 @@ from homeassistant.core import HomeAssistant
 from .api import (
     DomolinkCameraSnapshotView,
     DomolinkCameraStreamView,
+    DomolinkTvLiveStreamView,
+    DomolinkTvProxyView,
     register_websocket_handlers,
 )
 from .const import DOMAIN, NAME, VERSION
@@ -36,6 +38,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register HTTP views
     hass.http.register_view(DomolinkCameraSnapshotView(hass))
     hass.http.register_view(DomolinkCameraStreamView(hass))
+    hass.http.register_view(DomolinkTvLiveStreamView(hass))
+    hass.http.register_view(DomolinkTvProxyView(hass))
 
     # Register WebSocket commands
     register_websocket_handlers(hass)
