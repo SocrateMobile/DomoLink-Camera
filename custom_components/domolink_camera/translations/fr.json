@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "DomoLink-Camera",
+        "description": "Installer et activer DomoLink-Camera avec son panneau latéral et la gestion des flux en direct."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Une seule instance de DomoLink-Camera est nécessaire."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options DomoLink-Camera",
+        "description": "Accédez directement au panneau latéral DomoLink Camera pour configurer vos caméras et l'appairage Wi-Fi."
+      }
+    }
+  }
+}
