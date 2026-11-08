@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
-import voluptuous as vol
+
+try:
+    from homeassistant.config_entries import ConfigFlowResult
+except ImportError:
+    ConfigFlowResult = Any  # type: ignore[misc,assignment]
 
 from .const import DOMAIN, NAME
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class DomoLinkCameraConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -19,10 +26,10 @@ class DomoLinkCameraConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle the initial setup step."""
-        if self._async_current_entries():
-            return self.async_abort(reason="single_instance_allowed")
+        await self.async_set_unique_id(DOMAIN)
+        self._abort_if_unique_id_configured()
 
         if user_input is not None:
             return self.async_create_entry(title=NAME, data=user_input)
@@ -30,7 +37,6 @@ class DomoLinkCameraConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({}),
-            description_placeholders={"name": NAME},
         )
 
     @staticmethod
@@ -51,7 +57,7 @@ class DomoLinkCameraOptionsFlow(config_entries.OptionsFlow):
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
