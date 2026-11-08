@@ -28,8 +28,10 @@ from .const import (
     WS_TYPE_SAVE_CAMERA,
     WS_TYPE_SAVE_LAYOUT,
     WS_TYPE_SCAN_LOCAL,
+    WS_TYPE_SCAN_WIFI_APS,
     WS_TYPE_SET_IR,
     WS_TYPE_START_PAIRING,
+    WS_TYPE_STOP_PAIRING,
     WS_TYPE_TRIGGER_LIVE,
 )
 
@@ -189,7 +191,8 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Required("type"): WS_TYPE_START_PAIRING,
         vol.Required("ssid"): str,
         vol.Required("password"): str,
-        vol.Optional("camera_ap_ip", default="192.168.1.254"): str,
+        vol.Optional("camera_ap_ip", default="192.168.1.1"): str,
+        vol.Optional("camera_ssid"): str,
     })
     @websocket_api.async_response
     async def ws_start_pairing(
@@ -199,10 +202,31 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         # Run pairing asynchronously in background
         asyncio.create_task(
             mgr.pairing_engine.async_start_pairing(
-                msg["ssid"], msg["password"], msg.get("camera_ap_ip", "192.168.1.254")
+                msg["ssid"],
+                msg["password"],
+                msg.get("camera_ap_ip", "192.168.1.1"),
+                msg.get("camera_ssid"),
             )
         )
         connection.send_result(msg["id"], {"started": True})
+
+    @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_STOP_PAIRING})
+    @websocket_api.async_response
+    async def ws_stop_pairing(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        mgr.pairing_engine.stop_pairing()
+        connection.send_result(msg["id"], {"stopped": True})
+
+    @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_SCAN_WIFI_APS})
+    @websocket_api.async_response
+    async def ws_scan_wifi_aps(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        aps = await mgr.pairing_engine.async_scan_camera_aps()
+        connection.send_result(msg["id"], {"aps": aps})
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_PAIR_STATUS})
     @websocket_api.async_response
@@ -437,7 +461,9 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_save_camera)
     websocket_api.async_register_command(hass, ws_delete_camera)
     websocket_api.async_register_command(hass, ws_start_pairing)
+    websocket_api.async_register_command(hass, ws_stop_pairing)
     websocket_api.async_register_command(hass, ws_pair_status)
+    websocket_api.async_register_command(hass, ws_scan_wifi_aps)
     websocket_api.async_register_command(hass, ws_scan_local)
     websocket_api.async_register_command(hass, ws_get_entities)
     websocket_api.async_register_command(hass, ws_trigger_live)

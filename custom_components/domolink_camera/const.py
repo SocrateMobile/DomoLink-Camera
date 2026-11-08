@@ -2,7 +2,7 @@
 
 DOMAIN = "domolink_camera"
 NAME = "DomoLink Camera"
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 # Storage
 STORAGE_KEY = "domolink_camera_data"
@@ -42,6 +42,26 @@ PPPP_CMD_SYSTEM_REBOOT = 0x0007
 PPPP_CMD_WIFI_SET = 0x0008
 PPPP_CMD_DEV_SEARCH = 0x0009
 
+# Known Camera Access Point SSID prefixes in factory mode
+CAMERA_AP_SSID_PREFIXES = (
+    "AYS-",
+    "ACCQ-",
+    "BCCQ-",
+    "CCCQ-",
+    "DG-",
+    "XY-",
+    "A9-",
+    "X5-",
+    "IPC-",
+    "CLOUDCAM",
+    "V380",
+    "MC-",
+    "BAT-",
+    "PTZ-",
+    "Q6-",
+    "HD-",
+)
+
 # Camera Statuses
 STATUS_ONLINE = "online"
 STATUS_OFFLINE = "offline"
@@ -67,7 +87,9 @@ WS_TYPE_SAVE_LAYOUT = "domolink_camera/save_layout"
 WS_TYPE_SAVE_CAMERA = "domolink_camera/save_camera"
 WS_TYPE_DELETE_CAMERA = "domolink_camera/delete_camera"
 WS_TYPE_START_PAIRING = "domolink_camera/start_pairing"
+WS_TYPE_STOP_PAIRING = "domolink_camera/stop_pairing"
 WS_TYPE_PAIR_STATUS = "domolink_camera/pair_status"
+WS_TYPE_SCAN_WIFI_APS = "domolink_camera/scan_wifi_aps"
 WS_TYPE_SCAN_LOCAL = "domolink_camera/scan_local"
 WS_TYPE_GET_ENTITIES = "domolink_camera/get_entities"
 WS_TYPE_TRIGGER_LIVE = "domolink_camera/trigger_live"

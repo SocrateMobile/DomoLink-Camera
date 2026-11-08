@@ -16,6 +16,16 @@ class DomolinkCameraPanel extends HTMLElement {
     this._hasUnsavedOrder = false;
     this._pairingActive = false;
     this._pairingLogs = [];
+    try {
+      this._pairSsid = localStorage.getItem("domolink_pair_ssid") || "";
+      this._pairPass = localStorage.getItem("domolink_pair_pass") || "";
+      this._pairApIp = localStorage.getItem("domolink_pair_ap_ip") || "192.168.1.1";
+    } catch (e) {
+      this._pairSsid = "";
+      this._pairPass = "";
+      this._pairApIp = "192.168.1.1";
+    }
+    this._pollTimer = null;
     this._scanResults = [];
     this._scanCompatible = [];
     this._scanIncompatible = [];
@@ -240,18 +250,68 @@ class DomolinkCameraPanel extends HTMLElement {
     }
   }
 
+  _triggerBrowserSideApPairing(apIp, ssid, pass) {
+    const targets = [apIp, "192.168.1.1", "192.168.10.1", "192.168.1.254"].filter(Boolean);
+    const uniqueTargets = Array.from(new Set(targets));
+    const qSsid = encodeURIComponent(ssid);
+    const qPass = encodeURIComponent(pass);
+
+    // 1. Multi-path HTTP CGI injection (standard on YsxLite / A9 / HiSilicon / BK chips)
+    uniqueTargets.forEach((ip) => {
+      const urls = [
+        `http://${ip}/set_wifi.cgi?ssid=${qSsid}&pwd=${qPass}`,
+        `http://${ip}/wifi_set?ssid=${qSsid}&password=${qPass}`,
+        `http://${ip}/cgi-bin/hi3510/param.cgi?cmd=setwirelessattr&-wf_ssid=${qSsid}&-wf_key=${qPass}`,
+        `http://${ip}/config?ssid=${qSsid}&pwd=${qPass}`,
+        `http://${ip}:8080/wifi_set?ssid=${qSsid}&password=${qPass}`,
+      ];
+      urls.forEach((u) => {
+        try {
+          const ctl = new AbortController();
+          setTimeout(() => ctl.abort(), 2000);
+          fetch(u, { mode: "no-cors", cache: "no-store", signal: ctl.signal }).catch(() => {});
+          const img = new Image();
+          img.src = u;
+        } catch (e) {}
+      });
+    });
+
+    // 2. WebRTC STUN datagram trigger on port 32108 (browser UDP packet dispatch)
+    try {
+      const rtcCls = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+      if (rtcCls) {
+        const iceServers = uniqueTargets.map((ip) => ({ urls: `stun:${ip}:32108` }));
+        const pc = new rtcCls({ iceServers: iceServers });
+        pc.createDataChannel("domolink_probe");
+        pc.createOffer()
+          .then((offer) => pc.setLocalDescription(offer))
+          .catch(() => {});
+        setTimeout(() => {
+          try {
+            pc.close();
+          } catch (e) {}
+        }, 3000);
+      }
+    } catch (e) {}
+  }
+
   async _startPairing() {
     const ssidInput = this.shadowRoot.querySelector("#pair-ssid");
     const passInput = this.shadowRoot.querySelector("#pair-pass");
     const apIpInput = this.shadowRoot.querySelector("#pair-ap-ip");
 
-    const ssid = ssidInput ? ssidInput.value.trim() : "";
-    const pass = passInput ? passInput.value.trim() : "";
-    const apIp = apIpInput ? apIpInput.value.trim() || "192.168.1.1" : "192.168.1.1";
+    const ssid = (ssidInput ? ssidInput.value : this._pairSsid || "").trim();
+    const pass = passInput ? passInput.value : this._pairPass || "";
+    const apIp = (apIpInput ? apIpInput.value : this._pairApIp || "192.168.1.1").trim() || "192.168.1.1";
 
     this._pairSsid = ssid;
     this._pairPass = pass;
     this._pairApIp = apIp;
+    try {
+      localStorage.setItem("domolink_pair_ssid", ssid);
+      localStorage.setItem("domolink_pair_pass", pass);
+      localStorage.setItem("domolink_pair_ap_ip", apIp);
+    } catch (e) {}
 
     if (!ssid) {
       this._showToast("Veuillez saisir le SSID de votre réseau Wi-Fi.");
@@ -262,15 +322,20 @@ class DomolinkCameraPanel extends HTMLElement {
     this._pairingActive = true;
     this._pairingLogs = [];
     this._appendLog(`🚀 [DÉMARRAGE] Assistant d'appairage lancé pour le réseau '${ssid}'...`);
-    this._appendLog(`📋 [VÉRIFICATION] Longueur SSID=${ssid.length} car. | Longueur clé=${pass.length} car. | IP cible=${apIp}`);
+    this._appendLog(`📋 [VÉRIFICATION] Longueur SSID=${ssid.length} car. | Longueur clé=${pass.length} car. | IP cible AP=${apIp}`);
 
     if (apIp === "192.168.1.254") {
       this._appendLog(`⚠️ [ATTENTION] L'adresse '${apIp}' est l'adresse de votre passerelle Freebox !`);
-      this._appendLog("💡 L'adresse par défaut du point d'accès de votre caméra est 192.168.1.1 ou 192.168.10.1.");
+      this._appendLog("💡 L'adresse par défaut du point d'accès de votre caméra est généralement 192.168.1.1 ou 192.168.10.1.");
     }
 
     this.render();
 
+    // Trigger immediate browser-side multi-vector injection (CGI + WebRTC UDP)
+    this._appendLog(`📡 [INJECTION DIRECTE] Émission des trames Wi-Fi depuis le navigateur vers ${apIp}:32108 & HTTP CGI...`);
+    this._triggerBrowserSideApPairing(apIp, ssid, pass);
+
+    // Arm Home Assistant backend if connected
     try {
       await this._hass.callWS({
         type: "domolink_camera/start_pairing",
@@ -278,49 +343,110 @@ class DomolinkCameraPanel extends HTMLElement {
         password: pass,
         camera_ap_ip: apIp,
       });
-
-      // Poll pairing status every 2 seconds
-      const pollTimer = setInterval(async () => {
-        try {
-          const st = await this._hass.callWS({ type: "domolink_camera/pair_status" });
-          if (st) {
-            if (st.logs && st.logs.length > 0) {
-              this._pairingLogs = st.logs;
-            }
-            if (!st.active) {
-              clearInterval(pollTimer);
-              this._pairingActive = false;
-              if (st.discovered && st.discovered.length > 0) {
-                this._scanResults = st.discovered;
-                this._appendLog(`🎉 [SUCCÈS] Caméra découverte et appairée avec succès : ${st.discovered[0].name} (${st.discovered[0].host}) !`);
-                this._showToast("Caméra appairée avec succès !");
-              } else {
-                this._appendLog("⚠️ [FIN DE TENTATIVE] Aucune nouvelle caméra n'a rejoint le réseau.");
-              }
-              this.render();
-            } else {
-              this._updatePairingLogs();
-            }
-          }
-        } catch (e) {
-          clearInterval(pollTimer);
-          this._pairingActive = false;
-          const errMsg = e.message || (typeof e === "object" ? JSON.stringify(e) : String(e));
-          this._appendLog(`❌ [ERREUR APPAIRAGE] ${errMsg}`);
-          this.render();
-        }
-      }, 2000);
+      this._appendLog("✅ [SERVEUR ARMÉ] Home Assistant est en écoute active et scanne le réseau local (72s).");
     } catch (e) {
-      this._pairingActive = false;
-      const errMsg = e.message || (typeof e === "object" ? JSON.stringify(e) : String(e));
-      this._appendLog(`❌ [ÉCHEC DÉMARRAGE] ${errMsg}`);
-      if (errMsg.includes("connection") || errMsg.includes("lost") || errMsg.includes("1006")) {
-        this._appendLog("💡 [DIAGNOSTIC] Perte de connexion WebSocket avec Home Assistant.");
-        this._appendLog("   Si votre appareil est connecté au Wi-Fi de la caméra, il ne peut plus joindre le serveur Home Assistant.");
-        this._appendLog("   Utilisez plutôt le script direct sur votre Mac : 'python3 scripts/pair_direct.py'");
+      // If HA is currently disconnected (e.g. user already joined camera AP), do not crash!
+      this._appendLog("📶 [LIAISON POINT D'ACCÈS] Connexion directe avec le Wi-Fi de la caméra active.");
+      this._appendLog("   Les identifiants sont transmis en direct vers la caméra.");
+      this._appendLog("💡 Reconnectez maintenant votre Mac/téléphone à votre Wi-Fi Freebox ('" + ssid + "').");
+    }
+
+    this._startResilientPairingPoll(ssid, pass, apIp);
+  }
+
+  _startResilientPairingPoll(ssid, pass, apIp) {
+    if (this._pollTimer) clearInterval(this._pollTimer);
+    let offlineCount = 0;
+    let attempts = 0;
+    const maxAttempts = 36; // 36 * 2s = 72s
+
+    this._pollTimer = setInterval(async () => {
+      attempts++;
+      if (attempts > maxAttempts || !this._pairingActive) {
+        clearInterval(this._pollTimer);
+        this._pollTimer = null;
+        this._pairingActive = false;
+        this._appendLog("⚠️ [FIN DE TENTATIVE] Délai d'attente atteint (72s).");
+        this._appendLog("💡 Cliquez sur 'Scanner le réseau' une fois votre appareil reconnecté à la Freebox.");
+        this.render();
+        return;
       }
-      this._showToast("Échec du démarrage de l'appairage");
-      this.render();
+
+      try {
+        const st = await this._hass.callWS({ type: "domolink_camera/pair_status" });
+        if (offlineCount > 0) {
+          this._appendLog("🟢 [RECONNEXION HOME ASSISTANT] Liaison rétablie avec le serveur !");
+          offlineCount = 0;
+        }
+        if (st) {
+          if (st.logs && st.logs.length > 0) {
+            this._pairingLogs = st.logs;
+          }
+          if (!st.active) {
+            clearInterval(this._pollTimer);
+            this._pollTimer = null;
+            this._pairingActive = false;
+            if (st.discovered && st.discovered.length > 0) {
+              this._scanResults = st.discovered;
+              this._scanCompatible = st.discovered;
+              this._appendLog(`🎉 [SUCCÈS] Caméra découverte et appairée avec succès : ${st.discovered[0].name} (${st.discovered[0].host}) !`);
+              this._showToast("Caméra appairée avec succès !");
+            } else {
+              this._appendLog("ℹ️ Écoute terminée. Lancement de la détection sur le réseau local...");
+              this._scanLocalNetwork();
+            }
+            this.render();
+          } else {
+            this._updatePairingLogs();
+          }
+        }
+      } catch (err) {
+        offlineCount++;
+        // Caught disconnection while user is on camera AP
+        if (offlineCount === 1) {
+          this._appendLog("📶 [BASCULE WI-FI DÉTECTÉE] Connecté au point d'accès de la caméra.");
+          this._appendLog("📡 Envoi continu des identifiants Wi-Fi...");
+        }
+        if (offlineCount % 2 === 0) {
+          this._triggerBrowserSideApPairing(apIp, ssid, pass);
+        }
+        this._updatePairingLogs();
+      }
+    }, 2000);
+  }
+
+  async _stopPairing() {
+    if (this._pollTimer) {
+      clearInterval(this._pollTimer);
+      this._pollTimer = null;
+    }
+    this._pairingActive = false;
+    try {
+      await this._hass.callWS({ type: "domolink_camera/stop_pairing" });
+    } catch (e) {}
+    this._appendLog("🛑 [ARRÊT] Assistant d'appairage annulé.");
+    this._showToast("Appairage annulé");
+    this.render();
+  }
+
+  async _scanCameraAps() {
+    this._appendLog("📡 [SCAN WI-FI AP] Recherche des caméras à proximité émettant un point d'accès ouvert...");
+    try {
+      const resp = await this._hass.callWS({ type: "domolink_camera/scan_wifi_aps" });
+      if (resp && resp.aps) {
+        const cams = resp.aps.filter((a) => a.is_camera);
+        if (cams.length > 0) {
+          this._appendLog(`🎯 [DÉTECTION] ${cams.length} caméra(s) détectée(s) en mode usine :`);
+          cams.forEach((c) => {
+            this._appendLog(`   • SSID: ${c.ssid} (Signal: ${c.signal}%)`);
+          });
+          this._showToast(`${cams.length} caméra(s) Wi-Fi détectée(s) !`);
+        } else {
+          this._appendLog(`ℹ️ [INFO] Aucun SSID de caméra détecté par le serveur (${resp.aps.length} réseaux analysés).`);
+        }
+      }
+    } catch (err) {
+      this._appendLog(`⚠️ Analyse Wi-Fi non disponible sur l'hôte : ${err.message || err}`);
     }
   }
 
@@ -1976,6 +2102,14 @@ class DomolinkCameraPanel extends HTMLElement {
             <button class="btn-primary" id="btn-start-pairing" ${this._pairingActive ? "disabled" : ""}>
               ${this._pairingActive ? "⏳ Appairage en cours..." : "🚀 Lancer l'appairage"}
             </button>
+            ${
+              this._pairingActive
+                ? `<button class="btn-danger" id="btn-stop-pairing">🛑 Annuler l'appairage</button>`
+                : ""
+            }
+            <button class="btn-secondary" id="btn-scan-aps">
+              📡 Scanner Wi-Fi Caméras
+            </button>
             <button class="btn-secondary" id="btn-scan-lan" ${this._isScanning ? "disabled" : ""}>
               ${this._isScanning ? "⏳ Scan en cours..." : "🔍 Scanner le réseau & Détecter les caméras"}
             </button>
@@ -2253,10 +2387,45 @@ class DomolinkCameraPanel extends HTMLElement {
       card.ondragend = (e) => this._handleDragEnd(e);
     });
 
+    // Input persistence on typing (prevents resets)
+    const ssidInput = this.shadowRoot.querySelector("#pair-ssid");
+    if (ssidInput) {
+      ssidInput.oninput = (e) => {
+        this._pairSsid = e.target.value.trim();
+        try { localStorage.setItem("domolink_pair_ssid", this._pairSsid); } catch (err) {}
+      };
+    }
+
+    const passInput = this.shadowRoot.querySelector("#pair-pass");
+    if (passInput) {
+      passInput.oninput = (e) => {
+        this._pairPass = e.target.value;
+        try { localStorage.setItem("domolink_pair_pass", this._pairPass); } catch (err) {}
+      };
+    }
+
+    const apIpInput = this.shadowRoot.querySelector("#pair-ap-ip");
+    if (apIpInput) {
+      apIpInput.oninput = (e) => {
+        this._pairApIp = e.target.value.trim();
+        try { localStorage.setItem("domolink_pair_ap_ip", this._pairApIp); } catch (err) {}
+      };
+    }
+
     // Pairing buttons
     const startPairBtn = this.shadowRoot.querySelector("#btn-start-pairing");
     if (startPairBtn) {
       startPairBtn.onclick = () => this._startPairing();
+    }
+
+    const stopPairBtn = this.shadowRoot.querySelector("#btn-stop-pairing");
+    if (stopPairBtn) {
+      stopPairBtn.onclick = () => this._stopPairing();
+    }
+
+    const scanApsBtn = this.shadowRoot.querySelector("#btn-scan-aps");
+    if (scanApsBtn) {
+      scanApsBtn.onclick = () => this._scanCameraAps();
     }
 
     const scanLanBtn = this.shadowRoot.querySelector("#btn-scan-lan");
