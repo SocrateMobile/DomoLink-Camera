@@ -265,9 +265,23 @@ class WifiPairingEngine:
         except Exception as e:
             _LOGGER.debug("UDP PPPP broadcast error: %s", e)
 
-        # 2. Collect candidate LAN IPs from ARP table
-        def _get_candidate_ips() -> set[str]:
+        # 2. Collect candidate LAN IPs from ARP table and detect gateway IPs
+        def _get_network_info() -> tuple[set[str], set[str]]:
             ips = set()
+            gateways = {"192.168.1.254", "192.168.0.254", "192.168.1.1", "192.168.0.1"}
+
+            # Read default gateway from /proc/net/route
+            try:
+                with open("/proc/net/route", "r", encoding="utf-8") as f:
+                    for line in f.readlines()[1:]:
+                        parts = line.strip().split()
+                        if len(parts) >= 3 and parts[1] == "00000000":
+                            gw_ip = socket.inet_ntoa(struct.pack("<L", int(parts[2], 16)))
+                            gateways.add(gw_ip)
+            except Exception:
+                pass
+
+            # Read ARP table
             try:
                 with open("/proc/net/arp", "r", encoding="utf-8") as f:
                     for line in f.readlines()[1:]:
@@ -289,38 +303,53 @@ class WifiPairingEngine:
                 except Exception:
                     pass
 
-            return ips
+            return ips, gateways
 
         try:
-            candidate_ips = await self.hass.async_add_executor_job(_get_candidate_ips)
+            candidate_ips, gateway_ips = await self.hass.async_add_executor_job(_get_network_info)
         except Exception:
-            candidate_ips = set()
+            candidate_ips, gateway_ips = set(), {"192.168.1.254", "192.168.0.254", "192.168.1.1", "192.168.0.1"}
 
-        # 3. Concurrent TCP port probing on candidate IPs (RTSP 554, 8554)
+        # 3. Concurrent RTSP handshake probing on candidate IPs (RTSP 554, 8554)
         async def _probe_ip(ip: str) -> dict[str, Any] | None:
-            # Skip if already found via PPPP
+            # Skip if already found via PPPP or if it is a known router / Freebox gateway
             if any(d["host"] == ip for d in compatible_found):
                 return None
+            if ip in gateway_ips:
+                return None
 
-            # Test RTSP port 554
+            # Test RTSP port 554 / 8554 with real RTSP OPTIONS protocol verification
             for port in (554, 8554):
                 try:
-                    _, writer = await asyncio.wait_for(
-                        asyncio.open_connection(ip, port), timeout=0.35
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(ip, port), timeout=0.4
                     )
+                    # Send RTSP OPTIONS probe to verify it is actually an RTSP camera
+                    probe_req = (
+                        f"OPTIONS rtsp://{ip}:{port}/ RTSP/1.0\r\n"
+                        f"CSeq: 1\r\n"
+                        f"User-Agent: DomoLink-Camera\r\n\r\n"
+                    )
+                    writer.write(probe_req.encode("ascii"))
+                    await writer.drain()
+
+                    # Require valid RTSP response signature (e.g. RTSP/1.0 200 or RTSP/1.0 401)
+                    raw_resp = await asyncio.wait_for(reader.read(256), timeout=0.7)
                     writer.close()
                     await writer.wait_closed()
-                    return {
-                        "host": ip,
-                        "port": port,
-                        "device_id": f"RTSP_{ip.replace('.', '_')}_{port}",
-                        "name": f"Caméra IP / RTSP ({ip})",
-                        "driver": DRIVER_GENERIC_RTSP,
-                        "protocol": f"RTSP Standard (Port {port})",
-                        "model": "Generic RTSP / ONVIF IP Camera",
-                        "details": f"Serveur RTSP actif détecté sur le port {port} - Compatible flux direct H.264/RTSP",
-                        "compatible": True,
-                    }
+
+                    if b"RTSP/1." in raw_resp:
+                        return {
+                            "host": ip,
+                            "port": port,
+                            "device_id": f"RTSP_{ip.replace('.', '_')}_{port}",
+                            "name": f"Caméra IP / RTSP ({ip})",
+                            "driver": DRIVER_GENERIC_RTSP,
+                            "protocol": f"RTSP Standard (Port {port})",
+                            "model": "Generic RTSP / ONVIF IP Camera",
+                            "details": f"Serveur RTSP actif et validé sur le port {port} - Compatible flux direct H.264/RTSP",
+                            "compatible": True,
+                        }
                 except Exception:
                     pass
             return None
