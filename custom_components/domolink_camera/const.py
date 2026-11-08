@@ -2,7 +2,7 @@
 
 DOMAIN = "domolink_camera"
 NAME = "DomoLink Camera"
-VERSION = "1.0.4"
+VERSION = "1.1.0"
 
 # Storage
 STORAGE_KEY = "domolink_camera_data"
@@ -71,3 +71,7 @@ WS_TYPE_GET_ENTITIES = "domolink_camera/get_entities"
 WS_TYPE_TRIGGER_LIVE = "domolink_camera/trigger_live"
 WS_TYPE_SET_IR = "domolink_camera/set_ir"
 WS_TYPE_REBOOT = "domolink_camera/reboot"
+WS_TYPE_DETECT_BOX = "domolink_camera/detect_box"
+WS_TYPE_GET_TV_CHANNELS = "domolink_camera/get_tv_channels"
+WS_TYPE_GET_TV_STREAM = "domolink_camera/get_tv_stream"
+WS_TYPE_PIN_TV_CAMERA = "domolink_camera/pin_tv_camera"

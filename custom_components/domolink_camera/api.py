@@ -15,10 +15,15 @@ import voluptuous as vol
 from .const import (
     ALLOWED_ENTITY_DOMAINS,
     DOMAIN,
+    DRIVER_GENERIC_RTSP,
     WS_TYPE_DELETE_CAMERA,
+    WS_TYPE_DETECT_BOX,
     WS_TYPE_GET_CAMERAS,
     WS_TYPE_GET_ENTITIES,
+    WS_TYPE_GET_TV_CHANNELS,
+    WS_TYPE_GET_TV_STREAM,
     WS_TYPE_PAIR_STATUS,
+    WS_TYPE_PIN_TV_CAMERA,
     WS_TYPE_REBOOT,
     WS_TYPE_SAVE_CAMERA,
     WS_TYPE_SAVE_LAYOUT,
@@ -286,6 +291,147 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         ok = await mgr.async_reboot(msg["camera_id"])
         connection.send_result(msg["id"], {"success": ok})
 
+    @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_DETECT_BOX})
+    @websocket_api.async_response
+    async def ws_detect_box(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        """Detect local ISP box (Freebox, Livebox, SFR, Bbox)."""
+        mgr = hass.data[DOMAIN]["manager"]
+        box_info = await mgr.box_detector.async_detect_box()
+        connection.send_result(msg["id"], box_info)
+
+    @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_GET_TV_CHANNELS})
+    @websocket_api.async_response
+    async def ws_get_tv_channels(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        """Return available TV channels for detected box."""
+        mgr = hass.data[DOMAIN]["manager"]
+        channels = await mgr.box_detector.async_get_tv_channels()
+        box_info = await mgr.box_detector.async_detect_box()
+        connection.send_result(msg["id"], {"box": box_info, "channels": channels})
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_GET_TV_STREAM,
+        vol.Required("channel_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_get_tv_stream(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        """Get playable HLS or RTSP stream URL for chosen TV channel."""
+        mgr = hass.data[DOMAIN]["manager"]
+        channel_id = msg["channel_id"]
+        channels = await mgr.box_detector.async_get_tv_channels()
+        channel = next((c for c in channels if c["id"] == channel_id), None)
+        if not channel:
+            connection.send_error(msg["id"], "not_found", "Chaîne non trouvée")
+            return
+
+        # 1. Prefer direct web HLS stream if available
+        if channel.get("web_hls_url"):
+            connection.send_result(
+                msg["id"],
+                {
+                    "url": channel["web_hls_url"],
+                    "format": "hls",
+                    "channel": channel,
+                },
+            )
+            return
+
+        # 2. If it's a web HLS stream directly
+        if channel.get("type") == "hls" and channel.get("stream_url"):
+            connection.send_result(
+                msg["id"],
+                {
+                    "url": channel["stream_url"],
+                    "format": "hls",
+                    "channel": channel,
+                },
+            )
+            return
+
+        # 3. For Freebox RTSP stream, try HA stream component to get an HLS master playlist
+        rtsp_url = channel.get("stream_url")
+        if rtsp_url and "stream" in hass.config.components:
+            try:
+                stream_comp = getattr(hass.components, "stream", None)
+                if stream_comp and hasattr(stream_comp, "async_create_stream"):
+                    stream = await stream_comp.async_create_stream(hass, rtsp_url)
+                    stream.add_provider("hls")
+                    await stream.start()
+                    hls_url = stream.endpoint_url("hls")
+                    connection.send_result(
+                        msg["id"],
+                        {
+                            "url": hls_url,
+                            "format": "hls",
+                            "channel": channel,
+                        },
+                    )
+                    return
+            except Exception as e:
+                _LOGGER.debug("Error creating HA HLS stream for %s: %s", channel_id, e)
+
+        # Fallback to direct stream_url
+        connection.send_result(
+            msg["id"],
+            {
+                "url": channel.get("stream_url", ""),
+                "format": channel.get("type", "rtsp"),
+                "channel": channel,
+            },
+        )
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_PIN_TV_CAMERA,
+        vol.Required("channel_id"): str,
+    })
+    @websocket_api.async_response
+    async def ws_pin_tv_camera(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        """Pin a TV channel as a live camera in the Cameras grid."""
+        mgr = hass.data[DOMAIN]["manager"]
+        channel_id = msg["channel_id"]
+        channels = await mgr.box_detector.async_get_tv_channels()
+        channel = next((c for c in channels if c["id"] == channel_id), None)
+        if not channel:
+            connection.send_error(msg["id"], "not_found", "Chaîne non trouvée")
+            return
+
+        cam_id = f"tv_{channel_id}"
+        rtsp_url = channel.get("stream_url", "")
+        # Parse host and path if RTSP
+        host = "mafreebox.freebox.fr"
+        path = "/live/ch0"
+        port = 554
+        if "rtsp://" in rtsp_url:
+            cleaned = rtsp_url.replace("rtsp://", "")
+            if "/" in cleaned:
+                host_part, path_part = cleaned.split("/", 1)
+                host = host_part.split(":")[0]
+                path = f"/{path_part}"
+
+        cam_config = {
+            "id": cam_id,
+            "name": f"TV - {channel['name']}",
+            "description": f"Chaîne TV {channel['name']} ({channel.get('category', 'Direct')})",
+            "driver": DRIVER_GENERIC_RTSP,
+            "host": host,
+            "port": port,
+            "stream_path": path,
+            "order": len(mgr.cameras),
+            "linked_entities": [],
+        }
+
+        mgr.cameras[cam_id] = cam_config
+        mgr._init_driver(cam_id, cam_config)
+        await mgr.async_save()
+        connection.send_result(msg["id"], {"success": True, "camera": cam_config})
+
     websocket_api.async_register_command(hass, ws_get_cameras)
     websocket_api.async_register_command(hass, ws_save_layout)
     websocket_api.async_register_command(hass, ws_save_camera)
@@ -297,3 +443,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_trigger_live)
     websocket_api.async_register_command(hass, ws_set_ir)
     websocket_api.async_register_command(hass, ws_reboot)
+    websocket_api.async_register_command(hass, ws_detect_box)
+    websocket_api.async_register_command(hass, ws_get_tv_channels)
+    websocket_api.async_register_command(hass, ws_get_tv_stream)
+    websocket_api.async_register_command(hass, ws_pin_tv_camera)
