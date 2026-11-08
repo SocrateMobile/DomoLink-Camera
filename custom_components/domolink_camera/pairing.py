@@ -15,6 +15,7 @@ from .const import (
     DOMAIN,
     DRIVER_GENERIC_MJPEG,
     DRIVER_GENERIC_RTSP,
+    DRIVER_HA_PROXY,
     DRIVER_YSXLITE_PPPP,
     PPPP_CMD_DEV_SEARCH,
     PPPP_CMD_WIFI_SET,
@@ -127,12 +128,20 @@ class WifiPairingEngine:
         """Return True if pairing process is active."""
         return self._is_pairing
 
+    def add_log(self, msg: str) -> None:
+        """Add timestamped message to the terminal log."""
+        import datetime
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        self._pairing_log.append(f"[{now_str}] {msg}")
+        if len(self._pairing_log) > 60:
+            self._pairing_log = self._pairing_log[-60:]
+
     def get_status(self) -> dict[str, Any]:
         """Return pairing status snapshot."""
         return {
             "active": self._is_pairing,
             "step": self._current_step,
-            "logs": self._pairing_log[-10:],
+            "logs": self._pairing_log[-40:],
             "discovered": self._discovered_devices,
         }
 
@@ -384,6 +393,14 @@ class WifiPairingEngine:
                 if not eid.startswith("camera."):
                     continue
 
+                # Skip unavailable camera entities
+                if state.state == "unavailable":
+                    continue
+
+                # Filter out obvious mirror duplicates from Remote Home Assistant (e.g. _2, _2_2)
+                if re.search(r"_\d+(_\d+)*$", eid):
+                    continue
+
                 attrs = state.attributes or {}
                 friendly_name = attrs.get("friendly_name") or eid
                 model = attrs.get("model_name") or attrs.get("brand") or "Caméra Détectée"
@@ -398,7 +415,7 @@ class WifiPairingEngine:
                 if platform == DOMAIN:
                     continue
 
-                # Check if known compatible
+                # Check if known direct RTSP/MJPEG compatible
                 if platform in KNOWN_COMPATIBLE_PLATFORMS:
                     info = KNOWN_COMPATIBLE_PLATFORMS[platform]
                     compatible.append({
@@ -413,30 +430,21 @@ class WifiPairingEngine:
                         "compatible": True,
                         "source": "ha_entity",
                     })
-                # Check if known incompatible / proprietary / cloud
-                elif platform in KNOWN_INCOMPATIBLE_PLATFORMS:
-                    info = KNOWN_INCOMPATIBLE_PLATFORMS[platform]
-                    incompatible.append({
-                        "entity_id": eid,
-                        "name": friendly_name,
-                        "platform": info["platform_name"],
-                        "protocol": info["protocol"],
-                        "model": model,
-                        "reason": info["reason"],
-                        "compatible": False,
-                        "details": f"Gérée par l'intégration '{platform}'",
-                    })
                 else:
-                    # Unknown or generic platform
-                    incompatible.append({
-                        "entity_id": eid,
+                    # Active camera in HA (Tuya, Arlo, Xiaomi, Blink, etc.) proxied through Home Assistant!
+                    info = KNOWN_INCOMPATIBLE_PLATFORMS.get(platform, {})
+                    plat_name = info.get("platform_name") or platform.capitalize()
+                    compatible.append({
+                        "host": eid,
+                        "port": 0,
+                        "device_id": eid,
                         "name": friendly_name,
-                        "platform": platform.capitalize(),
-                        "protocol": f"Intégration {platform}",
-                        "model": model,
-                        "reason": f"Protocole géré par '{platform}'. Pour l'intégrer en direct dans DomoLink, vérifiez si un flux local RTSP ou MJPEG est exposé.",
-                        "compatible": False,
-                        "details": f"Plateforme: {platform}",
+                        "driver": DRIVER_HA_PROXY,
+                        "protocol": f"Passerelle Home Assistant ({plat_name})",
+                        "model": model if model != "Caméra Détectée" else f"Caméra {plat_name}",
+                        "details": f"Gérée par '{plat_name}' dans Home Assistant • Snapshot et Live streaming proxifiés automatiquement",
+                        "compatible": True,
+                        "source": "ha_entity",
                     })
 
         except Exception as e:
@@ -448,42 +456,63 @@ class WifiPairingEngine:
         """Execute autonomous Wi-Fi pairing routine."""
         self._is_pairing = True
         self._current_step = "sending_credentials"
-        self._pairing_log = [f"Démarrage de l'appairage pour le réseau Wi-Fi '{ssid}'..."]
+        self._pairing_log = []
         self._discovered_devices = []
+
+        self.add_log(f"🚀 Initialisation de l'assistant d'appairage Wi-Fi pour '{ssid}'...")
+        self.add_log(f"📋 Paramètres : Longueur SSID={len(ssid)} car. | Longueur mot de passe={len(password)} car.")
+
+        # Detect if camera_ap_ip is a common router IP
+        if camera_ap_ip in ("192.168.1.254", "192.168.1.1", "192.168.0.254", "192.168.0.1"):
+            self.add_log(f"⚠️ AVERTISSEMENT : L'IP cible '{camera_ap_ip}' correspond à votre passerelle / Freebox.")
+            self.add_log("💡 Pour que l'appairage fonctionne, connectez votre appareil au réseau Wi-Fi temporaire de la caméra (ex: AYS-xxx, ACCQ-xxx).")
+            self.add_log("💡 En mode direct AP, l'IP de la caméra est généralement 192.168.10.1 ou 192.168.1.254 (isolée).")
 
         try:
             # Step 1: Send Wi-Fi credentials to camera AP
-            self._pairing_log.append(f"Transmission des identifiants vers la caméra ({camera_ap_ip}:32108)...")
+            self.add_log(f"📡 Transmission des identifiants vers la caméra ({camera_ap_ip}:32108)...")
             success = await self._send_wifi_config(camera_ap_ip, ssid, password)
 
             if success:
-                self._pairing_log.append("Identifiants transmis ! En attente de redémarrage de la caméra...")
+                self.add_log("✅ Trame UDP PPPP_CMD_WIFI_SET envoyée avec succès à la caméra !")
+                self.add_log("🔄 La caméra enregistre le mot de passe et redémarre pour se connecter à votre Freebox...")
             else:
-                self._pairing_log.append("Envoi initial UDP terminé. Scan actif en cours...")
+                self.add_log("⚠️ Envoi direct UDP non acquitté. Envoi par broadcast étendu en cours...")
 
             # Step 2: Listen for camera connecting to local Wi-Fi
             self._current_step = "waiting_connection"
-            for attempt in range(1, 7):
-                self._pairing_log.append(f"Recherche de la nouvelle caméra sur le réseau local (tentative {attempt}/6)...")
+            max_attempts = 8
+            for attempt in range(1, max_attempts + 1):
+                self.add_log(f"🔍 [Tentative {attempt}/{max_attempts}] Recherche de la caméra connectée sur le réseau local...")
                 await asyncio.sleep(4)
                 scan_res = await self.async_scan_all_cameras(timeout=3.0)
                 found = scan_res.get("compatible", [])
-                if found:
-                    self._discovered_devices = found
+                # Only look for newly connected LAN cameras (host is an IP, not HA entity)
+                new_cams = [d for d in found if not str(d.get("host", "")).startswith("camera.")]
+                if new_cams:
+                    self._discovered_devices = new_cams
                     self._current_step = "completed"
-                    self._pairing_log.append(f"Caméra détectée avec succès : {found[0].get('host', found[0].get('name'))} !")
+                    cam_name = new_cams[0].get("name", "Caméra Détectée")
+                    cam_ip = new_cams[0].get("host", "")
+                    self.add_log(f"🎉 CAMÉRA DÉTECTÉE SUR LE RÉSEAU : {cam_name} ({cam_ip}) !")
+                    self.add_log("✅ Appairage terminé avec succès ! Vous pouvez l'ajouter à vos caméras.")
                     self._is_pairing = False
-                    return {"success": True, "devices": found}
+                    return {"success": True, "devices": new_cams}
 
             self._current_step = "timeout"
-            self._pairing_log.append("Délai dépassé. Si la caméra a clignoté, vérifiez son IP sur votre box.")
+            self.add_log("❌ DÉLAI DÉPASSÉ (32s) : La caméra n'a pas répondu sur votre réseau local.")
+            self.add_log("📋 DIAGNOSTIC DES CAUSES PROBABLES & SOLUTIONS :")
+            self.add_log("  1. Fréquence 5 GHz : Ces caméras ne fonctionnent qu'en Wi-Fi 2.4 GHz. Vérifiez que la bande 2.4 GHz est bien activée sur votre Freebox.")
+            self.add_log("  2. Clé Wi-Fi : Vérifiez scrupuleusement le mot de passe (attention aux majuscules/minuscules et caractères spéciaux).")
+            self.add_log("  3. Point d'Accès : Étiez-vous bien connecté au Wi-Fi de la caméra lors du clic sur 'Lancer l'appairage' ?")
+            self.add_log("  4. Rapprochez la caméra à 1 ou 2 mètres de votre box Wi-Fi lors de l'initialisation.")
             self._is_pairing = False
             return {"success": False, "devices": []}
 
         except Exception as err:
             _LOGGER.error("Pairing failure: %s", err)
             self._current_step = "error"
-            self._pairing_log.append(f"Erreur lors de l'appairage: {err}")
+            self.add_log(f"❌ ERREUR SYSTÈME LORS DE L'APPAIRAGE : {err}")
             self._is_pairing = False
             return {"success": False, "error": str(err)}
 

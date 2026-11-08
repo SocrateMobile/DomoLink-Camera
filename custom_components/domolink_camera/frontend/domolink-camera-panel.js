@@ -223,6 +223,23 @@ class DomolinkCameraPanel extends HTMLElement {
   }
 
   // --- Settings Actions ---
+  _appendLog(msg) {
+    const time = new Date().toLocaleTimeString("fr-FR", { hour12: false });
+    const formatted = `[${time}] ${msg}`;
+    if (!this._pairingLogs) this._pairingLogs = [];
+    this._pairingLogs.push(formatted);
+    if (this._pairingLogs.length > 80) this._pairingLogs.shift();
+    this._updatePairingLogs();
+  }
+
+  _updatePairingLogs() {
+    const logBox = this.shadowRoot.querySelector("#pairing-logs") || this.shadowRoot.querySelector(".pairing-logs");
+    if (logBox) {
+      logBox.innerHTML = this._pairingLogs.map((l) => `<div>> ${l}</div>`).join("");
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+  }
+
   async _startPairing() {
     const ssidInput = this.shadowRoot.querySelector("#pair-ssid");
     const passInput = this.shadowRoot.querySelector("#pair-pass");
@@ -230,15 +247,24 @@ class DomolinkCameraPanel extends HTMLElement {
 
     const ssid = ssidInput ? ssidInput.value.trim() : "";
     const pass = passInput ? passInput.value.trim() : "";
-    const apIp = apIpInput ? apIpInput.value.trim() || "192.168.1.254" : "192.168.1.254";
+    const apIp = apIpInput ? apIpInput.value.trim() || "192.168.10.1" : "192.168.10.1";
 
     if (!ssid) {
-      alert("Veuillez saisir le SSID de votre réseau Wi-Fi.");
+      this._showToast("Veuillez saisir le SSID de votre réseau Wi-Fi.");
+      this._appendLog("⚠️ [VALIDATION] Nom du réseau Wi-Fi (SSID) manquant.");
       return;
     }
 
     this._pairingActive = true;
-    this._pairingLogs = ["Initialisation de l'assistant d'appairage..."];
+    this._pairingLogs = [];
+    this._appendLog(`🚀 [DÉMARRAGE] Assistant d'appairage lancé pour le réseau '${ssid}'...`);
+    this._appendLog(`📋 [VÉRIFICATION] Longueur SSID=${ssid.length} car. | Longueur clé=${pass.length} car. | IP cible=${apIp}`);
+
+    if (apIp === "192.168.1.254" || apIp === "192.168.1.1") {
+      this._appendLog(`⚠️ [ATTENTION] L'adresse '${apIp}' est l'adresse de votre Freebox / Box Internet !`);
+      this._appendLog("💡 Assurez-vous d'avoir connecté votre PC ou smartphone au Wi-Fi propre de la caméra (ex: AYS-xxx, ACCQ-xxx) avant de lancer.");
+    }
+
     this.render();
 
     try {
@@ -254,13 +280,18 @@ class DomolinkCameraPanel extends HTMLElement {
         try {
           const st = await this._hass.callWS({ type: "domolink_camera/pair_status" });
           if (st) {
-            this._pairingLogs = st.logs || [];
+            if (st.logs && st.logs.length > 0) {
+              this._pairingLogs = st.logs;
+            }
             if (!st.active) {
               clearInterval(pollTimer);
               this._pairingActive = false;
               if (st.discovered && st.discovered.length > 0) {
                 this._scanResults = st.discovered;
+                this._appendLog(`🎉 [SUCCÈS] Caméra découverte et appairée avec succès : ${st.discovered[0].name} (${st.discovered[0].host}) !`);
                 this._showToast("Caméra appairée avec succès !");
+              } else {
+                this._appendLog("⚠️ [FIN DE TENTATIVE] Aucune nouvelle caméra n'a rejoint le réseau.");
               }
               this.render();
             } else {
@@ -270,27 +301,25 @@ class DomolinkCameraPanel extends HTMLElement {
         } catch (e) {
           clearInterval(pollTimer);
           this._pairingActive = false;
+          this._appendLog(`❌ [ERREUR APPAIRAGE] ${e.message || e}`);
           this.render();
         }
       }, 2000);
     } catch (e) {
       this._pairingActive = false;
+      this._appendLog(`❌ [ÉCHEC DÉMARRAGE] ${e.message || e}`);
       this._showToast("Échec du démarrage de l'appairage");
       this.render();
     }
   }
 
-  _updatePairingLogs() {
-    const logBox = this.shadowRoot.querySelector(".pairing-logs");
-    if (logBox) {
-      logBox.innerHTML = this._pairingLogs.map((l) => `<div>> ${l}</div>`).join("");
-      logBox.scrollTop = logBox.scrollHeight;
-    }
-  }
-
   async _scanLocalNetwork() {
     this._isScanning = true;
-    this._showToast("Scan du réseau en cours (UDP 32108, RTSP 554, ONVIF & entités HA)...");
+    this._appendLog("🔍 [SCAN RÉSEAU] Démarrage du scan multi-sources (Local LAN & Entités HA)...");
+    this._appendLog("📡 [LAN] Envoi broadcast UDP sur le port 32108 pour détecter caméras PPPP / YsxLite...");
+    this._appendLog("🌐 [LAN] Analyse de la table ARP et test de réponse RTSP port 554...");
+    this._appendLog("🏠 [HA] Inspection des comptes et entités caméras enregistrées dans Home Assistant...");
+    this._showToast("Scan du réseau en cours (UDP 32108, RTSP 554 & Entités HA)...");
     this.render();
 
     try {
@@ -306,34 +335,50 @@ class DomolinkCameraPanel extends HTMLElement {
         };
         this._scanResults = this._scanCompatible;
 
+        this._appendLog(`✅ [SCAN TERMINÉ] ${this._scanCompatible.length} caméra(s) compatible(s) trouvée(s) et prête(s) à l'ajout !`);
+        if (this._scanIncompatible.length > 0) {
+          this._appendLog(`ℹ️ [INFO] ${this._scanIncompatible.length} entité(s) secondaire(s) ou distantes filtrées.`);
+        }
+
         this._showToast(
-          `Scan terminé : ${this._scanCompatible.length} compatible(s), ${this._scanIncompatible.length} cloud/propriétaire(s)`
+          `Scan terminé : ${this._scanCompatible.length} caméra(s) prête(s) à l'intégration !`
         );
         this.render();
       }
     } catch (e) {
       this._isScanning = false;
+      this._appendLog(`❌ [ERREUR SCAN] Échec de l'analyse : ${e.message || e}`);
       this._showToast("Erreur lors du scan du réseau");
       this.render();
     }
   }
 
   async _addDiscoveredCamera(dev) {
+    this._appendLog(`📥 [INTÉGRATION] Ajout de la caméra '${dev.name}' en cours...`);
+    this._appendLog(`⚙️ [CONFIGURATION] Pilote assigné : ${dev.driver} (Cible : ${dev.host})`);
+
     const newCam = {
       name: dev.name || dev.model || "Caméra Wi-Fi",
-      description: dev.details || "Caméra détectée sur le réseau local",
-      driver: dev.driver || "ysxlite_pppp",
+      description: dev.details || "Caméra intégrée",
+      driver: dev.driver || "ha_proxy",
       host: dev.host,
       port: dev.port || (dev.driver === "generic_rtsp" ? 554 : 32108),
       linked_entities: [],
     };
-    await this._saveCamera(newCam);
 
-    // Update in-memory scan results
-    dev.already_added = true;
-    this._showToast(`Caméra ${dev.name || dev.host} ajoutée avec succès !`);
-    await this._fetchCameras();
-    this.render();
+    try {
+      this._appendLog("📸 [TEST FLUX] Vérification de l'acquisition de snapshot et initialisation du pilote...");
+      await this._saveCamera(newCam);
+
+      dev.already_added = true;
+      this._appendLog(`✅ [SUCCÈS] Caméra '${dev.name}' ajoutée à DomoLink ! Retrouvez-la dans l'onglet Caméras.`);
+      this._showToast(`Caméra ${dev.name} ajoutée avec succès !`);
+      await this._fetchCameras();
+      this.render();
+    } catch (err) {
+      this._appendLog(`❌ [ERREUR INTÉGRATION] Impossible d'ajouter '${dev.name}' : ${err.message || err}`);
+      this._showToast(`Erreur lors de l'ajout : ${err.message || err}`);
+    }
   }
 
   async _saveCamera(cam) {
@@ -863,18 +908,88 @@ class DomolinkCameraPanel extends HTMLElement {
           color: white;
         }
 
-        /* Pairing Logs Box */
-        .pairing-logs {
-          background: #000;
-          border: 1px solid rgba(255, 255, 255, 0.1);
-          border-radius: 8px;
-          padding: 12px;
-          font-family: monospace;
+        /* Pairing Logs Terminal Card */
+        .terminal-card {
+          margin-top: 18px;
+          background: #060a12;
+          border: 1px solid rgba(74, 222, 128, 0.3);
+          border-radius: 12px;
+          overflow: hidden;
+          box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+        }
+
+        .terminal-header {
+          background: rgba(15, 23, 42, 0.95);
+          border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+          padding: 10px 16px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+        }
+
+        .terminal-dots {
+          display: flex;
+          gap: 6px;
+        }
+
+        .terminal-dots span {
+          width: 10px;
+          height: 10px;
+          border-radius: 50%;
+          display: inline-block;
+        }
+
+        .dot-red { background: #ef4444; }
+        .dot-yellow { background: #f59e0b; }
+        .dot-green { background: #10b981; }
+
+        .terminal-title {
           font-size: 12px;
+          font-family: 'SF Mono', Monaco, Consolas, monospace;
+          color: #94a3b8;
+          font-weight: 600;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .terminal-status-badge {
+          background: rgba(16, 185, 129, 0.2);
+          color: #34d399;
+          font-size: 10px;
+          padding: 2px 6px;
+          border-radius: 4px;
+        }
+
+        .btn-clear-terminal {
+          background: transparent;
+          border: 1px solid rgba(255, 255, 255, 0.15);
+          color: #94a3b8;
+          font-size: 11px;
+          padding: 3px 10px;
+          border-radius: 6px;
+          cursor: pointer;
+          transition: all 0.2s ease;
+        }
+
+        .btn-clear-terminal:hover {
+          color: #ffffff;
+          border-color: #3b82f6;
+          background: rgba(59, 130, 246, 0.15);
+        }
+
+        .pairing-logs {
+          background: #040810;
+          padding: 14px 16px;
+          font-family: 'SF Mono', Monaco, Consolas, monospace;
+          font-size: 12px;
+          line-height: 1.6;
           color: #4ade80;
-          max-height: 160px;
+          min-height: 120px;
+          max-height: 240px;
           overflow-y: auto;
-          margin-top: 14px;
+          white-space: pre-wrap;
+          word-break: break-word;
         }
 
         /* Discovered List & Categorized Scan */
@@ -1842,7 +1957,7 @@ class DomolinkCameraPanel extends HTMLElement {
 
             <div class="form-group">
               <label for="pair-ap-ip">IP par défaut de la caméra en mode AP</label>
-              <input type="text" id="pair-ap-ip" class="form-input" value="192.168.1.254" />
+              <input type="text" id="pair-ap-ip" class="form-input" value="192.168.10.1" placeholder="Ex: 192.168.10.1 ou 192.168.1.254" />
             </div>
           </div>
 
@@ -1855,15 +1970,28 @@ class DomolinkCameraPanel extends HTMLElement {
             </button>
           </div>
 
-          ${
-            this._pairingLogs && this._pairingLogs.length > 0
-              ? `
-            <div class="pairing-logs">
-              ${this._pairingLogs.map((l) => `<div>> ${l}</div>`).join("")}
+          <!-- Interactive Live Diagnostic Terminal -->
+          <div class="terminal-card">
+            <div class="terminal-header">
+              <div class="terminal-dots">
+                <span class="dot-red"></span>
+                <span class="dot-yellow"></span>
+                <span class="dot-green"></span>
+              </div>
+              <div class="terminal-title">
+                🖥️ Terminal d'Appairage & Diagnostic en Temps Réel
+                <span class="terminal-status-badge">${this._pairingActive ? "⏳ ACTIF" : "🟢 PRÊT"}</span>
+              </div>
+              <button class="btn-clear-terminal" id="btn-clear-logs" title="Effacer l'historique du terminal">Effacer</button>
             </div>
-          `
-              : ""
-          }
+            <div class="pairing-logs" id="pairing-logs">
+              ${
+                this._pairingLogs && this._pairingLogs.length > 0
+                  ? this._pairingLogs.map((l) => `<div>> ${l}</div>`).join("")
+                  : `<div style="color: #6ee7b7; opacity: 0.6;">> En attente d'une action (Appairage, Scan réseau ou Ajout de caméra)...</div>`
+              }
+            </div>
+          </div>
 
           ${
             this._scanSummary
@@ -2123,6 +2251,14 @@ class DomolinkCameraPanel extends HTMLElement {
     const scanLanBtn = this.shadowRoot.querySelector("#btn-scan-lan");
     if (scanLanBtn) {
       scanLanBtn.onclick = () => this._scanLocalNetwork();
+    }
+
+    const clearLogsBtn = this.shadowRoot.querySelector("#btn-clear-logs");
+    if (clearLogsBtn) {
+      clearLogsBtn.onclick = () => {
+        this._pairingLogs = [];
+        this._updatePairingLogs();
+      };
     }
 
     const addDiscoveredBtns = this.shadowRoot.querySelectorAll(".btn-add-discovered");

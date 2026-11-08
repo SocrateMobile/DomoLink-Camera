@@ -12,12 +12,14 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     DRIVER_GENERIC_RTSP,
+    DRIVER_HA_PROXY,
     DRIVER_YSXLITE_PPPP,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
 from .drivers.base import BaseCameraDriver
 from .drivers.generic_rtsp import GenericRtspDriver
+from .drivers.ha_proxy import HaProxyDriver
 from .drivers.ysxlite_pppp import YsxLiteDriver
 from .pairing import WifiPairingEngine
 from .box_detector import BoxDetectorService
@@ -79,6 +81,8 @@ class CameraManager:
 
         if driver_type == DRIVER_GENERIC_RTSP:
             driver = GenericRtspDriver(camera_id, config)
+        elif driver_type == DRIVER_HA_PROXY:
+            driver = HaProxyDriver(camera_id, config, hass=self.hass)
         else:
             driver = YsxLiteDriver(camera_id, config)
 
