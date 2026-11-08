@@ -261,19 +261,19 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
     async def ws_get_entities(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
     ) -> None:
-        """Return available entities in Home Assistant for bottom banner."""
+        """Return available controllable entities in Home Assistant for bottom banner (capped to prevent WS payload overflow)."""
         entities = []
+        controllable_domains = {"switch", "light", "cover", "lock", "fan"}
         for state in hass.states.async_all():
             domain = state.domain
-            if domain in ALLOWED_ENTITY_DOMAINS:
+            if domain in controllable_domains:
                 entities.append({
                     "entity_id": state.entity_id,
                     "name": state.attributes.get("friendly_name", state.entity_id),
                     "domain": domain,
-                    "state": state.state,
-                    "icon": state.attributes.get("icon"),
                 })
-        # Sort by friendly name
+                if len(entities) >= 150:
+                    break
         entities.sort(key=lambda x: x["name"].lower())
         connection.send_result(msg["id"], {"entities": entities})
 
