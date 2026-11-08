@@ -2,7 +2,7 @@
 
 DOMAIN = "domolink_camera"
 NAME = "DomoLink Camera"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Storage
 STORAGE_KEY = "domolink_camera_data"
@@ -12,11 +12,13 @@ STORAGE_VERSION = 1
 DRIVER_YSXLITE_PPPP = "ysxlite_pppp"
 DRIVER_GENERIC_RTSP = "generic_rtsp"
 DRIVER_GENERIC_MJPEG = "generic_mjpeg"
+DRIVER_HA_PROXY = "ha_proxy"
 
 SUPPORTED_DRIVERS = {
     DRIVER_YSXLITE_PPPP: "YsxLite / A9 / PPPP (Wi-Fi Mini Cam)",
     DRIVER_GENERIC_RTSP: "RTSP / ONVIF (Standard IP Camera)",
     DRIVER_GENERIC_MJPEG: "MJPEG / HTTP (Webcam & ESP32-CAM)",
+    DRIVER_HA_PROXY: "Passerelle Home Assistant (Tuya, Arlo, Xiaomi, Blink...)",
 }
 
 # Network defaults
