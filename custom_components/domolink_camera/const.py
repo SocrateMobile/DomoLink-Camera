@@ -2,7 +2,7 @@
 
 DOMAIN = "domolink_camera"
 NAME = "DomoLink Camera"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # Storage
 STORAGE_KEY = "domolink_camera_data"
