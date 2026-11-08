@@ -20,6 +20,7 @@ from .drivers.base import BaseCameraDriver
 from .drivers.generic_rtsp import GenericRtspDriver
 from .drivers.ysxlite_pppp import YsxLiteDriver
 from .pairing import WifiPairingEngine
+from .box_detector import BoxDetectorService
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class CameraManager:
         self.cameras: dict[str, dict[str, Any]] = {}
         self.drivers: dict[str, BaseCameraDriver] = {}
         self.pairing_engine = WifiPairingEngine(hass)
+        self.box_detector = BoxDetectorService(hass)
         self._listeners: list[Any] = []
 
     async def async_load(self) -> None:

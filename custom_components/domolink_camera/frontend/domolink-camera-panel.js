@@ -24,6 +24,13 @@ class DomolinkCameraPanel extends HTMLElement {
     this._selectedCamera = null;
     this._refreshTimer = null;
     this._toastMsg = null;
+    this._boxInfo = null;
+    this._tvChannels = [];
+    this._selectedChannel = null;
+    this._tvSearch = "";
+    this._tvFilter = "all";
+    this._hlsPlayer = null;
+    this._isLoadingTv = false;
   }
 
   set hass(hass) {
@@ -1043,6 +1050,345 @@ class DomolinkCameraPanel extends HTMLElement {
           color: #8b949e;
           font-size: 12px;
         }
+
+        /* TV Section Styles */
+        .tv-container {
+          display: flex;
+          flex-direction: column;
+          gap: 24px;
+        }
+
+        .box-info-card {
+          background: rgba(22, 27, 34, 0.85);
+          border: 1px solid rgba(59, 130, 246, 0.3);
+          border-radius: 16px;
+          padding: 18px 24px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+          backdrop-filter: blur(20px);
+        }
+
+        .box-info-left {
+          display: flex;
+          align-items: center;
+          gap: 16px;
+        }
+
+        .box-icon {
+          font-size: 32px;
+          background: rgba(59, 130, 246, 0.15);
+          width: 56px;
+          height: 56px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 14px;
+          border: 1px solid rgba(59, 130, 246, 0.3);
+        }
+
+        .box-title {
+          font-size: 17px;
+          font-weight: 700;
+          color: #f0f6fc;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+
+        .box-badge {
+          background: #10b981;
+          color: #064e3b;
+          font-size: 11px;
+          font-weight: 700;
+          padding: 3px 9px;
+          border-radius: 12px;
+        }
+
+        .box-desc {
+          font-size: 13px;
+          color: #8b949e;
+          margin-top: 4px;
+        }
+
+        .tv-player-card {
+          background: rgba(22, 27, 34, 0.85);
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 16px;
+          overflow: hidden;
+          box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+          backdrop-filter: blur(20px);
+        }
+
+        .tv-player-header {
+          padding: 14px 20px;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          background: rgba(13, 17, 23, 0.8);
+          border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        .tv-channel-title {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+
+        .tv-ch-num {
+          background: #3b82f6;
+          color: #ffffff;
+          font-weight: 800;
+          font-size: 13px;
+          padding: 2px 8px;
+          border-radius: 6px;
+        }
+
+        .tv-ch-name {
+          font-size: 18px;
+          font-weight: 700;
+          color: #ffffff;
+        }
+
+        .tv-live-tag {
+          background: rgba(239, 68, 68, 0.2);
+          color: #ef4444;
+          border: 1px solid rgba(239, 68, 68, 0.4);
+          font-size: 11px;
+          font-weight: 700;
+          padding: 3px 8px;
+          border-radius: 6px;
+          display: flex;
+          align-items: center;
+          gap: 5px;
+        }
+
+        .tv-header-actions {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+
+        .btn-tv-action {
+          background: rgba(255, 255, 255, 0.08);
+          color: #f0f6fc;
+          border: 1px solid rgba(255, 255, 255, 0.15);
+          padding: 7px 14px;
+          border-radius: 8px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          transition: all 0.2s ease;
+        }
+
+        .btn-tv-action:hover {
+          background: rgba(59, 130, 246, 0.2);
+          border-color: #3b82f6;
+          color: #60a5fa;
+        }
+
+        .btn-tv-action.primary {
+          background: #3b82f6;
+          color: #ffffff;
+          border: none;
+        }
+
+        .btn-tv-action.primary:hover {
+          background: #2563eb;
+        }
+
+        .tv-player-wrapper {
+          position: relative;
+          background: #000000;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 100%;
+          min-height: 380px;
+          max-height: 560px;
+        }
+
+        .tv-player-wrapper video {
+          width: 100%;
+          height: auto;
+          max-height: 560px;
+          display: block;
+        }
+
+        /* Fullscreen handling */
+        .tv-player-wrapper:fullscreen {
+          width: 100vw;
+          height: 100vh;
+          max-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: #000000;
+        }
+
+        .tv-player-wrapper:fullscreen video {
+          max-height: 100vh;
+          width: 100%;
+          height: 100%;
+          object-fit: contain;
+        }
+
+        /* TV Channel Selector */
+        .tv-selector-card {
+          background: rgba(22, 27, 34, 0.85);
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 16px;
+          padding: 24px;
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+          backdrop-filter: blur(20px);
+        }
+
+        .tv-selector-header {
+          display: flex;
+          flex-wrap: wrap;
+          justify-content: space-between;
+          align-items: center;
+          gap: 16px;
+          margin-bottom: 20px;
+        }
+
+        .tv-search-box {
+          position: relative;
+          min-width: 280px;
+          flex: 1;
+          max-width: 400px;
+        }
+
+        .tv-search-input {
+          width: 100%;
+          padding: 10px 14px 10px 38px;
+          background: rgba(13, 17, 23, 0.7);
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          border-radius: 10px;
+          color: #f0f6fc;
+          font-size: 14px;
+          outline: none;
+          box-sizing: border-box;
+          transition: border-color 0.2s ease;
+        }
+
+        .tv-search-input:focus {
+          border-color: #3b82f6;
+        }
+
+        .tv-search-icon {
+          position: absolute;
+          left: 12px;
+          top: 50%;
+          transform: translateY(-50%);
+          font-size: 14px;
+          color: #8b949e;
+        }
+
+        .category-pills {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .category-pill {
+          background: rgba(255, 255, 255, 0.05);
+          color: #8b949e;
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          padding: 6px 14px;
+          border-radius: 20px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.2s ease;
+        }
+
+        .category-pill:hover {
+          background: rgba(255, 255, 255, 0.1);
+          color: #f0f6fc;
+        }
+
+        .category-pill.active {
+          background: #3b82f6;
+          color: #ffffff;
+          border-color: #3b82f6;
+        }
+
+        .channel-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+          gap: 16px;
+          max-height: 480px;
+          overflow-y: auto;
+          padding-right: 6px;
+        }
+
+        .channel-card {
+          background: rgba(13, 17, 23, 0.6);
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 12px;
+          padding: 14px;
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          position: relative;
+        }
+
+        .channel-card:hover {
+          background: rgba(59, 130, 246, 0.1);
+          border-color: rgba(59, 130, 246, 0.4);
+          transform: translateY(-2px);
+        }
+
+        .channel-card.active {
+          background: rgba(59, 130, 246, 0.2);
+          border-color: #3b82f6;
+          box-shadow: 0 0 16px rgba(59, 130, 246, 0.3);
+        }
+
+        .channel-logo-box {
+          width: 44px;
+          height: 44px;
+          background: rgba(255, 255, 255, 0.05);
+          border-radius: 8px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          overflow: hidden;
+          flex-shrink: 0;
+        }
+
+        .channel-logo-img {
+          max-width: 38px;
+          max-height: 38px;
+          object-fit: contain;
+        }
+
+        .channel-details {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .channel-name {
+          font-weight: 600;
+          font-size: 14px;
+          color: #f0f6fc;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+
+        .channel-sub {
+          font-size: 11px;
+          color: #8b949e;
+          margin-top: 2px;
+        }
       </style>
 
       <div class="panel-container">
@@ -1063,6 +1409,9 @@ class DomolinkCameraPanel extends HTMLElement {
             <button class="tab-btn ${this._activeTab === "cameras" ? "active" : ""}" id="tab-cameras">
               <span>🖼️</span> Caméras (${this._cameras.length})
             </button>
+            <button class="tab-btn ${this._activeTab === "tv" ? "active" : ""}" id="tab-tv">
+              <span>📺</span> TV en Direct
+            </button>
             <button class="tab-btn ${this._activeTab === "settings" ? "active" : ""}" id="tab-settings">
               <span>⚙️</span> Paramètres & Appairage
             </button>
@@ -1070,7 +1419,13 @@ class DomolinkCameraPanel extends HTMLElement {
         </header>
 
         <!-- Main Content Area -->
-        ${this._activeTab === "cameras" ? this._renderCamerasGrid() : this._renderSettings()}
+        ${
+          this._activeTab === "cameras"
+            ? this._renderCamerasGrid()
+            : this._activeTab === "tv"
+            ? this._renderTvSection()
+            : this._renderSettings()
+        }
 
         <!-- Save Layout Order Floating Bar -->
         ${
@@ -1181,6 +1536,278 @@ class DomolinkCameraPanel extends HTMLElement {
           `;
           })
           .join("")}
+      </div>
+    `;
+  }
+
+  // --- TV Section & Player ---
+  async _fetchTvData() {
+    if (this._isLoadingTv) return;
+    this._isLoadingTv = true;
+    try {
+      const resp = await this._hass.callWS({ type: "domolink_camera/get_tv_channels" });
+      if (resp) {
+        this._boxInfo = resp.box || null;
+        this._tvChannels = resp.channels || [];
+        if (!this._selectedChannel && this._tvChannels.length > 0) {
+          this._selectedChannel = this._tvChannels[0];
+        }
+        this.render();
+        if (this._selectedChannel) {
+          this._playChannelStream(this._selectedChannel);
+        }
+      }
+    } catch (err) {
+      console.error("Error loading TV channels:", err);
+      this._showToast("Erreur lors de la détection de la Box ou des flux TV");
+    } finally {
+      this._isLoadingTv = false;
+    }
+  }
+
+  _ensureHlsJs() {
+    if (window.Hls) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js";
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("Impossible de charger le moteur HLS"));
+      document.head.appendChild(script);
+    });
+  }
+
+  async _playChannelStream(channel) {
+    if (!channel) return;
+    this._selectedChannel = channel;
+    const video = this.shadowRoot.querySelector("#tv-video-player");
+    if (!video) return;
+
+    this._showToast(`Chargement du direct : ${channel.name}...`);
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/get_tv_stream",
+        channel_id: channel.id,
+      });
+
+      if (!resp || !resp.url) {
+        this._showToast(`Flux indisponible pour ${channel.name}`);
+        return;
+      }
+
+      const streamUrl = resp.url;
+      const isHls = streamUrl.includes(".m3u8") || resp.format === "hls";
+
+      if (isHls) {
+        if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          video.src = streamUrl;
+          video.play().catch(() => {});
+        } else {
+          await this._ensureHlsJs();
+          if (window.Hls && window.Hls.isSupported()) {
+            if (this._hlsPlayer) {
+              this._hlsPlayer.destroy();
+            }
+            this._hlsPlayer = new window.Hls({
+              enableWorker: true,
+              lowLatencyMode: true,
+            });
+            this._hlsPlayer.loadSource(streamUrl);
+            this._hlsPlayer.attachMedia(video);
+            this._hlsPlayer.on(window.Hls.Events.MANIFEST_PARSED, () => {
+              video.play().catch(() => {});
+            });
+          } else {
+            video.src = streamUrl;
+            video.play().catch(() => {});
+          }
+        }
+      } else {
+        video.src = streamUrl;
+        video.play().catch(() => {});
+      }
+    } catch (err) {
+      console.error("TV stream error:", err);
+      this._showToast(`Erreur flux TV: ${err.message || err}`);
+    }
+  }
+
+  _toggleFullscreen() {
+    const wrapper = this.shadowRoot.querySelector("#tv-player-wrapper");
+    if (!wrapper) return;
+
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+      if (wrapper.requestFullscreen) {
+        wrapper.requestFullscreen();
+      } else if (wrapper.webkitRequestFullscreen) {
+        wrapper.webkitRequestFullscreen();
+      }
+    } else {
+      if (document.exitFullscreen) {
+        document.exitFullscreen();
+      } else if (document.webkitExitFullscreen) {
+        document.webkitExitFullscreen();
+      }
+    }
+  }
+
+  async _togglePip() {
+    const video = this.shadowRoot.querySelector("#tv-video-player");
+    if (!video) return;
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+      } else if (video.requestPictureInPicture) {
+        await video.requestPictureInPicture();
+      }
+    } catch (e) {
+      console.warn("PiP error:", e);
+    }
+  }
+
+  async _pinCurrentChannel() {
+    if (!this._selectedChannel) return;
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/pin_tv_camera",
+        channel_id: this._selectedChannel.id,
+      });
+      if (resp && resp.success) {
+        this._showToast(`Chaîne ${this._selectedChannel.name} ajoutée à vos caméras !`);
+        await this._fetchCameras();
+      }
+    } catch (err) {
+      this._showToast(`Erreur lors de l'épinglage: ${err.message || err}`);
+    }
+  }
+
+  _renderTvSection() {
+    if (!this._boxInfo && !this._isLoadingTv) {
+      setTimeout(() => this._fetchTvData(), 10);
+      return `
+        <div style="text-align: center; padding: 60px 20px;">
+          <div class="loading-spinner"></div>
+          <div style="margin-top: 16px; color: #8b949e;">Détection de votre Box Internet et chargement des flux TV...</div>
+        </div>
+      `;
+    }
+
+    const box = this._boxInfo || {
+      brand: "free",
+      name: "Freebox Server",
+      model: "Freebox Ultra",
+      badge: "Multiposte Actif ⚡",
+      description: "Accès direct aux flux vidéo Multiposte RTSP locaux en qualité maximale.",
+    };
+
+    const isFree = box.brand === "free";
+    const boxIcon = isFree ? "⚡" : box.brand === "orange" ? "🍊" : box.brand === "sfr" ? "🔴" : box.brand === "bouygues" ? "🔷" : "🌐";
+
+    const ch = this._selectedChannel || (this._tvChannels.length > 0 ? this._tvChannels[0] : null);
+
+    const filteredChannels = (this._tvChannels || []).filter((c) => {
+      const matchFilter = this._tvFilter === "all" || c.category === this._tvFilter;
+      const matchSearch =
+        !this._tvSearch ||
+        c.name.toLowerCase().includes(this._tvSearch.toLowerCase()) ||
+        (c.num && String(c.num).includes(this._tvSearch));
+      return matchFilter && matchSearch;
+    });
+
+    const categories = ["all", "Généraliste", "Information", "Culture", "Jeunesse", "Sport", "Musique", "Régionale"];
+
+    return `
+      <div class="tv-container">
+        <!-- Box Identification Banner -->
+        <div class="box-info-card">
+          <div class="box-info-left">
+            <div class="box-icon">${boxIcon}</div>
+            <div>
+              <div class="box-title">
+                ${box.name}
+                <span class="box-badge">${box.badge || "Connecté"}</span>
+              </div>
+              <div class="box-desc">${box.description}</div>
+            </div>
+          </div>
+          <div style="text-align: right; color: #8b949e; font-size: 13px;">
+            <span>${this._tvChannels.length} chaîne(s) disponible(s)</span>
+          </div>
+        </div>
+
+        <!-- TV Player Card with Fullscreen & Controls -->
+        <div class="tv-player-card">
+          <div class="tv-player-header">
+            <div class="tv-channel-title">
+              ${ch && ch.num ? `<span class="tv-ch-num">CH ${ch.num}</span>` : ""}
+              <span class="tv-ch-name">${ch ? ch.name : "Aucune chaîne sélectionnée"}</span>
+              <span class="tv-live-tag">🔴 EN DIRECT</span>
+            </div>
+            <div class="tv-header-actions">
+              <button class="btn-tv-action" id="btn-pin-channel" title="Ajouter cette chaîne dans la grille de vos caméras">
+                📌 Épingler aux Caméras
+              </button>
+              <button class="btn-tv-action" id="btn-pip-player" title="Incrustation d'image (Picture-in-Picture)">
+                🪟 PiP
+              </button>
+              <button class="btn-tv-action primary" id="btn-fullscreen-player" title="Passer en plein écran">
+                ⛶ Plein Écran
+              </button>
+            </div>
+          </div>
+
+          <div class="tv-player-wrapper" id="tv-player-wrapper">
+            <video id="tv-video-player" playsinline autoplay controls></video>
+          </div>
+        </div>
+
+        <!-- Channel Selector -->
+        <div class="tv-selector-card">
+          <div class="tv-selector-header">
+            <div class="category-pills">
+              ${categories
+                .map(
+                  (cat) => `
+                <button class="category-pill ${this._tvFilter === cat ? "active" : ""}" data-category="${cat}">
+                  ${cat === "all" ? "Toutes les chaînes" : cat}
+                </button>
+              `
+                )
+                .join("")}
+            </div>
+
+            <div class="tv-search-box">
+              <span class="tv-search-icon">🔍</span>
+              <input type="text" class="tv-search-input" id="tv-search-input" placeholder="Rechercher une chaîne ou un numéro..." value="${this._tvSearch}" />
+            </div>
+          </div>
+
+          <div class="channel-grid">
+            ${
+              filteredChannels.length > 0
+                ? filteredChannels
+                    .map((item) => {
+                      const isActive = ch && ch.id === item.id;
+                      return `
+                  <div class="channel-card ${isActive ? "active" : ""}" data-channel-id="${item.id}">
+                    <div class="channel-logo-box">
+                      ${
+                        item.logo
+                          ? `<img src="${item.logo}" class="channel-logo-img" alt="${item.name}" />`
+                          : `<span style="font-weight: 800; color: #3b82f6;">${item.num || "TV"}</span>`
+                      }
+                    </div>
+                    <div class="channel-details">
+                      <div class="channel-name">${item.num ? `${item.num}. ` : ""}${item.name}</div>
+                      <div class="channel-sub">${item.category || "Direct"} • ${item.quality || "HD"}</div>
+                    </div>
+                  </div>
+                `;
+                    })
+                    .join("")
+                : `<div style="grid-column: 1 / -1; text-align: center; color: #8b949e; padding: 40px 0;">Aucune chaîne ne correspond à votre recherche.</div>`
+            }
+          </div>
+        </div>
       </div>
     `;
   }
@@ -1417,11 +2044,23 @@ class DomolinkCameraPanel extends HTMLElement {
   _bindEvents() {
     // Tabs
     const tabCams = this.shadowRoot.querySelector("#tab-cameras");
+    const tabTv = this.shadowRoot.querySelector("#tab-tv");
     const tabSets = this.shadowRoot.querySelector("#tab-settings");
     if (tabCams) {
       tabCams.onclick = () => {
         this._activeTab = "cameras";
         this.render();
+      };
+    }
+    if (tabTv) {
+      tabTv.onclick = () => {
+        this._activeTab = "tv";
+        this.render();
+        if (!this._boxInfo) {
+          this._fetchTvData();
+        } else if (this._selectedChannel) {
+          this._playChannelStream(this._selectedChannel);
+        }
       };
     }
     if (tabSets) {
@@ -1543,6 +2182,104 @@ class DomolinkCameraPanel extends HTMLElement {
         this._saveCamera(newCam);
       };
     }
+
+    // --- TV Tab Controls & Fullscreen ---
+    const fsBtn = this.shadowRoot.querySelector("#btn-fullscreen-player");
+    if (fsBtn) {
+      fsBtn.onclick = () => this._toggleFullscreen();
+    }
+
+    const pipBtn = this.shadowRoot.querySelector("#btn-pip-player");
+    if (pipBtn) {
+      pipBtn.onclick = () => this._togglePip();
+    }
+
+    const pinBtn = this.shadowRoot.querySelector("#btn-pin-channel");
+    if (pinBtn) {
+      pinBtn.onclick = () => this._pinCurrentChannel();
+    }
+
+    const tvVideo = this.shadowRoot.querySelector("#tv-video-player");
+    if (tvVideo) {
+      tvVideo.ondblclick = () => this._toggleFullscreen();
+    }
+
+    // Category pills filter
+    const catPills = this.shadowRoot.querySelectorAll(".category-pill");
+    catPills.forEach((pill) => {
+      pill.onclick = () => {
+        this._tvFilter = pill.dataset.category;
+        this.render();
+      };
+    });
+
+    // Search input
+    const searchInp = this.shadowRoot.querySelector("#tv-search-input");
+    if (searchInp) {
+      searchInp.oninput = (e) => {
+        this._tvSearch = e.target.value;
+        const grid = this.shadowRoot.querySelector(".channel-grid");
+        if (grid) {
+          const filtered = (this._tvChannels || []).filter((c) => {
+            const matchFilter = this._tvFilter === "all" || c.category === this._tvFilter;
+            const matchSearch =
+              !this._tvSearch ||
+              c.name.toLowerCase().includes(this._tvSearch.toLowerCase()) ||
+              (c.num && String(c.num).includes(this._tvSearch));
+            return matchFilter && matchSearch;
+          });
+
+          grid.innerHTML =
+            filtered.length > 0
+              ? filtered
+                  .map((item) => {
+                    const isActive = this._selectedChannel && this._selectedChannel.id === item.id;
+                    return `
+                  <div class="channel-card ${isActive ? "active" : ""}" data-channel-id="${item.id}">
+                    <div class="channel-logo-box">
+                      ${
+                        item.logo
+                          ? `<img src="${item.logo}" class="channel-logo-img" alt="${item.name}" />`
+                          : `<span style="font-weight: 800; color: #3b82f6;">${item.num || "TV"}</span>`
+                      }
+                    </div>
+                    <div class="channel-details">
+                      <div class="channel-name">${item.num ? `${item.num}. ` : ""}${item.name}</div>
+                      <div class="channel-sub">${item.category || "Direct"} • ${item.quality || "HD"}</div>
+                    </div>
+                  </div>
+                `;
+                  })
+                  .join("")
+              : `<div style="grid-column: 1 / -1; text-align: center; color: #8b949e; padding: 40px 0;">Aucune chaîne trouvée.</div>`;
+
+          this._bindChannelCards();
+        }
+      };
+    }
+
+    // Channel cards click
+    this._bindChannelCards();
+  }
+
+  _bindChannelCards() {
+    const chCards = this.shadowRoot.querySelectorAll(".channel-card");
+    chCards.forEach((card) => {
+      card.onclick = () => {
+        const chId = card.dataset.channelId;
+        const channel = (this._tvChannels || []).find((c) => c.id === chId);
+        if (channel) {
+          this._selectedChannel = channel;
+          chCards.forEach((c) => c.classList.remove("active"));
+          card.classList.add("active");
+          const nameEl = this.shadowRoot.querySelector(".tv-ch-name");
+          if (nameEl) nameEl.textContent = channel.name;
+          const numEl = this.shadowRoot.querySelector(".tv-ch-num");
+          if (numEl) numEl.textContent = channel.num ? `CH ${channel.num}` : "";
+          this._playChannelStream(channel);
+        }
+      };
+    });
   }
 }
 
