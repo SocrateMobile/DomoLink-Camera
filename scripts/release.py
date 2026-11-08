@@ -132,7 +132,10 @@ def main() -> None:
 
     # Git operations
     run_cmd(["git", "add", "."])
-    run_cmd(["git", "commit", "-m", f"chore(release): bump version to {tag}"])
+    try:
+        run_cmd(["git", "commit", "-m", f"chore(release): bump version to {tag}"])
+    except Exception:
+        pass
     run_cmd(["git", "tag", "-fa", tag, "-m", f"Release {tag}"])
     run_cmd(["git", "tag", "-fa", "latest", "-m", f"Latest release ({tag})"])
     run_cmd(["git", "push", "origin", "main"])
