@@ -13,11 +13,13 @@ import aiohttp
 from .base import BaseCameraDriver
 from ..const import (
     DEFAULT_PPPP_DISCOVERY_PORT,
+    ILNK_MAGIC,
     PPPP_CMD_IRCUT_ONOFF,
     PPPP_CMD_LIVE_VIDEO_START,
     PPPP_CMD_LIVE_VIDEO_STOP,
     PPPP_CMD_SNAPSHOT_GET,
     PPPP_CMD_SYSTEM_REBOOT,
+    PPPP_MAGIC,
     STATUS_CONNECTING,
     STATUS_OFFLINE,
     STATUS_ONLINE,
@@ -25,10 +27,6 @@ from ..const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-# PPPP Packet Magic Headers
-PPPP_MAGIC = b"PPPP"
-ILNK_MAGIC = b"\x4c\x4e\x4b\x01"
 
 
 class YsxLiteProtocol(asyncio.DatagramProtocol):
