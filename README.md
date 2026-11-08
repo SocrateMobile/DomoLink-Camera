@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="images/banner_logo.png" alt="DomoLink Camera" width="100%" />
+</p>
+
 # DomoLink-Camera 📹
 
-Intégration personnalisée Home Assistant pour la gestion centralisée et le streaming en direct des caméras Wi-Fi (YsxLite, A9, X5, PPPP, RTSP, ONVIF).
+Intégration personnalisée Home Assistant pour la gestion centralisée et le streaming en direct des caméras Wi-Fi (YsxLite, A9, X5, PPPP, RTSP, ONVIF, Passerelle HA).
 
 ---
 
