@@ -1,12 +1,17 @@
 {
   "domain": "domolink_camera",
   "name": "DomoLink Camera",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "documentation": "https://github.com/domolink/domolink-camera",
   "issue_tracker": "https://github.com/domolink/domolink-camera/issues",
-  "codeowners": ["@domolink"],
+  "codeowners": [
+    "@domolink"
+  ],
   "config_flow": true,
   "iot_class": "local_push",
-  "dependencies": ["frontend", "http"],
+  "dependencies": [
+    "frontend",
+    "http"
+  ],
   "requirements": []
 }
