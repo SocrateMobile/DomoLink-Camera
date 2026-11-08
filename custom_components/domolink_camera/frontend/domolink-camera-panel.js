@@ -339,7 +339,9 @@ class DomolinkCameraPanel extends HTMLElement {
 
     this._pairingActive = true;
     this._pairingLogs = [];
+    this._showQrCode = true; // Auto-display QR Code for optical pairing
     this._appendLog(`🚀 [DÉMARRAGE] Assistant d'appairage lancé pour le réseau '${ssid}'...`);
+    this._appendLog("📱 [QR CODE OPTIQUE GÉNÉRÉ] Pointez l'objectif de votre caméra vers le QR Code ci-dessous (15-20 cm) jusqu'au bip !");
     this._appendLog(`📋 [VÉRIFICATION] Longueur SSID=${ssid.length} car. | Longueur clé=${pass.length} car. | IP cible AP=${apIp}`);
 
     if (apIp === "192.168.1.254" || apIp === "192.168.0.254") {
@@ -354,7 +356,7 @@ class DomolinkCameraPanel extends HTMLElement {
     this.render();
 
     // Trigger immediate browser-side multi-vector injection (CGI + WebRTC UDP)
-    this._appendLog(`📡 [INJECTION DIRECTE] Émission des trames Wi-Fi depuis le navigateur vers ${apIp}:32108 & HTTP CGI...`);
+    this._appendLog(`📡 [INJECTION DIRECTE] Émission des trames Wi-Fi vers ${apIp}:32108 & HTTP CGI...`);
     this._triggerBrowserSideApPairing(apIp, ssid, pass);
 
     // Arm Home Assistant backend if connected
@@ -366,13 +368,11 @@ class DomolinkCameraPanel extends HTMLElement {
         camera_ap_ip: apIp,
         camera_ssid: this._selectedCameraAp || undefined,
       });
-      this._appendLog("✅ [SERVEUR ARMÉ] Home Assistant est en écoute active et scanne le réseau local (72s).");
+      this._appendLog("✅ [SERVEUR ARMÉ] Home Assistant écoute et scanne le réseau local (72s).");
     } catch (e) {
       const errMsg = e?.message || (typeof e === "object" ? JSON.stringify(e) : String(e));
-      // If HA is currently disconnected (e.g. user already joined camera AP), do not crash!
-      this._appendLog(`ℹ️ [LIAISON POINT D'ACCÈS] Connexion directe au point d'accès caméra : ${errMsg}`);
-      this._appendLog("   Les trames Wi-Fi sont transmises en direct vers la caméra.");
-      this._appendLog("💡 Reconnectez maintenant votre Mac/téléphone à votre Wi-Fi Freebox ('" + ssid + "').");
+      this._appendLog(`ℹ️ [REMARQUE LIAISON] Déconnexion temporaire HA (${errMsg}) - Basculez sur votre Wi-Fi Freebox ('${ssid}').`);
+      this._appendLog("💡 Astuce : La méthode la plus rapide et infaillible est de présenter le QR Code ci-dessous à la caméra !");
     }
 
     this._startResilientPairingPoll(ssid, pass, apIp);
@@ -1791,14 +1791,10 @@ class DomolinkCameraPanel extends HTMLElement {
 
             let snapUrl = `/api/domolink_camera/snapshot/${cam.id}?t=${cam.snapshot_timestamp || Date.now()}`;
             if (isLive) {
-              if (cam.driver === "ha_proxy" && stateObj?.attributes?.access_token) {
-                snapUrl = `/api/camera_proxy_stream/${cam.host}?token=${stateObj.attributes.access_token}`;
-              } else {
-                snapUrl = `/api/domolink_camera/stream/${cam.id}`;
-              }
+              snapUrl = `/api/domolink_camera/stream/${cam.id}`;
             } else if (cam.driver === "ha_proxy" && stateObj?.attributes?.entity_picture) {
               const pic = stateObj.attributes.entity_picture;
-              snapUrl = pic.startsWith("http") ? pic : (this._hass.hassUrl ? this._hass.hassUrl(pic) : pic);
+              snapUrl = pic;
             }
 
             const driverLabel = cam.driver === "ysxlite_pppp" ? "YsxLite" : cam.driver === "ha_proxy" ? "Passerelle HA" : "RTSP";

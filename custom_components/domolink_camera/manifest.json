@@ -1,7 +1,7 @@
 {
   "domain": "domolink_camera",
   "name": "DomoLink Camera",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "documentation": "https://github.com/domolink/domolink-camera",
   "issue_tracker": "https://github.com/domolink/domolink-camera/issues",
   "codeowners": [
