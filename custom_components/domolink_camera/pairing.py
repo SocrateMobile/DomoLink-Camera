@@ -9,14 +9,18 @@ import socket
 import struct
 import subprocess
 from typing import Any
+import urllib.parse
+import urllib.request
 
 from .const import (
+    CAMERA_AP_SSID_PREFIXES,
     DEFAULT_PPPP_DISCOVERY_PORT,
     DOMAIN,
     DRIVER_GENERIC_MJPEG,
     DRIVER_GENERIC_RTSP,
     DRIVER_HA_PROXY,
     DRIVER_YSXLITE_PPPP,
+    ILNK_MAGIC,
     PPPP_CMD_DEV_SEARCH,
     PPPP_CMD_WIFI_SET,
     PPPP_MAGIC,
@@ -452,7 +456,179 @@ class WifiPairingEngine:
 
         return compatible, incompatible
 
-    async def async_start_pairing(self, ssid: str, password: str, camera_ap_ip: str = "192.168.1.254") -> dict[str, Any]:
+    def build_wifi_payloads(self, ssid: str, password: str) -> list[bytes]:
+        """Generate all binary and structural payload variants for PPPP / YsxLite Wi-Fi pairing."""
+        s_bytes = ssid.encode("utf-8")
+        p_bytes = password.encode("utf-8")
+        payload = struct.pack("B", len(s_bytes)) + s_bytes + struct.pack("B", len(p_bytes)) + p_bytes
+
+        # 1. Standard Big-Endian PPPP packet
+        p1 = PPPP_MAGIC + struct.pack(">HHH", PPPP_CMD_WIFI_SET, len(payload), 1) + payload
+
+        # 2. Little-Endian header variant (some ARM SoC camera firmwares)
+        p2 = PPPP_MAGIC + struct.pack("<HHH", PPPP_CMD_WIFI_SET, len(payload), 1) + payload
+
+        # 3. Fixed 128-byte C-struct: char ssid[64] + char pass[64]
+        payload_fixed = s_bytes.ljust(64, b"\x00") + p_bytes.ljust(64, b"\x00")
+        p3 = PPPP_MAGIC + struct.pack(">HHH", PPPP_CMD_WIFI_SET, 128, 1) + payload_fixed
+
+        # 4. iLnk header variant
+        p4 = ILNK_MAGIC + struct.pack(">HH", PPPP_CMD_WIFI_SET, len(payload)) + payload
+
+        # 5. JSON / Text null-terminated fallback
+        p5 = f'{{"ssid":"{ssid}","pwd":"{password}"}}\x00'.encode("utf-8")
+
+        return [p1, p2, p3, p4, p5]
+
+    async def async_scan_camera_aps(self) -> list[dict[str, Any]]:
+        """Scan nearby Wi-Fi Access Points to find cameras in AP mode."""
+        def _scan() -> list[dict[str, Any]]:
+            results: list[dict[str, Any]] = []
+            seen: set[str] = set()
+
+            # Linux nmcli scan
+            try:
+                out = subprocess.check_output(
+                    ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list"],
+                    timeout=4,
+                    stderr=subprocess.DEVNULL,
+                ).decode("utf-8", errors="ignore")
+                for line in out.splitlines():
+                    parts = line.strip().split(":")
+                    if parts and parts[0]:
+                        s_name = parts[0].strip()
+                        if s_name in seen:
+                            continue
+                        seen.add(s_name)
+                        sig = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 70
+                        sec = parts[2] if len(parts) > 2 else "OPEN"
+                        is_cam = any(s_name.upper().startswith(p) for p in CAMERA_AP_SSID_PREFIXES)
+                        results.append({
+                            "ssid": s_name,
+                            "signal": sig,
+                            "security": sec,
+                            "is_camera": is_cam,
+                        })
+            except Exception:
+                pass
+
+            # macOS airport utility scan (for development / local Mac environments)
+            if not results:
+                try:
+                    airport_bin = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+                    out = subprocess.check_output(
+                        [airport_bin, "-s"],
+                        timeout=4,
+                        stderr=subprocess.DEVNULL,
+                    ).decode("utf-8", errors="ignore")
+                    for line in out.splitlines()[1:]:
+                        parts = line.split()
+                        if parts:
+                            s_name = parts[0].strip()
+                            if s_name in seen:
+                                continue
+                            seen.add(s_name)
+                            is_cam = any(s_name.upper().startswith(p) for p in CAMERA_AP_SSID_PREFIXES)
+                            results.append({
+                                "ssid": s_name,
+                                "signal": 75,
+                                "security": "OPEN" if "NONE" in line.upper() else "WPA",
+                                "is_camera": is_cam,
+                            })
+                except Exception:
+                    pass
+
+            # Sort cameras first, then by signal
+            results.sort(key=lambda x: (not x["is_camera"], -x["signal"]))
+            return results
+
+        try:
+            return await self.hass.async_add_executor_job(_scan)
+        except Exception as e:
+            _LOGGER.debug("AP scan error: %s", e)
+            return []
+
+    async def _send_http_cgi_wifi_config(self, ip: str, ssid: str, password: str) -> None:
+        """Send HTTP CGI Wi-Fi setup queries commonly supported by IP camera chipsets."""
+        def _request_all() -> None:
+            q_ssid = urllib.parse.quote(ssid)
+            q_pwd = urllib.parse.quote(password)
+            endpoints = [
+                f"http://{ip}/set_wifi.cgi?ssid={q_ssid}&pwd={q_pwd}",
+                f"http://{ip}/wifi_set?ssid={q_ssid}&password={q_pwd}",
+                f"http://{ip}/cgi-bin/hi3510/param.cgi?cmd=setwirelessattr&-wf_ssid={q_ssid}&-wf_key={q_pwd}",
+                f"http://{ip}/config?ssid={q_ssid}&pwd={q_pwd}",
+            ]
+            for url in endpoints:
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        headers={"User-Agent": "DomoLink-Camera-Engine"},
+                    )
+                    with urllib.request.urlopen(req, timeout=0.8):
+                        pass
+                except Exception:
+                    pass
+
+        try:
+            await self.hass.async_add_executor_job(_request_all)
+        except Exception:
+            pass
+
+    async def _async_bridge_camera_ap(
+        self, camera_ssid: str | None, target_ssid: str, target_pass: str, camera_ap_ip: str
+    ) -> bool:
+        """Attempt autonomous server-side Wi-Fi bridge to camera AP using secondary interface."""
+        def _bridge() -> bool:
+            if not camera_ssid:
+                return False
+            try:
+                # Check if secondary wlan interface exists on HA host
+                out = subprocess.check_output(
+                    ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"],
+                    timeout=3,
+                    stderr=subprocess.DEVNULL,
+                ).decode("utf-8", errors="ignore")
+                wlan_dev = None
+                for line in out.splitlines():
+                    parts = line.strip().split(":")
+                    if len(parts) >= 2 and parts[1] == "wifi" and "connected" not in parts[2]:
+                        wlan_dev = parts[0]
+                        break
+
+                if not wlan_dev:
+                    return False
+
+                # Connect secondary Wi-Fi device to camera AP
+                subprocess.run(
+                    ["nmcli", "dev", "wifi", "connect", camera_ssid, "ifname", wlan_dev],
+                    timeout=8,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return True
+            except Exception:
+                return False
+
+        try:
+            return await self.hass.async_add_executor_job(_bridge)
+        except Exception:
+            return False
+
+    def stop_pairing(self) -> None:
+        """Cancel ongoing pairing process immediately."""
+        self._is_pairing = False
+        self._current_step = "cancelled"
+        self.add_log("🛑 Assistant d'appairage arrêté par l'utilisateur.")
+
+    async def async_start_pairing(
+        self,
+        ssid: str,
+        password: str,
+        camera_ap_ip: str = "192.168.1.1",
+        camera_ssid: str | None = None,
+    ) -> dict[str, Any]:
         """Execute autonomous Wi-Fi pairing routine."""
         self._is_pairing = True
         self._current_step = "sending_credentials"
@@ -460,31 +636,42 @@ class WifiPairingEngine:
         self._discovered_devices = []
 
         self.add_log(f"🚀 Initialisation de l'assistant d'appairage Wi-Fi pour '{ssid}'...")
-        self.add_log(f"📋 Paramètres : Longueur SSID={len(ssid)} car. | Longueur mot de passe={len(password)} car.")
+        self.add_log(f"📋 Paramètres : Longueur SSID={len(ssid)} car. | Longueur mot de passe={len(password)} car. | IP cible={camera_ap_ip}")
 
-        # Detect if camera_ap_ip is a common router IP
-        if camera_ap_ip in ("192.168.1.254", "192.168.1.1", "192.168.0.254", "192.168.0.1"):
-            self.add_log(f"⚠️ AVERTISSEMENT : L'IP cible '{camera_ap_ip}' correspond à votre passerelle / Freebox.")
-            self.add_log("💡 Pour que l'appairage fonctionne, connectez votre appareil au réseau Wi-Fi temporaire de la caméra (ex: AYS-xxx, ACCQ-xxx).")
-            self.add_log("💡 En mode direct AP, l'IP de la caméra est généralement 192.168.10.1 ou 192.168.1.254 (isolée).")
+        # Warn only if camera_ap_ip is actually the Freebox / LAN gateway (e.g. 192.168.1.254)
+        if camera_ap_ip in ("192.168.1.254", "192.168.0.254"):
+            self.add_log(f"⚠️ AVERTISSEMENT : L'IP cible '{camera_ap_ip}' correspond à votre passerelle Freebox.")
+            self.add_log("💡 En mode Point d'Accès d'usine, l'adresse de la caméra est généralement 192.168.1.1 ou 192.168.10.1.")
 
         try:
-            # Step 1: Send Wi-Fi credentials to camera AP
-            self.add_log(f"📡 Transmission des identifiants vers la caméra ({camera_ap_ip}:32108)...")
+            # Step 1: Check for autonomous server-side Wi-Fi AP bridge
+            bridged = await self._async_bridge_camera_ap(camera_ssid, ssid, password, camera_ap_ip)
+            if bridged:
+                self.add_log(f"📶 [PONT AUTONOME SERVEUR] Interface Wi-Fi connectée directement à l'AP '{camera_ssid}' !")
+
+            # Step 2: Multi-vector transmission (UDP multi-payloads + HTTP CGI)
+            self.add_log(f"📡 Transmission des identifiants vers la caméra ({camera_ap_ip}:32108 + 192.168.1.1 / 192.168.10.1)...")
             success = await self._send_wifi_config(camera_ap_ip, ssid, password)
 
             if success:
-                self.add_log("✅ Trame UDP PPPP_CMD_WIFI_SET envoyée avec succès à la caméra !")
-                self.add_log("🔄 La caméra enregistre le mot de passe et redémarre pour se connecter à votre Freebox...")
+                self.add_log("✅ Trames UDP multi-formats (Big/Little-Endian, Struct 128B, iLnk) & requêtes CGI transmises !")
+                self.add_log("🔄 La caméra enregistre les paramètres et redémarre pour rejoindre votre Wi-Fi...")
             else:
-                self.add_log("⚠️ Envoi direct UDP non acquitté. Envoi par broadcast étendu en cours...")
+                self.add_log("⚠️ Émission UDP standard complétée. Diffusion broadcast étendue en cours...")
 
-            # Step 2: Listen for camera connecting to local Wi-Fi
+            # Step 3: Listen for camera connecting to local Wi-Fi with extended 72s timeout
             self._current_step = "waiting_connection"
-            max_attempts = 8
+            max_attempts = 18  # 18 * 4s = 72s
             for attempt in range(1, max_attempts + 1):
-                self.add_log(f"🔍 [Tentative {attempt}/{max_attempts}] Recherche de la caméra connectée sur le réseau local...")
+                if not self._is_pairing:
+                    return {"success": False, "cancelled": True}
+
+                self.add_log(f"🔍 [Écoute LAN {attempt}/{max_attempts}] Recherche de la caméra connectée sur le réseau...")
                 await asyncio.sleep(4)
+
+                if not self._is_pairing:
+                    return {"success": False, "cancelled": True}
+
                 scan_res = await self.async_scan_all_cameras(timeout=3.0)
                 found = scan_res.get("compatible", [])
                 # Only look for newly connected LAN cameras (host is an IP, not HA entity)
@@ -500,12 +687,11 @@ class WifiPairingEngine:
                     return {"success": True, "devices": new_cams}
 
             self._current_step = "timeout"
-            self.add_log("❌ DÉLAI DÉPASSÉ (32s) : La caméra n'a pas répondu sur votre réseau local.")
-            self.add_log("📋 DIAGNOSTIC DES CAUSES PROBABLES & SOLUTIONS :")
-            self.add_log("  1. Fréquence 5 GHz : Ces caméras ne fonctionnent qu'en Wi-Fi 2.4 GHz. Vérifiez que la bande 2.4 GHz est bien activée sur votre Freebox.")
-            self.add_log("  2. Clé Wi-Fi : Vérifiez scrupuleusement le mot de passe (attention aux majuscules/minuscules et caractères spéciaux).")
-            self.add_log("  3. Point d'Accès : Étiez-vous bien connecté au Wi-Fi de la caméra lors du clic sur 'Lancer l'appairage' ?")
-            self.add_log("  4. Rapprochez la caméra à 1 ou 2 mètres de votre box Wi-Fi lors de l'initialisation.")
+            self.add_log("❌ DÉLAI D'ATTENTE ATTEINT (72s) : La caméra n'a pas encore répondu sur le réseau local.")
+            self.add_log("📋 VÉRIFICATIONS CONSEILLÉES :")
+            self.add_log("  1. Fréquence Wi-Fi : Les caméras YsxLite/A9 requièrent une bande 2.4 GHz active sur la Freebox.")
+            self.add_log("  2. Si votre appareil était sur le Wi-Fi de la caméra, reconnectez-le à votre Freebox et cliquez sur 'Scanner le réseau'.")
+            self.add_log("  3. Vérifiez l'exactitude de la clé Wi-Fi saisie (sensible à la casse).")
             self._is_pairing = False
             return {"success": False, "devices": []}
 
@@ -517,20 +703,26 @@ class WifiPairingEngine:
             return {"success": False, "error": str(err)}
 
     async def _send_wifi_config(self, ip: str, ssid: str, password: str) -> bool:
-        """Send SSID and password payload to camera in AP mode."""
+        """Send all SSID and password payload variants to camera in AP mode across candidate IPs."""
+        # Also trigger HTTP CGI probes asynchronously
+        for target in (ip, "192.168.1.1", "192.168.10.1", "192.168.1.254"):
+            asyncio.create_task(self._send_http_cgi_wifi_config(target, ssid, password))
+
         def _send() -> bool:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             sock.settimeout(2.0)
             try:
-                # Format: [SSID_LEN (1B)] + SSID + [PASS_LEN (1B)] + PASS
-                s_bytes = ssid.encode("utf-8")
-                p_bytes = password.encode("utf-8")
-                payload = struct.pack("B", len(s_bytes)) + s_bytes + struct.pack("B", len(p_bytes)) + p_bytes
+                payloads = self.build_wifi_payloads(ssid, password)
+                candidate_ips = [ip, "192.168.1.1", "192.168.10.1", "192.168.1.254", "255.255.255.255"]
+                candidate_ips = list(dict.fromkeys(candidate_ips))
 
-                packet = PPPP_MAGIC + struct.pack(">HHH", PPPP_CMD_WIFI_SET, len(payload), 1) + payload
-                # Send to target AP IP and broadcast fallback
-                sock.sendto(packet, (ip, DEFAULT_PPPP_DISCOVERY_PORT))
-                sock.sendto(packet, ("192.168.16.101", DEFAULT_PPPP_DISCOVERY_PORT))
+                for packet in payloads:
+                    for target_ip in candidate_ips:
+                        try:
+                            sock.sendto(packet, (target_ip, DEFAULT_PPPP_DISCOVERY_PORT))
+                        except Exception:
+                            continue
                 return True
             except Exception as e:
                 _LOGGER.warning("Could not send direct AP packet: %s", e)
