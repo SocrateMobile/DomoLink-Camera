@@ -52,9 +52,14 @@ class DomolinkCameraPanel extends HTMLElement {
     this._isLoadingTv = false;
   }
 
+  set panel(panel) {
+    this._panel = panel;
+  }
+
   set hass(hass) {
     const isFirst = !this._hass;
     this._hass = hass;
+    this._fetchAvailableEntities();
     if (isFirst) {
       this._init();
     } else {
@@ -63,6 +68,7 @@ class DomolinkCameraPanel extends HTMLElement {
   }
 
   connectedCallback() {
+    this.render();
     this._startPeriodicRefresh();
   }
 
@@ -71,8 +77,12 @@ class DomolinkCameraPanel extends HTMLElement {
   }
 
   async _init() {
-    await this._fetchCameras();
-    await this._fetchAvailableEntities();
+    this.render();
+    try {
+      await this._fetchCameras();
+    } catch (e) {
+      console.error("[DomoLink-Camera] Error fetching cameras:", e);
+    }
     this.render();
   }
 
@@ -106,15 +116,20 @@ class DomolinkCameraPanel extends HTMLElement {
     }
   }
 
-  async _fetchAvailableEntities() {
-    if (!this._hass) return;
+  _fetchAvailableEntities() {
+    if (!this._hass || !this._hass.states) return;
     try {
-      const resp = await this._hass.callWS({ type: "domolink_camera/get_entities" });
-      if (resp && resp.entities) {
-        this._availableEntities = resp.entities;
-      }
+      const allowed = ["switch", "light", "cover", "lock", "fan"];
+      this._availableEntities = Object.values(this._hass.states)
+        .filter((s) => allowed.includes(s.entity_id.split(".")[0]))
+        .slice(0, 150)
+        .map((s) => ({
+          entity_id: s.entity_id,
+          name: s.attributes.friendly_name || s.entity_id,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
     } catch (e) {
-      console.error("[DomoLink-Camera] Failed to fetch entities:", e);
+      this._availableEntities = [];
     }
   }
 
@@ -599,6 +614,25 @@ class DomolinkCameraPanel extends HTMLElement {
   }
 
   render() {
+    try {
+      this._renderInner();
+    } catch (err) {
+      console.error("[DomoLink-Camera] Render error:", err);
+      if (this.shadowRoot) {
+        this.shadowRoot.innerHTML = `
+          <div style="padding: 40px; color: #ef4444; font-family: sans-serif; background: #0d1117; min-height: 100vh;">
+            <h2>⚠️ Erreur d'affichage DomoLink Camera</h2>
+            <pre style="background: rgba(0,0,0,0.5); padding: 16px; border-radius: 8px; color: #f87171; white-space: pre-wrap;">${err.stack || err.message || err}</pre>
+            <button id="btn-reload-panel" style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; margin-top: 16px;">Réessayer</button>
+          </div>
+        `;
+        const rBtn = this.shadowRoot.querySelector("#btn-reload-panel");
+        if (rBtn) rBtn.onclick = () => this.render();
+      }
+    }
+  }
+
+  _renderInner() {
     this.shadowRoot.innerHTML = `
       <style>
         :host {
