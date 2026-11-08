@@ -17,6 +17,10 @@ class DomolinkCameraPanel extends HTMLElement {
     this._pairingActive = false;
     this._pairingLogs = [];
     this._scanResults = [];
+    this._scanCompatible = [];
+    this._scanIncompatible = [];
+    this._scanSummary = null;
+    this._isScanning = false;
     this._selectedCamera = null;
     this._refreshTimer = null;
     this._toastMsg = null;
@@ -278,32 +282,49 @@ class DomolinkCameraPanel extends HTMLElement {
   }
 
   async _scanLocalNetwork() {
-    this._showToast("Recherche de caméras sur le réseau local (UDP 32108)...");
+    this._isScanning = true;
+    this._showToast("Scan du réseau en cours (UDP 32108, RTSP 554, ONVIF & entités HA)...");
+    this.render();
+
     try {
       const resp = await this._hass.callWS({ type: "domolink_camera/scan_local" });
-      if (resp && resp.devices) {
-        this._scanResults = resp.devices;
-        this._showToast(`${resp.devices.length} caméra(s) détectée(s) !`);
+      this._isScanning = false;
+      if (resp) {
+        this._scanCompatible = resp.compatible || [];
+        this._scanIncompatible = resp.incompatible || [];
+        this._scanSummary = resp.summary || {
+          total: this._scanCompatible.length + this._scanIncompatible.length,
+          compatible_count: this._scanCompatible.length,
+          incompatible_count: this._scanIncompatible.length,
+        };
+        this._scanResults = this._scanCompatible;
+
+        this._showToast(
+          `Scan terminé : ${this._scanCompatible.length} compatible(s), ${this._scanIncompatible.length} cloud/propriétaire(s)`
+        );
         this.render();
       }
     } catch (e) {
-      this._showToast("Erreur lors du scan local");
+      this._isScanning = false;
+      this._showToast("Erreur lors du scan du réseau");
+      this.render();
     }
   }
 
   async _addDiscoveredCamera(dev) {
     const newCam = {
-      name: dev.model || "Caméra Wi-Fi",
-      description: "Nouvelle caméra détectée sur le réseau local",
+      name: dev.name || dev.model || "Caméra Wi-Fi",
+      description: dev.details || "Caméra détectée sur le réseau local",
       driver: dev.driver || "ysxlite_pppp",
       host: dev.host,
-      port: dev.port || 32108,
+      port: dev.port || (dev.driver === "generic_rtsp" ? 554 : 32108),
       linked_entities: [],
     };
     await this._saveCamera(newCam);
-    // Remove from scan results
-    this._scanResults = this._scanResults.filter((d) => d.host !== dev.host);
-    this._showToast(`Caméra ${dev.host} ajoutée avec succès !`);
+
+    // Update in-memory scan results
+    dev.already_added = true;
+    this._showToast(`Caméra ${dev.name || dev.host} ajoutée avec succès !`);
     await this._fetchCameras();
     this.render();
   }
@@ -849,22 +870,135 @@ class DomolinkCameraPanel extends HTMLElement {
           margin-top: 14px;
         }
 
-        /* Discovered List */
-        .discovered-list {
+        /* Discovered List & Categorized Scan */
+        .scan-summary-bar {
+          display: flex;
+          gap: 12px;
           margin-top: 16px;
+          flex-wrap: wrap;
+        }
+
+        .summary-chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 8px 14px;
+          border-radius: 20px;
+          font-size: 13px;
+          font-weight: 600;
+        }
+
+        .summary-chip.chip-compatible {
+          background: rgba(16, 185, 129, 0.15);
+          color: #34d399;
+          border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .summary-chip.chip-incompatible {
+          background: rgba(245, 158, 11, 0.15);
+          color: #fbbf24;
+          border: 1px solid rgba(245, 158, 11, 0.3);
+        }
+
+        .scan-category-section {
+          margin-top: 20px;
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+        }
+
+        .scan-category-header {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 14px;
+          font-weight: 600;
+          padding-bottom: 6px;
+          border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .discovered-list {
           display: flex;
           flex-direction: column;
           gap: 10px;
         }
 
         .discovered-item {
-          background: rgba(13, 17, 23, 0.6);
-          border: 1px solid rgba(16, 185, 129, 0.3);
-          border-radius: 8px;
-          padding: 12px 16px;
+          background: rgba(13, 17, 23, 0.7);
+          border-radius: 10px;
+          padding: 14px 16px;
           display: flex;
           justify-content: space-between;
           align-items: center;
+          gap: 16px;
+          transition: transform 0.15s, border-color 0.15s;
+        }
+
+        .discovered-item.compatible {
+          border: 1px solid rgba(16, 185, 129, 0.35);
+        }
+
+        .discovered-item.compatible:hover {
+          border-color: rgba(16, 185, 129, 0.6);
+          transform: translateY(-1px);
+        }
+
+        .discovered-item.incompatible {
+          border: 1px solid rgba(245, 158, 11, 0.3);
+          background: rgba(24, 20, 16, 0.6);
+        }
+
+        .badge-protocol {
+          display: inline-block;
+          font-size: 11px;
+          font-weight: 600;
+          padding: 2px 8px;
+          border-radius: 6px;
+          margin-right: 6px;
+          text-transform: uppercase;
+          letter-spacing: 0.3px;
+        }
+
+        .badge-protocol.badge-green {
+          background: rgba(16, 185, 129, 0.2);
+          color: #34d399;
+          border: 1px solid rgba(16, 185, 129, 0.4);
+        }
+
+        .badge-protocol.badge-orange {
+          background: rgba(245, 158, 11, 0.2);
+          color: #fbbf24;
+          border: 1px solid rgba(245, 158, 11, 0.4);
+        }
+
+        .badge-protocol.badge-gray {
+          background: rgba(148, 163, 184, 0.15);
+          color: #94a3b8;
+          border: 1px solid rgba(148, 163, 184, 0.3);
+        }
+
+        .badge-already-added {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          font-size: 12px;
+          font-weight: 600;
+          color: #34d399;
+          background: rgba(16, 185, 129, 0.15);
+          padding: 6px 12px;
+          border-radius: 6px;
+          border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .reason-box {
+          margin-top: 6px;
+          padding: 8px 12px;
+          background: rgba(245, 158, 11, 0.08);
+          border-left: 3px solid #f59e0b;
+          border-radius: 0 6px 6px 0;
+          font-size: 12px;
+          color: #e2e8f0;
+          line-height: 1.4;
         }
 
         /* Toast */
@@ -1085,12 +1219,12 @@ class DomolinkCameraPanel extends HTMLElement {
             </div>
           </div>
 
-          <div style="margin-top: 16px; display: flex; gap: 12px; align-items: center;">
+          <div style="margin-top: 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
             <button class="btn-primary" id="btn-start-pairing" ${this._pairingActive ? "disabled" : ""}>
               ${this._pairingActive ? "⏳ Appairage en cours..." : "🚀 Lancer l'appairage"}
             </button>
-            <button class="btn-secondary" id="btn-scan-lan">
-              🔍 Scanner le réseau local (UDP 32108)
+            <button class="btn-secondary" id="btn-scan-lan" ${this._isScanning ? "disabled" : ""}>
+              ${this._isScanning ? "⏳ Scan en cours..." : "🔍 Scanner le réseau & Détecter les caméras"}
             </button>
           </div>
 
@@ -1105,23 +1239,102 @@ class DomolinkCameraPanel extends HTMLElement {
           }
 
           ${
-            this._scanResults && this._scanResults.length > 0
+            this._scanSummary
               ? `
-            <div class="discovered-list">
-              <div style="font-weight: 600; font-size: 14px; color: #4ade80;">Caméras détectées :</div>
-              ${this._scanResults
-                .map(
-                  (dev) => `
-                <div class="discovered-item">
-                  <div>
-                    <strong>${dev.model}</strong> (${dev.host}:${dev.port})
-                    <div style="font-size: 11px; color: #8b949e;">ID: ${dev.device_id || "N/A"}</div>
+            <div class="scan-summary-bar">
+              <span class="summary-chip chip-compatible">
+                🟢 ${this._scanCompatible.length} Caméras Compatibles (Protocoles intégrés)
+              </span>
+              <span class="summary-chip chip-incompatible">
+                🟠 ${this._scanIncompatible.length} Caméras Détectées (Protocoles Non Intégrés - Cloud / Propriétaire)
+              </span>
+            </div>
+          `
+              : ""
+          }
+
+          ${
+            this._scanCompatible && this._scanCompatible.length > 0
+              ? `
+            <div class="scan-category-section">
+              <div class="scan-category-header" style="color: #34d399;">
+                <span>🟢</span>
+                <span>Caméras Compatibles avec DomoLink (YsxLite PPPP, RTSP, ONVIF, MJPEG)</span>
+                <span style="font-size: 12px; color: #8b949e; font-weight: normal;">— Flux direct local accessible</span>
+              </div>
+              <div class="discovered-list">
+                ${this._scanCompatible
+                  .map(
+                    (dev) => `
+                  <div class="discovered-item compatible">
+                    <div style="flex: 1;">
+                      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+                        <span class="badge-protocol badge-green">${dev.protocol || dev.driver}</span>
+                        <strong style="color: #f0f6fc; font-size: 14px;">${dev.name || dev.model}</strong>
+                      </div>
+                      <div style="font-size: 12px; color: #8b949e;">
+                        IP: <code style="color: #60a5fa;">${dev.host}${dev.port ? `:${dev.port}` : ""}</code>
+                        ${dev.model ? ` • Modèle : ${dev.model}` : ""}
+                      </div>
+                      ${
+                        dev.details
+                          ? `<div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">${dev.details}</div>`
+                          : ""
+                      }
+                    </div>
+                    <div>
+                      ${
+                        dev.already_added
+                          ? `<span class="badge-already-added">✓ Déjà intégrée</span>`
+                          : `<button class="btn-primary btn-add-discovered" data-host="${dev.host}">+ Ajouter à DomoLink</button>`
+                      }
+                    </div>
                   </div>
-                  <button class="btn-primary btn-add-discovered" data-host="${dev.host}">+ Ajouter cette caméra</button>
-                </div>
-              `
-                )
-                .join("")}
+                `
+                  )
+                  .join("")}
+              </div>
+            </div>
+          `
+              : ""
+          }
+
+          ${
+            this._scanIncompatible && this._scanIncompatible.length > 0
+              ? `
+            <div class="scan-category-section" style="margin-top: 24px;">
+              <div class="scan-category-header" style="color: #fbbf24;">
+                <span>🟠</span>
+                <span>Autres Caméras Détectées (Protocoles Non Intégrés - Cloud / Propriétaire)</span>
+                <span style="font-size: 12px; color: #8b949e; font-weight: normal;">— Flux fermé ou hébergé dans un cloud distant</span>
+              </div>
+              <div class="discovered-list">
+                ${this._scanIncompatible
+                  .map(
+                    (dev) => `
+                  <div class="discovered-item incompatible">
+                    <div style="flex: 1;">
+                      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap;">
+                        <span class="badge-protocol badge-orange">${dev.platform}</span>
+                        <span class="badge-protocol badge-gray">${dev.protocol}</span>
+                        <strong style="color: #f0f6fc; font-size: 14px;">${dev.name}</strong>
+                        ${dev.model ? `<span style="font-size: 12px; color: #8b949e;">(${dev.model})</span>` : ""}
+                      </div>
+                      <div style="font-size: 12px; color: #8b949e;">
+                        Entité HA: <code style="color: #e2e8f0;">${dev.entity_id || dev.host}</code>
+                      </div>
+                      <div class="reason-box">
+                        <strong>⚠️ Raison de non-intégration directe :</strong> ${dev.reason}
+                        <div style="margin-top: 4px; font-size: 11px; color: #94a3b8;">
+                          💡 <em>Astuce : Vous pouvez associer les interrupteurs ou capteurs de présence de cette caméra dans le bandeau inférieur de vos caméras DomoLink.</em>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                `
+                  )
+                  .join("")}
+              </div>
             </div>
           `
               : ""
@@ -1276,7 +1489,7 @@ class DomolinkCameraPanel extends HTMLElement {
     const addDiscoveredBtns = this.shadowRoot.querySelectorAll(".btn-add-discovered");
     addDiscoveredBtns.forEach((btn) => {
       btn.onclick = () => {
-        const dev = this._scanResults.find((d) => d.host === btn.dataset.host);
+        const dev = (this._scanCompatible || this._scanResults || []).find((d) => d.host === btn.dataset.host);
         if (dev) this._addDiscoveredCamera(dev);
       };
     });

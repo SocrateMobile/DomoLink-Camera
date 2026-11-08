@@ -213,8 +213,16 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
     ) -> None:
         mgr = hass.data[DOMAIN]["manager"]
-        found = await mgr.pairing_engine.async_scan_local_network()
-        connection.send_result(msg["id"], {"devices": found})
+        scan_data = await mgr.pairing_engine.async_scan_all_cameras()
+        connection.send_result(
+            msg["id"],
+            {
+                "compatible": scan_data.get("compatible", []),
+                "incompatible": scan_data.get("incompatible", []),
+                "summary": scan_data.get("summary", {}),
+                "devices": scan_data.get("compatible", []),
+            },
+        )
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_GET_ENTITIES})
     @websocket_api.async_response
