@@ -38,6 +38,18 @@ class HaProxyDriver(BaseCameraDriver):
         self.hass = hass
         self.entity_id = config.get("entity_id") or config.get("host") or ""
         self._stream_url: str | None = None
+        self._stream_task: asyncio.Task[None] | None = None
+
+    async def _live_feed_loop(self) -> None:
+        """Continuously poll snapshots to feed the live MJPEG stream."""
+        while self.is_streaming:
+            try:
+                snap = await self.async_get_snapshot()
+                if snap and self.on_frame_callback:
+                    self.on_frame_callback(snap)
+            except Exception as err:
+                _LOGGER.debug("[%s] Error in live stream loop: %s", self.entity_id, err)
+            await asyncio.sleep(0.5)
 
     async def async_connect(self) -> bool:
         """Verify camera entity exists and is available in Home Assistant."""
@@ -118,12 +130,17 @@ class HaProxyDriver(BaseCameraDriver):
         return self.last_snapshot
 
     async def async_start_stream(self) -> None:
-        """Request live HLS or WebRTC stream from Home Assistant camera component."""
+        """Request live HLS or WebRTC stream from Home Assistant camera component and start frame feed."""
         self.is_streaming = True
         self.status = STATUS_STREAMING
 
         if not self.hass or not self.entity_id:
             return
+
+        # Start live feed task for MJPEG endpoint
+        if self._stream_task and not self._stream_task.done():
+            self._stream_task.cancel()
+        self._stream_task = asyncio.create_task(self._live_feed_loop())
 
         try:
             from homeassistant.components.camera import async_request_stream
@@ -145,6 +162,9 @@ class HaProxyDriver(BaseCameraDriver):
         self.is_streaming = False
         self.status = STATUS_ONLINE
         self._stream_url = None
+        if self._stream_task and not self._stream_task.done():
+            self._stream_task.cancel()
+            self._stream_task = None
 
     def get_capabilities(self) -> dict[str, Any]:
         """Return capabilities for HA Proxy camera."""

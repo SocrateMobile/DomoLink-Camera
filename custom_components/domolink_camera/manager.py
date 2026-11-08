@@ -134,9 +134,13 @@ class CameraManager:
         """Create or update camera configuration."""
         cid = camera_data.get("id")
         if not cid:
-            # Generate ID from name or timestamp
-            raw_name = camera_data.get("name", "camera").lower().replace(" ", "_")
-            cid = f"cam_{raw_name}_{int(time.time())}"
+            # Generate pure ASCII URL-safe ID from name or timestamp
+            import re, unicodedata
+            raw_name = str(camera_data.get("name") or "camera")
+            clean_name = unicodedata.normalize("NFKD", raw_name).encode("ascii", "ignore").decode("ascii")
+            slug = re.sub(r"[^\w\s-]", "", clean_name.lower())
+            slug = re.sub(r"[-\s]+", "_", slug).strip("-_") or "cam"
+            cid = f"cam_{slug}_{int(time.time())}"
             camera_data["id"] = cid
 
         # Keep existing order or assign to end

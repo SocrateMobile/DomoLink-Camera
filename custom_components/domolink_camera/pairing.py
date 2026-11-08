@@ -263,6 +263,13 @@ class WifiPairingEngine:
                 except Exception:
                     continue
 
+            # Unicast subnet sweep (192.168.1.1-254) to bypass AP isolation and populate ARP table
+            for i in range(1, 255):
+                try:
+                    sock.sendto(pkt, (f"192.168.1.{i}", DEFAULT_PPPP_DISCOVERY_PORT))
+                except Exception:
+                    pass
+
             start_t = loop.time()
             while loop.time() - start_t < 1.5:
                 try:
