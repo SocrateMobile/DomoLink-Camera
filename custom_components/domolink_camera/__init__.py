@@ -78,7 +78,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "module_url": f"/domolink_camera_panel/domolink-camera-panel.js?v={VERSION}",
                 }
             },
-            require_admin=False,
+            require_admin=True,
         )
     except ValueError:
         # Panel already registered

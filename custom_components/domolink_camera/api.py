@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
+import aiohttp
 from aiohttp import web
 from homeassistant.components import websocket_api
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import Unauthorized
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import voluptuous as vol
 
 from .const import (
@@ -43,7 +48,7 @@ class DomolinkCameraSnapshotView(HomeAssistantView):
 
     url = "/api/domolink_camera/snapshot/{camera_id}"
     name = "api:domolink_camera:snapshot"
-    requires_auth = False  # Allows secure signed token or frontend token
+    requires_auth = True
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize view."""
@@ -51,6 +56,10 @@ class DomolinkCameraSnapshotView(HomeAssistantView):
 
     async def get(self, request: web.Request, camera_id: str) -> web.Response:
         """Return latest snapshot image."""
+        user = request.get("hass_user")
+        if not user:
+            raise Unauthorized()
+
         mgr = self.hass.data[DOMAIN]["manager"]
         data = await mgr.async_get_snapshot(camera_id)
 
@@ -71,13 +80,17 @@ class DomolinkCameraStreamView(HomeAssistantView):
 
     url = "/api/domolink_camera/stream/{camera_id}"
     name = "api:domolink_camera:stream"
-    requires_auth = False
+    requires_auth = True
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize stream view."""
         self.hass = hass
 
     async def get(self, request: web.Request, camera_id: str) -> web.StreamResponse:
+        """Stream MJPEG frames directly to client."""
+        user = request.get("hass_user")
+        if not user:
+            raise Unauthorized()
         """Stream MJPEG frames directly to client."""
         mgr = self.hass.data[DOMAIN]["manager"]
         driver = mgr.drivers.get(camera_id)
@@ -146,7 +159,7 @@ class DomolinkTvLiveStreamView(HomeAssistantView):
 
     url = "/api/domolink_camera/tv_live/{channel_id}"
     name = "api:domolink_camera:tv_live"
-    requires_auth = False
+    requires_auth = True
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize TV live stream view."""
@@ -154,6 +167,10 @@ class DomolinkTvLiveStreamView(HomeAssistantView):
 
     async def get(self, request: web.Request, channel_id: str) -> web.StreamResponse:
         """Remux RTSP/UDP stream to fragmented MP4 for browser HTML5 video playback."""
+        user = request.get("hass_user")
+        if not user:
+            raise Unauthorized()
+
         mgr = self.hass.data[DOMAIN]["manager"]
         channels = await mgr.box_detector.async_get_tv_channels()
         channel = next((c for c in channels if c["id"] == channel_id), None)
@@ -240,7 +257,7 @@ class DomolinkTvProxyView(HomeAssistantView):
 
     url = "/api/domolink_camera/tv_proxy"
     name = "api:domolink_camera:tv_proxy"
-    requires_auth = False
+    requires_auth = True
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize proxy view."""
@@ -248,20 +265,36 @@ class DomolinkTvProxyView(HomeAssistantView):
 
     async def get(self, request: web.Request) -> web.Response:
         """Proxy external HLS stream bypassing browser CORS constraints."""
-        import aiohttp
+        user = request.get("hass_user")
+        if not user or not user.is_admin:
+            raise Unauthorized()
+
         url = request.query.get("url")
         if not url:
             return web.Response(status=400, text="Paramètre url requis.")
+
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return web.Response(status=400, text="Schéma d'URL non autorisé.")
+
+        hostname = parsed.hostname or ""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=5.0) as resp:
-                    data = await resp.read()
-                    ct = resp.headers.get("Content-Type", "application/vnd.apple.mpegurl")
-                    return web.Response(
-                        body=data,
-                        content_type=ct,
-                        headers={"Access-Control-Allow-Origin": "*"},
-                    )
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+                return web.Response(status=403, text="Adresse IP non autorisée.")
+        except ValueError:
+            pass
+
+        try:
+            session = async_get_clientsession(self.hass)
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8.0)) as resp:
+                data = await resp.read()
+                ct = resp.headers.get("Content-Type", "application/vnd.apple.mpegurl")
+                return web.Response(
+                    body=data,
+                    content_type=ct,
+                    headers={"Access-Control-Allow-Origin": "*"},
+                )
         except Exception as e:
             return web.Response(status=502, text=str(e))
 
@@ -283,6 +316,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Required("type"): WS_TYPE_SAVE_LAYOUT,
         vol.Required("order"): [str],
     })
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_save_layout(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -295,6 +329,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Required("type"): WS_TYPE_SAVE_CAMERA,
         vol.Required("camera"): dict,
     })
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_save_camera(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -307,6 +342,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Required("type"): WS_TYPE_DELETE_CAMERA,
         vol.Required("camera_id"): str,
     })
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_delete_camera(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -322,6 +358,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Optional("camera_ap_ip", default="192.168.1.1"): str,
         vol.Optional("camera_ssid"): str,
     })
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_start_pairing(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -339,6 +376,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         connection.send_result(msg["id"], {"started": True})
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_STOP_PAIRING})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_stop_pairing(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -348,6 +386,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         connection.send_result(msg["id"], {"stopped": True})
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_SCAN_WIFI_APS})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_scan_wifi_aps(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -365,6 +404,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         connection.send_result(msg["id"], mgr.pairing_engine.get_status())
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_SCAN_LOCAL})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_scan_local(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -423,6 +463,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Required("camera_id"): str,
         vol.Required("enabled"): bool,
     })
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_set_ir(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -435,6 +476,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Required("type"): WS_TYPE_REBOOT,
         vol.Required("camera_id"): str,
     })
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_reboot(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -542,6 +584,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Required("type"): WS_TYPE_PIN_TV_CAMERA,
         vol.Required("channel_id"): str,
     })
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_pin_tv_camera(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]

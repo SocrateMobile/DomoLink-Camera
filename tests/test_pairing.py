@@ -1,9 +1,14 @@
 """Unit tests for DomoLink Camera Wi-Fi Pairing Engine."""
 
 import asyncio
+import os
 import struct
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 # Mock homeassistant modules for offline testing
 import types
@@ -21,7 +26,8 @@ ha_mods = [
     "homeassistant.helpers.event",
     "homeassistant.helpers.entity_registry",
     "homeassistant.helpers.storage",
-    "voluptuous",
+    "homeassistant.exceptions",
+    "homeassistant.helpers.aiohttp_client",
 ]
 
 for mod in ha_mods:
@@ -31,12 +37,15 @@ for mod in ha_mods:
 
 # Mock Store and callback
 sys.modules["homeassistant.helpers.storage"].Store = MagicMock()
+sys.modules["homeassistant.helpers.aiohttp_client"].async_get_clientsession = MagicMock()
+sys.modules["homeassistant.exceptions"].Unauthorized = type("Unauthorized", (Exception,), {})
 sys.modules["homeassistant.core"].callback = lambda f: f
 sys.modules["homeassistant.core"].HomeAssistant = MagicMock
 sys.modules["homeassistant.config_entries"].ConfigEntry = MagicMock
 sys.modules["homeassistant.components.http"].HomeAssistantView = MagicMock
 sys.modules["homeassistant.components.websocket_api"].websocket_command = lambda schema: lambda f: f
 sys.modules["homeassistant.components.websocket_api"].async_response = lambda f: f
+sys.modules["homeassistant.components.websocket_api"].require_admin = lambda f: f
 sys.modules["homeassistant.components.websocket_api"].ActiveConnection = MagicMock
 
 import unittest
