@@ -4,6 +4,11 @@
 
 # DomoLink-Camera 📹
 
+[![Documentation Officielle](https://img.shields.io/badge/Documentation-socratemobile.fr-06b6d4.svg?logo=googlechrome&logoColor=white)](https://socratemobile.fr/integration.html?id=domolink-camera)
+
+> 🌐 **Site officiel & Documentation complète** : Retrouvez le guide d'installation pas à pas, les entités supportées et les exemples d'automatisations sur [socratemobile.fr](https://socratemobile.fr/integration.html?id=domolink-camera).
+
+
 Intégration personnalisée Home Assistant pour la gestion centralisée et le streaming en direct des caméras Wi-Fi (YsxLite, A9, X5, PPPP, RTSP, ONVIF, Passerelle HA).
 
 ---
