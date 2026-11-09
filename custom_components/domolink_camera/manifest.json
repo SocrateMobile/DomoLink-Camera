@@ -1,17 +1,17 @@
 {
   "domain": "domolink_camera",
   "name": "DomoLink Camera",
-  "version": "1.4.5",
-  "documentation": "https://github.com/domolink/domolink-camera",
-  "issue_tracker": "https://github.com/domolink/domolink-camera/issues",
   "codeowners": [
-    "@domolink"
+    "@SocrateMobile"
   ],
   "config_flow": true,
-  "iot_class": "local_push",
   "dependencies": [
     "frontend",
     "http"
   ],
-  "requirements": []
+  "documentation": "https://github.com/SocrateMobile/DomoLink-Camera",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/SocrateMobile/DomoLink-Camera/issues",
+  "requirements": [],
+  "version": "1.4.6"
 }

@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "DomoLink-Camera",
+        "description": "Install and activate DomoLink-Camera with its sidebar panel and live stream management."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only a single instance of DomoLink-Camera is required."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "DomoLink-Camera Options",
+        "description": "Access the DomoLink Camera sidebar panel directly to configure your cameras and Wi-Fi pairing."
+      }
+    }
+  }
+}

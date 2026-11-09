@@ -4,6 +4,17 @@
  */
 
 class DomolinkCameraPanel extends HTMLElement {
+  _escapeHtml(str) {
+    if (str === null || str === undefined) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
@@ -263,7 +274,7 @@ class DomolinkCameraPanel extends HTMLElement {
   _updatePairingLogs() {
     const logBox = this.shadowRoot.querySelector("#pairing-logs") || this.shadowRoot.querySelector(".pairing-logs");
     if (logBox) {
-      logBox.innerHTML = this._pairingLogs.map((l) => `<div>> ${l}</div>`).join("");
+      logBox.innerHTML = this._pairingLogs.map((l) => `<div>> ${this._escapeHtml(l)}</div>`).join("");
       logBox.scrollTop = logBox.scrollHeight;
     }
   }
@@ -1809,7 +1820,7 @@ class DomolinkCameraPanel extends HTMLElement {
               <div class="card-header">
                 <div class="card-title-box">
                   <div class="status-dot ${isLive ? "streaming" : statusClass}"></div>
-                  <div class="card-name">${cam.name}</div>
+                  <div class="card-name">${this._escapeHtml(cam.name)}</div>
                   <span class="driver-badge">${driverLabel}</span>
                 </div>
                 <div style="font-size: 12px; color: #8b949e; cursor: grab;" title="Glisser pour réorganiser">⠿</div>
@@ -1817,12 +1828,12 @@ class DomolinkCameraPanel extends HTMLElement {
 
               <!-- Viewport with Image/Live Stream -->
               <div class="viewport">
-                <img src="${snapUrl}" alt="${cam.name}" loading="lazy" />
+                <img src="${snapUrl}" alt="${this._escapeHtml(cam.name)}" loading="lazy" />
 
                 <!-- Rollover Hover Tooltip -->
                 <div class="rollover-tooltip">
-                  <strong>${cam.name}</strong> (${cam.host || "IP non assignée"})<br/>
-                  ${cam.description ? cam.description : "<i>Aucune description renseignée.</i>"}
+                  <strong>${this._escapeHtml(cam.name)}</strong> (${this._escapeHtml(cam.host || "IP non assignée")})<br/>
+                  ${cam.description ? this._escapeHtml(cam.description) : "<i>Aucune description renseignée.</i>"}
                 </div>
 
                 <!-- Live Button -->
@@ -2155,8 +2166,8 @@ class DomolinkCameraPanel extends HTMLElement {
                       }
                     </div>
                     <div class="channel-details">
-                      <div class="channel-name">${item.num ? `${item.num}. ` : ""}${item.name}</div>
-                      <div class="channel-sub">${item.category || "Direct"} • ${item.quality || "HD"}</div>
+                      <div class="channel-name">${item.num ? `${this._escapeHtml(item.num)}. ` : ""}${this._escapeHtml(item.name)}</div>
+                      <div class="channel-sub">${this._escapeHtml(item.category || "Direct")} • ${this._escapeHtml(item.quality || "HD")}</div>
                     </div>
                   </div>
                 `;
@@ -2294,7 +2305,7 @@ class DomolinkCameraPanel extends HTMLElement {
             <div class="pairing-logs" id="pairing-logs">
               ${
                 this._pairingLogs && this._pairingLogs.length > 0
-                  ? this._pairingLogs.map((l) => `<div>> ${l}</div>`).join("")
+                  ? this._pairingLogs.map((l) => `<div>> ${this._escapeHtml(l)}</div>`).join("")
                   : `<div style="color: #6ee7b7; opacity: 0.6;">> En attente d'une action (Appairage, Scan réseau ou Ajout de caméra)...</div>`
               }
             </div>
@@ -2332,11 +2343,11 @@ class DomolinkCameraPanel extends HTMLElement {
                     <div style="flex: 1;">
                       <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
                         <span class="badge-protocol badge-green">${dev.protocol || dev.driver}</span>
-                        <strong style="color: #f0f6fc; font-size: 14px;">${dev.name || dev.model}</strong>
+                        <strong style="color: #f0f6fc; font-size: 14px;">${this._escapeHtml(dev.name || dev.model)}</strong>
                       </div>
                       <div style="font-size: 12px; color: #8b949e;">
                         IP: <code style="color: #60a5fa;">${dev.host}${dev.port ? `:${dev.port}` : ""}</code>
-                        ${dev.model ? ` • Modèle : ${dev.model}` : ""}
+                        ${dev.model ? ` • Modèle : ${this._escapeHtml(dev.model)}` : ""}
                       </div>
                       ${
                         dev.details
@@ -2379,14 +2390,14 @@ class DomolinkCameraPanel extends HTMLElement {
                       <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap;">
                         <span class="badge-protocol badge-orange">${dev.platform}</span>
                         <span class="badge-protocol badge-gray">${dev.protocol}</span>
-                        <strong style="color: #f0f6fc; font-size: 14px;">${dev.name}</strong>
-                        ${dev.model ? `<span style="font-size: 12px; color: #8b949e;">(${dev.model})</span>` : ""}
+                        <strong style="color: #f0f6fc; font-size: 14px;">${this._escapeHtml(dev.name)}</strong>
+                        ${dev.model ? `<span style="font-size: 12px; color: #8b949e;">(${this._escapeHtml(dev.model)})</span>` : ""}
                       </div>
                       <div style="font-size: 12px; color: #8b949e;">
                         Entité HA: <code style="color: #e2e8f0;">${dev.entity_id || dev.host}</code>
                       </div>
                       <div class="reason-box">
-                        <strong>⚠️ Raison de non-intégration directe :</strong> ${dev.reason}
+                        <strong>⚠️ Raison de non-intégration directe :</strong> ${this._escapeHtml(dev.reason)}
                         <div style="margin-top: 4px; font-size: 11px; color: #94a3b8;">
                           💡 <em>Astuce : Vous pouvez associer les interrupteurs ou capteurs de présence de cette caméra dans le bandeau inférieur de vos caméras DomoLink.</em>
                         </div>
@@ -2430,13 +2441,13 @@ class DomolinkCameraPanel extends HTMLElement {
                         (cam) => `
                     <tr>
                       <td>
-                        <input type="text" class="form-input cam-input-name" data-id="${cam.id}" value="${cam.name}" style="width: 140px;" />
+                        <input type="text" class="form-input cam-input-name" data-id="${cam.id}" value="${this._escapeHtml(cam.name)}" style="width: 140px;" />
                       </td>
                       <td>
-                        <input type="text" class="form-input cam-input-desc" data-id="${cam.id}" value="${cam.description || ""}" placeholder="Ex: Salon grand angle" style="width: 200px;" />
+                        <input type="text" class="form-input cam-input-desc" data-id="${cam.id}" value="${this._escapeHtml(cam.description || "")}" placeholder="Ex: Salon grand angle" style="width: 200px;" />
                       </td>
                       <td>
-                        <input type="text" class="form-input cam-input-host" data-id="${cam.id}" value="${cam.host}" style="width: 130px;" />
+                        <input type="text" class="form-input cam-input-host" data-id="${cam.id}" value="${this._escapeHtml(cam.host)}" style="width: 130px;" />
                       </td>
                       <td>
                         <select class="form-select cam-input-driver" data-id="${cam.id}">
@@ -2766,8 +2777,8 @@ class DomolinkCameraPanel extends HTMLElement {
                 }
               </div>
               <div class="channel-details">
-                <div class="channel-name">${item.num ? `${item.num}. ` : ""}${item.name}</div>
-                <div class="channel-sub">${item.category || "Direct"} • ${item.quality || "HD"}</div>
+                <div class="channel-name">${item.num ? `${this._escapeHtml(item.num)}. ` : ""}${this._escapeHtml(item.name)}</div>
+                <div class="channel-sub">${this._escapeHtml(item.category || "Direct")} • ${this._escapeHtml(item.quality || "HD")}</div>
               </div>
             </div>
           `;
