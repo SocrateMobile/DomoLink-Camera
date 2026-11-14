@@ -339,7 +339,9 @@ class WifiPairingEngine:
             if not ips:
                 try:
                     out = subprocess.check_output(["arp", "-an"]).decode("utf-8", errors="ignore")
-                    for match in re.finditer(r"\((192\.168\.\d+\.\d+)\)", out):
+                    for match in re.finditer(
+                        r"\(((?:192\.168|10|172\.(?:1[6-9]|2\d|3[01]))\.\d+\.\d+)\)", out
+                    ):
                         ip = match.group(1)
                         if not ip.endswith(".255") and not ip.endswith(".0"):
                             ips.add(ip)
@@ -365,7 +367,7 @@ class WifiPairingEngine:
             for port in (554, 8554):
                 try:
                     reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(ip, port), timeout=0.4
+                        asyncio.open_connection(ip, port), timeout=0.75
                     )
                     # Send RTSP OPTIONS probe to verify it is actually an RTSP camera
                     probe_req = (
@@ -377,7 +379,7 @@ class WifiPairingEngine:
                     await writer.drain()
 
                     # Require valid RTSP response signature (e.g. RTSP/1.0 200 or RTSP/1.0 401)
-                    raw_resp = await asyncio.wait_for(reader.read(256), timeout=0.7)
+                    raw_resp = await asyncio.wait_for(reader.read(256), timeout=0.75)
                     writer.close()
                     await writer.wait_closed()
 
@@ -395,6 +397,50 @@ class WifiPairingEngine:
                         }
                 except Exception:
                     pass
+
+            # Test HTTP / MJPEG ports (80, 81, 8080) for ESP32-CAM and webcams
+            for http_port in (80, 81, 8080):
+                for path in ("/stream", "/mjpeg", "/snapshot.jpg", "/capture"):
+                    try:
+                        reader, writer = await asyncio.wait_for(
+                            asyncio.open_connection(ip, http_port), timeout=0.6
+                        )
+                        req = (
+                            f"GET {path} HTTP/1.1\r\n"
+                            f"Host: {ip}:{http_port}\r\n"
+                            f"User-Agent: DomoLink-Camera\r\n"
+                            f"Connection: close\r\n\r\n"
+                        )
+                        writer.write(req.encode("ascii"))
+                        await writer.drain()
+                        raw_resp = await asyncio.wait_for(reader.read(512), timeout=0.75)
+                        writer.close()
+                        await writer.wait_closed()
+
+                        lower_resp = raw_resp.lower()
+                        is_http_ok = b"200 ok" in lower_resp
+                        is_media = (
+                            b"multipart/x-mixed-replace" in lower_resp
+                            or b"image/jpeg" in lower_resp
+                            or b"image/jpg" in lower_resp
+                        )
+                        if is_http_ok and is_media:
+                            return {
+                                "host": ip,
+                                "port": http_port,
+                                "http_port": http_port,
+                                "stream_path": path if path in ("/stream", "/mjpeg") else "/stream",
+                                "snapshot_path": path if path in ("/snapshot.jpg", "/capture") else "/snapshot.jpg",
+                                "device_id": f"MJPEG_{ip.replace('.', '_')}_{http_port}",
+                                "name": f"Caméra MJPEG / HTTP ({ip})",
+                                "driver": DRIVER_GENERIC_MJPEG,
+                                "protocol": f"MJPEG / HTTP (Port {http_port})",
+                                "model": "Webcam / ESP32-CAM MJPEG",
+                                "details": f"Flux HTTP/MJPEG détecté sur {ip}:{http_port}{path}",
+                                "compatible": True,
+                            }
+                    except Exception:
+                        continue
             return None
 
         if candidate_ips:
@@ -422,17 +468,12 @@ class WifiPairingEngine:
                 er = self.hass.helpers.entity_registry.async_get(self.hass)
                 ent_map = er.entities
 
-            for state in self.hass.states.async_all():
+            all_states = self.hass.states.async_all()
+            existing_eids = {s.entity_id for s in all_states if s.entity_id.startswith("camera.")}
+
+            for state in all_states:
                 eid = state.entity_id
                 if not eid.startswith("camera."):
-                    continue
-
-                # Skip unavailable camera entities
-                if state.state == "unavailable":
-                    continue
-
-                # Filter out obvious mirror duplicates from Remote Home Assistant (e.g. _2, _2_2)
-                if re.search(r"_\d+(_\d+)*$", eid):
                     continue
 
                 attrs = state.attributes or {}
@@ -449,7 +490,17 @@ class WifiPairingEngine:
                 if platform == DOMAIN:
                     continue
 
-                # Check if known direct RTSP/MJPEG compatible
+                # Filter only true mirror duplicates created by remote_homeassistant
+                if platform == "remote_homeassistant":
+                    if re.search(r"_\d+_\d+$", eid):
+                        continue
+                    base_match = re.match(r"^(camera\..+?)_\d+$", eid)
+                    if base_match and base_match.group(1) in existing_eids:
+                        continue
+
+                unavail_note = " • Actuellement indisponible dans HA" if state.state == "unavailable" else ""
+
+                # All HA camera entities proxy cleanly through DRIVER_HA_PROXY
                 if platform in KNOWN_COMPATIBLE_PLATFORMS:
                     info = KNOWN_COMPATIBLE_PLATFORMS[platform]
                     compatible.append({
@@ -457,10 +508,10 @@ class WifiPairingEngine:
                         "port": 0,
                         "device_id": eid,
                         "name": friendly_name,
-                        "driver": info["driver"],
+                        "driver": DRIVER_HA_PROXY,
                         "protocol": info["protocol"],
                         "model": model if model != "Caméra Détectée" else info["model"],
-                        "details": f"Entité locale Home Assistant ({platform}) avec flux direct compatible",
+                        "details": f"Entité Home Assistant ({platform}) avec flux proxifié et support stream natif{unavail_note}",
                         "compatible": True,
                         "source": "ha_entity",
                     })
@@ -476,7 +527,7 @@ class WifiPairingEngine:
                         "driver": DRIVER_HA_PROXY,
                         "protocol": f"Passerelle Home Assistant ({plat_name})",
                         "model": model if model != "Caméra Détectée" else f"Caméra {plat_name}",
-                        "details": f"Gérée par '{plat_name}' dans Home Assistant • Snapshot et Live streaming proxifiés automatiquement",
+                        "details": f"Gérée par '{plat_name}' dans Home Assistant • Snapshot et Live streaming proxifiés automatiquement{unavail_note}",
                         "compatible": True,
                         "source": "ha_entity",
                     })

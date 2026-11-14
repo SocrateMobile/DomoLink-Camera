@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import ipaddress
 import logging
 from typing import Any
@@ -41,6 +42,15 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _sign_api_path(hass: HomeAssistant, path: str, expiration_seconds: int = 3600) -> str:
+    """Sign a Home Assistant API URL with ?authSig=... for media elements."""
+    try:
+        from homeassistant.components.http.auth import async_sign_path
+        return async_sign_path(hass, path, timedelta(seconds=expiration_seconds))
+    except Exception:
+        return path
 
 
 class DomolinkCameraSnapshotView(HomeAssistantView):
@@ -87,13 +97,15 @@ class DomolinkCameraStreamView(HomeAssistantView):
         self.hass = hass
 
     async def get(self, request: web.Request, camera_id: str) -> web.StreamResponse:
-        """Stream MJPEG frames directly to client."""
+        """Stream MJPEG frames directly to client with multi-subscriber low-latency queue."""
         user = request.get("hass_user")
         if not user:
             raise Unauthorized()
-        """Stream MJPEG frames directly to client."""
+
         mgr = self.hass.data[DOMAIN]["manager"]
         driver = mgr.drivers.get(camera_id)
+        if not driver:
+            return web.Response(status=404, text=f"Caméra '{camera_id}' introuvable.")
 
         response = web.StreamResponse(
             status=200,
@@ -107,10 +119,7 @@ class DomolinkCameraStreamView(HomeAssistantView):
         )
         await response.prepare(request)
 
-        # Start live video feed on driver
-        await mgr.async_start_live(camera_id)
-
-        frame_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=10)
+        frame_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=2)
 
         def _on_frame(jpeg_bytes: bytes) -> None:
             if frame_queue.full():
@@ -118,19 +127,24 @@ class DomolinkCameraStreamView(HomeAssistantView):
                     frame_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
-            frame_queue.put_nowait(jpeg_bytes)
+            try:
+                frame_queue.put_nowait(jpeg_bytes)
+            except asyncio.QueueFull:
+                pass
 
-        orig_callback = driver.on_frame_callback if driver else None
-        if driver:
-            driver.on_frame_callback = _on_frame
+        driver.subscribe_frames(_on_frame)
+        await driver.async_acquire_stream()
+
+        # Emit immediate initial frame if cached for instant startup
+        initial = driver.last_snapshot
+        if initial and not initial.startswith(b"<svg"):
+            _on_frame(initial)
 
         try:
             while True:
-                # Get frame or timeout to check client disconnect
                 try:
-                    jpeg = await asyncio.wait_for(frame_queue.get(), timeout=2.0)
+                    jpeg = await asyncio.wait_for(frame_queue.get(), timeout=2.5)
                 except asyncio.TimeoutError:
-                    # Send last known snapshot if available
                     jpeg = await mgr.async_get_snapshot(camera_id)
 
                 if jpeg and not jpeg.startswith(b"<svg"):
@@ -143,13 +157,12 @@ class DomolinkCameraStreamView(HomeAssistantView):
                     )
                     await response.write(part)
                 else:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.4)
         except (asyncio.CancelledError, ConnectionResetError, Exception):
             pass
         finally:
-            if driver:
-                driver.on_frame_callback = orig_callback
-            await mgr.async_stop_live(camera_id)
+            driver.unsubscribe_frames(_on_frame)
+            await driver.async_release_stream()
 
         return response
 
@@ -310,6 +323,18 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
     ) -> None:
         mgr = hass.data[DOMAIN]["manager"]
         cameras = mgr.get_cameras_list()
+        for cam in cameras:
+            cid = cam["id"]
+            cam["signed_snapshot_url"] = _sign_api_path(
+                hass, f"/api/domolink_camera/snapshot/{cid}"
+            )
+            cam["signed_stream_url"] = _sign_api_path(
+                hass, f"/api/domolink_camera/stream/{cid}"
+            )
+            if cam.get("channel_id"):
+                cam["signed_tv_live_url"] = _sign_api_path(
+                    hass, f"/api/domolink_camera/tv_live/{cam['channel_id']}"
+                )
         connection.send_result(msg["id"], {"cameras": cameras})
 
     @websocket_api.websocket_command({
@@ -452,11 +477,27 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
     ) -> None:
         mgr = hass.data[DOMAIN]["manager"]
+        camera_id = msg["camera_id"]
         if msg["live"]:
-            await mgr.async_start_live(msg["camera_id"])
+            await mgr.async_start_live(camera_id)
         else:
-            await mgr.async_stop_live(msg["camera_id"])
-        connection.send_result(msg["id"], {"success": True})
+            await mgr.async_stop_live(camera_id)
+        driver = mgr.drivers.get(camera_id)
+        cam_cfg = mgr.cameras.get(camera_id, {})
+        hls_url = (driver._stream_url if driver else None) or cam_cfg.get("web_hls_url") or ""
+        connection.send_result(
+            msg["id"],
+            {
+                "success": True,
+                "signed_stream_url": _sign_api_path(
+                    hass, f"/api/domolink_camera/stream/{camera_id}"
+                ),
+                "signed_snapshot_url": _sign_api_path(
+                    hass, f"/api/domolink_camera/snapshot/{camera_id}"
+                ),
+                "hls_url": hls_url,
+            },
+        )
 
     @websocket_api.websocket_command({
         vol.Required("type"): WS_TYPE_SET_IR,
@@ -573,7 +614,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         connection.send_result(
             msg["id"],
             {
-                "url": f"/api/domolink_camera/tv_live/{channel_id}",
+                "url": _sign_api_path(hass, f"/api/domolink_camera/tv_live/{channel_id}"),
                 "format": "mp4",
                 "proxied": True,
                 "channel": channel,
@@ -599,17 +640,25 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
             return
 
         cam_id = f"tv_{channel_id}"
-        rtsp_url = channel.get("stream_url", "")
-        # Parse host and path if RTSP
-        host = "mafreebox.freebox.fr"
-        path = "/live/ch0"
-        port = 554
-        if "rtsp://" in rtsp_url:
-            cleaned = rtsp_url.replace("rtsp://", "")
-            if "/" in cleaned:
-                host_part, path_part = cleaned.split("/", 1)
-                host = host_part.split(":")[0]
-                path = f"/{path_part}"
+        stream_url = channel.get("stream_url", "")
+        web_hls_url = channel.get("web_hls_url", "")
+        target_url = stream_url or web_hls_url
+
+        parsed = urlparse(target_url) if target_url else None
+        host = (parsed.hostname if parsed and parsed.hostname else "") or "mafreebox.freebox.fr"
+        if parsed and parsed.port:
+            port = parsed.port
+        elif parsed and parsed.scheme == "https":
+            port = 443
+        elif parsed and parsed.scheme == "http":
+            port = 80
+        else:
+            port = 554
+        path = (
+            f"{parsed.path or '/'}{f'?{parsed.query}' if parsed.query else ''}"
+            if parsed and parsed.scheme
+            else "/live/ch0"
+        )
 
         cam_config = {
             "id": cam_id,
@@ -619,13 +668,21 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
             "host": host,
             "port": port,
             "stream_path": path,
-            "order": len(mgr.cameras),
-            "linked_entities": [],
+            "stream_url": stream_url,
+            "web_hls_url": web_hls_url,
+            "channel_id": channel_id,
+            "type": channel.get("type", "rtsp"),
+            "order": mgr.cameras.get(cam_id, {}).get("order", len(mgr.cameras)),
+            "linked_entities": mgr.cameras.get(cam_id, {}).get("linked_entities", []),
         }
 
+        if cam_id in mgr.drivers:
+            await mgr.drivers[cam_id].async_disconnect()
         mgr.cameras[cam_id] = cam_config
-        mgr._init_driver(cam_id, cam_config)
+        driver = mgr._init_driver(cam_id, cam_config)
+        asyncio.create_task(driver.async_connect())
         await mgr.async_save()
+        mgr._notify_listeners()
         connection.send_result(msg["id"], {"success": True, "camera": cam_config})
 
     websocket_api.async_register_command(hass, ws_get_cameras)

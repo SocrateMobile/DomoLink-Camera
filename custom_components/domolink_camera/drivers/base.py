@@ -3,10 +3,36 @@
 from __future__ import annotations
 
 import abc
+import asyncio
 import logging
+import shutil
+import time
 from typing import Any, Callable
 
+from ..const import DEFAULT_STREAM_FPS, MAX_UDP_FRAME_BUFFER, STATUS_STREAMING
+
 _LOGGER = logging.getLogger(__name__)
+
+
+def extract_jpegs_from_buffer(buf: bytearray) -> list[bytes]:
+    """Extract complete JPEG frames (SOI..EOI) from a rolling byte buffer."""
+    frames: list[bytes] = []
+    while True:
+        soi = buf.find(b"\xff\xd8")
+        if soi == -1:
+            if len(buf) > MAX_UDP_FRAME_BUFFER:
+                buf.clear()
+            break
+        if soi > 0:
+            del buf[:soi]
+        eoi = buf.find(b"\xff\xd9", 2)
+        if eoi == -1:
+            if len(buf) > MAX_UDP_FRAME_BUFFER:
+                buf.clear()
+            break
+        frames.append(bytes(buf[: eoi + 2]))
+        del buf[: eoi + 2]
+    return frames
 
 
 class BaseCameraDriver(abc.ABC):
@@ -17,11 +43,142 @@ class BaseCameraDriver(abc.ABC):
         self.camera_id = camera_id
         self.config = config
         self.on_frame_callback = on_frame_callback
+        self._frame_listeners: set[Callable[[bytes], None]] = set()
+        self._stream_clients: int = 0
+        self._explicit_live: bool = False
+        self._stream_url: str | None = None
+        self._ffmpeg_proc: asyncio.subprocess.Process | None = None
+        self.fps: float = 0.0
+        self._frame_times: list[float] = []
         self.is_connected = False
         self.is_streaming = False
         self.last_snapshot: bytes | None = None
         self.last_snapshot_time: float | None = None
         self.status = "offline"
+
+    def subscribe_frames(self, cb: Callable[[bytes], None]) -> None:
+        """Register a listener callback for live JPEG frames."""
+        self._frame_listeners.add(cb)
+
+    def unsubscribe_frames(self, cb: Callable[[bytes], None]) -> None:
+        """Unregister a listener callback."""
+        self._frame_listeners.discard(cb)
+
+    def notify_frame(self, jpeg: bytes) -> None:
+        """Store valid JPEG frame, update FPS metric, and notify all subscribers."""
+        if not jpeg or len(jpeg) < 100:
+            return
+        now = time.time()
+        self.last_snapshot = jpeg
+        self.last_snapshot_time = now
+
+        self._frame_times.append(now)
+        cutoff = now - 2.0
+        self._frame_times = [t for t in self._frame_times if t >= cutoff]
+        if len(self._frame_times) >= 2:
+            span = self._frame_times[-1] - self._frame_times[0]
+            self.fps = (len(self._frame_times) - 1) / span if span > 0 else 0.0
+        else:
+            self.fps = 0.0
+
+        if self.on_frame_callback:
+            try:
+                self.on_frame_callback(jpeg)
+            except Exception as err:
+                _LOGGER.debug("[%s] Frame callback error: %s", self.camera_id, err)
+
+        for cb in list(self._frame_listeners):
+            try:
+                cb(jpeg)
+            except Exception as err:
+                _LOGGER.debug("[%s] Frame listener error: %s", self.camera_id, err)
+
+    async def async_acquire_stream(self) -> None:
+        """Acquire a live stream reference and start streaming if not active."""
+        self._stream_clients += 1
+        if not self.is_streaming:
+            await self.async_start_stream()
+
+    async def async_release_stream(self) -> None:
+        """Release a live stream reference and stop hardware stream when idle."""
+        self._stream_clients = max(0, self._stream_clients - 1)
+        if self._stream_clients == 0 and not self._explicit_live and self.is_streaming:
+            await self.async_stop_stream()
+
+    def get_stream_info(self) -> dict[str, Any]:
+        """Return stream metadata (stream URL and live FPS)."""
+        return {
+            "stream_url": self._stream_url,
+            "fps": round(self.fps, 1),
+        }
+
+    def stop_ffmpeg_process(self) -> None:
+        """Terminate active FFmpeg subprocess if running."""
+        if self._ffmpeg_proc and self._ffmpeg_proc.returncode is None:
+            try:
+                self._ffmpeg_proc.terminate()
+            except Exception:
+                pass
+
+    async def async_stream_ffmpeg_mjpeg(self, url: str) -> bool:
+        """Transcode an RTSP/HLS stream into JPEG frames via FFmpeg pipe."""
+        if not url or not shutil.which("ffmpeg"):
+            return False
+
+        transports = ("tcp", "udp") if url.startswith("rtsp://") else (None,)
+        for transport in transports:
+            if not self.is_streaming:
+                return False
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+            if transport:
+                cmd.extend(["-rtsp_transport", transport])
+            cmd.extend([
+                "-i", url,
+                "-an",
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "-q:v", "5",
+                "-r", str(DEFAULT_STREAM_FPS),
+                "pipe:1",
+            ])
+            proc = None
+            received_any = False
+            buf = bytearray()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                self._ffmpeg_proc = proc
+                while self.is_streaming and proc.stdout:
+                    chunk = await asyncio.wait_for(proc.stdout.read(16384), timeout=6.0)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    for frame in extract_jpegs_from_buffer(buf):
+                        received_any = True
+                        self.is_connected = True
+                        self.status = STATUS_STREAMING
+                        self.notify_frame(frame)
+                if received_any:
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.debug("[%s] FFmpeg stream (%s) error: %s", self.camera_id, transport, err)
+            finally:
+                self._ffmpeg_proc = None
+                if proc and proc.returncode is None:
+                    try:
+                        proc.terminate()
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+        return False
 
     @property
     def host(self) -> str:

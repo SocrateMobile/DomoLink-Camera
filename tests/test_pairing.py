@@ -53,10 +53,16 @@ import unittest
 from custom_components.domolink_camera.const import (
     CAMERA_AP_SSID_PREFIXES,
     DEFAULT_PPPP_DISCOVERY_PORT,
+    DRIVER_GENERIC_MJPEG,
+    DRIVER_HA_PROXY,
     ILNK_MAGIC,
+    MAX_UDP_FRAME_BUFFER,
     PPPP_CMD_WIFI_SET,
     PPPP_MAGIC,
 )
+from custom_components.domolink_camera.drivers.generic_rtsp import GenericRtspDriver
+from custom_components.domolink_camera.drivers.ysxlite_pppp import YsxLiteDriver
+from custom_components.domolink_camera.manager import CameraManager
 from custom_components.domolink_camera.pairing import WifiPairingEngine
 
 
@@ -222,6 +228,100 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
             self.assertIn("192.168.1.1", dest_ips)
             self.assertIn("192.168.10.1", dest_ips)
             self.assertIn("255.255.255.255", dest_ips)
+
+    async def test_scan_ha_entities_keeps_numbered_and_unavailable_cameras(self) -> None:
+        """Verify numbered HA cameras are not filtered out and use ha_proxy."""
+        s1 = MagicMock(entity_id="camera.cam_1", state="idle", attributes={"friendly_name": "Cam 1", "platform": "onvif"})
+        s2 = MagicMock(entity_id="camera.tapo_c200_1", state="unavailable", attributes={"friendly_name": "Tapo 1", "platform": "tplink"})
+        s3 = MagicMock(entity_id="camera.salon", state="idle", attributes={"friendly_name": "Salon", "platform": "generic"})
+        s4 = MagicMock(entity_id="camera.salon_2", state="idle", attributes={"friendly_name": "Salon Mirror", "platform": "remote_homeassistant"})
+        s5 = MagicMock(entity_id="camera.jardin_2_2", state="idle", attributes={"friendly_name": "Jardin Dup", "platform": "remote_homeassistant"})
+
+        self.mock_hass.states.async_all.return_value = [s1, s2, s3, s4, s5]
+        self.mock_hass.data["entity_registry"] = MagicMock(entities={})
+
+        compatible, incompatible = await self.engine._scan_ha_camera_entities()
+        ids = {c["device_id"] for c in compatible}
+
+        self.assertIn("camera.cam_1", ids)
+        self.assertIn("camera.tapo_c200_1", ids)
+        self.assertIn("camera.salon", ids)
+        self.assertNotIn("camera.salon_2", ids)
+        self.assertNotIn("camera.jardin_2_2", ids)
+        self.assertEqual(incompatible, [])
+        for cam in compatible:
+            self.assertEqual(cam["driver"], DRIVER_HA_PROXY)
+
+    async def test_ysxlite_udp_reassembly_and_multi_subscriber_fanout(self) -> None:
+        """Verify multi-packet UDP JPEG reassembly (raw/ILNK/PPPP) and multi-client callbacks."""
+        driver = YsxLiteDriver("cam_test", {"host": "192.168.1.50", "port": 32108})
+        driver.async_start_stream = AsyncMock(side_effect=lambda: setattr(driver, "is_streaming", True))
+        driver.async_stop_stream = AsyncMock(side_effect=lambda: setattr(driver, "is_streaming", False))
+
+        sub1_frames = []
+        sub2_frames = []
+        driver.subscribe_frames(sub1_frames.append)
+        driver.subscribe_frames(sub2_frames.append)
+
+        await driver.async_acquire_stream()
+        await driver.async_acquire_stream()
+        self.assertEqual(driver._stream_clients, 2)
+        driver.async_start_stream.assert_awaited_once()
+
+        # Fragment 1: PPPP header + JPEG SOI + body
+        part1_body = b"\xff\xd8\xff\xe0" + b"A" * 80
+        pkt1 = PPPP_MAGIC + struct.pack(">HHH", 0x0001, len(part1_body), 1) + part1_body
+        # Fragment 2: raw continuation UDP datagram (no header)
+        pkt2 = b"B" * 60
+        # Fragment 3: iLnk 8-byte header + tail + JPEG EOI
+        part3_body = b"C" * 40 + b"\xff\xd9"
+        pkt3 = ILNK_MAGIC + struct.pack(">HH", 0x0001, len(part3_body)) + part3_body
+
+        driver.handle_udp_packet(pkt1, ("192.168.1.50", 32108))
+        driver.handle_udp_packet(pkt2, ("192.168.1.50", 32108))
+        driver.handle_udp_packet(pkt3, ("192.168.1.50", 32108))
+
+        self.assertEqual(len(sub1_frames), 1)
+        self.assertEqual(len(sub2_frames), 1)
+        self.assertTrue(sub1_frames[0].startswith(b"\xff\xd8"))
+        self.assertTrue(sub1_frames[0].endswith(b"\xff\xd9"))
+        self.assertEqual(sub1_frames[0], part1_body + pkt2 + part3_body)
+
+        # Oversized corrupt frame buffer resets safely
+        driver.handle_udp_packet(b"\xff\xd8" + b"X" * (MAX_UDP_FRAME_BUFFER + 10), ("192.168.1.50", 32108))
+        self.assertEqual(len(driver._frame_buffer), 0)
+        self.assertFalse(driver._is_receiving_frame)
+
+        # Releasing 1 of 2 clients keeps stream alive; releasing 2nd stops it
+        driver.unsubscribe_frames(sub1_frames.append)
+        await driver.async_release_stream()
+        self.assertEqual(driver._stream_clients, 1)
+        driver.async_stop_stream.assert_not_awaited()
+
+        driver.unsubscribe_frames(sub2_frames.append)
+        await driver.async_release_stream()
+        self.assertEqual(driver._stream_clients, 0)
+        driver.async_stop_stream.assert_awaited_once()
+
+    async def test_generic_rtsp_ha_delegation_and_manager_mjpeg_driver(self) -> None:
+        """Verify GenericRtspDriver delegates camera.* hosts and CameraManager routes MJPEG."""
+        rtsp_with_entity = GenericRtspDriver(
+            "cam_ent", {"host": "camera.entree_1", "driver": "generic_rtsp"}, hass=self.mock_hass
+        )
+        self.assertIsNotNone(rtsp_with_entity._ha_delegate)
+
+        fake_jpeg = b"\xff\xd8\xff\xe0" + b"Z" * 150 + b"\xff\xd9"
+        rtsp_with_entity._ha_delegate.async_get_snapshot = AsyncMock(return_value=fake_jpeg)
+        snap = await rtsp_with_entity.async_get_snapshot()
+        self.assertEqual(snap, fake_jpeg)
+
+        mgr = CameraManager(self.mock_hass)
+        mjpeg_drv = mgr._init_driver(
+            "cam_esp",
+            {"id": "cam_esp", "driver": DRIVER_GENERIC_MJPEG, "host": "192.168.1.90", "http_port": 81, "stream_path": "/stream"},
+        )
+        self.assertIsInstance(mjpeg_drv, GenericRtspDriver)
+        self.assertEqual(mjpeg_drv.primary_stream_url, "http://192.168.1.90:81/stream")
 
 
 if __name__ == "__main__":

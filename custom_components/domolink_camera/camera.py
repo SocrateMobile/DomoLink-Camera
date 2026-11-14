@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 import logging
 from typing import Any
 
@@ -12,6 +13,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, DRIVER_HA_PROXY, NAME, VERSION
+from .drivers.generic_rtsp import GenericRtspDriver
 from .manager import CameraManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -106,5 +108,14 @@ class DomoLinkCameraEntity(Camera):
 
     async def stream_source(self) -> str | None:
         """Return the source of the stream."""
-        # Provide direct endpoint for MJPEG / RTSP streaming
-        return f"http://127.0.0.1:8123/api/domolink_camera/stream/{self.camera_id}"
+        driver = self.manager.drivers.get(self.camera_id)
+        if isinstance(driver, GenericRtspDriver):
+            return driver.primary_stream_url
+
+        path = f"/api/domolink_camera/stream/{self.camera_id}"
+        try:
+            from homeassistant.components.http.auth import async_sign_path
+            signed = async_sign_path(self.hass, path, timedelta(hours=1))
+            return f"http://127.0.0.1:8123{signed}"
+        except Exception:
+            return f"http://127.0.0.1:8123{path}"
