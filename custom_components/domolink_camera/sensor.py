@@ -30,6 +30,19 @@ async def async_setup_entry(
 
     async_add_entities(entities)
 
+    def _refresh() -> None:
+        current_ids = {e.camera_id for e in entities}
+        new_entities = [
+            DomoLinkCameraStatusSensor(mgr, c["id"])
+            for c in mgr.get_cameras_list()
+            if c["id"] not in current_ids
+        ]
+        if new_entities:
+            entities.extend(new_entities)
+            async_add_entities(new_entities)
+
+    mgr.add_update_listener(_refresh)
+
 
 class DomoLinkCameraStatusSensor(SensorEntity):
     """Sensor reporting camera status."""

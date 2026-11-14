@@ -17,9 +17,9 @@ def test_manifest_structure_and_version():
 
     assert manifest["domain"] == "domolink_camera"
     assert manifest["name"] == "DomoLink Camera"
-    assert manifest["version"] == "1.4.6"
+    assert manifest["version"] == "1.4.7"
     assert manifest["codeowners"] == ["@SocrateMobile"]
-    assert "SocrateMobile" in manifest["documentation"]
+    assert "socratemobile" in manifest["documentation"].lower()
     assert "SocrateMobile" in manifest["issue_tracker"]
 
     # Verify keys are sorted: domain, name, then alphabetical

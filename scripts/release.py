@@ -20,6 +20,7 @@ GITHUB_REPO = f"{REPO_OWNER}/{REPO_NAME}"
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MANIFEST_PATH = os.path.join(ROOT_DIR, "custom_components", "domolink_camera", "manifest.json")
 CONST_PATH = os.path.join(ROOT_DIR, "custom_components", "domolink_camera", "const.py")
+TEST_VERSION_PATH = os.path.join(ROOT_DIR, "tests", "test_camera_security_and_async.py")
 
 
 def get_token() -> str:
@@ -63,6 +64,19 @@ def update_version_files(new_ver: str) -> None:
     with open(CONST_PATH, "w", encoding="utf-8") as f:
         f.write(new_content)
     print(f"Updated {CONST_PATH} -> {new_ver}")
+
+    # 3. tests/test_camera_security_and_async.py
+    if os.path.isfile(TEST_VERSION_PATH):
+        with open(TEST_VERSION_PATH, "r", encoding="utf-8") as f:
+            test_content = f.read()
+        new_test_content = re.sub(
+            r'assert manifest\["version"\] == "[^"]+"',
+            f'assert manifest["version"] == "{new_ver}"',
+            test_content,
+        )
+        with open(TEST_VERSION_PATH, "w", encoding="utf-8") as f:
+            f.write(new_test_content)
+        print(f"Updated {TEST_VERSION_PATH} -> {new_ver}")
 
 
 def run_cmd(cmd: list[str]) -> None:

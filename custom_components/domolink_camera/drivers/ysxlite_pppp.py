@@ -14,6 +14,7 @@ from .base import BaseCameraDriver
 from ..const import (
     DEFAULT_PPPP_DISCOVERY_PORT,
     ILNK_MAGIC,
+    MAX_UDP_FRAME_BUFFER,
     PPPP_CMD_IRCUT_ONOFF,
     PPPP_CMD_LIVE_VIDEO_START,
     PPPP_CMD_LIVE_VIDEO_STOP,
@@ -150,53 +151,96 @@ class YsxLiteDriver(BaseCameraDriver):
         packet = self._build_packet(cmd, payload)
         self.transport.sendto(packet, (self.host, self.pppp_port))
 
+    def _extract_udp_payload(self, data: bytes) -> bytes:
+        """Extract media payload from PPPP, iLnk, or raw UDP datagrams."""
+        if data.startswith(PPPP_MAGIC) and len(data) >= 10:
+            _, _, length_be, _ = struct.unpack(">4sHHH", data[:10])
+            if 0 < length_be <= len(data) - 10:
+                return data[10 : 10 + length_be]
+            _, _, length_le, _ = struct.unpack("<4sHHH", data[:10])
+            if 0 < length_le <= len(data) - 10:
+                return data[10 : 10 + length_le]
+            return data[10:]
+
+        if data.startswith(ILNK_MAGIC) and len(data) >= 8:
+            return data[8:]
+
+        return data
+
     def handle_udp_packet(self, data: bytes, addr: tuple[str, int]) -> None:
         """Process incoming packet from camera."""
         if not data:
             return
 
-        # Check for direct JPEG payload (SOI = 0xFF 0xD8)
-        if b"\xff\xd8" in data:
-            start = data.find(b"\xff\xd8")
-            end = data.find(b"\xff\xd9", start)
-            if end != -1:
-                # Complete JPEG within one datagram
-                jpeg = data[start : end + 2]
+        payload = self._extract_udp_payload(data)
+        if not payload:
+            return
+
+        soi_idx = payload.find(b"\xff\xd8")
+        eoi_idx = payload.find(b"\xff\xd9")
+
+        # Complete single-packet JPEG when not mid-assembly
+        if not self._is_receiving_frame and soi_idx != -1:
+            end_after_soi = payload.find(b"\xff\xd9", soi_idx)
+            if end_after_soi != -1:
+                jpeg = payload[soi_idx : end_after_soi + 2]
                 self._update_frame(jpeg)
+                trailing_soi = payload.find(b"\xff\xd8", end_after_soi + 2)
+                if trailing_soi != -1:
+                    self._frame_buffer = bytearray(payload[trailing_soi:])
+                    self._is_receiving_frame = True
                 return
 
-        # Multi-packet frame assembly
-        if data.startswith(PPPP_MAGIC) or data.startswith(ILNK_MAGIC):
-            if len(data) >= 10:
-                _, cmd, length, _ = struct.unpack(">4sHHH", data[:10])
-                payload = data[10 : 10 + length]
+        # Complete pending frame before starting any trailing frame in the same packet
+        if self._is_receiving_frame and eoi_idx != -1 and (soi_idx == -1 or eoi_idx < soi_idx):
+            self._frame_buffer.extend(payload[: eoi_idx + 2])
+            jpeg = bytes(self._frame_buffer)
+            self._frame_buffer = bytearray()
+            self._is_receiving_frame = False
+            self._update_frame(jpeg)
+            if soi_idx != -1:
+                self._frame_buffer = bytearray(payload[soi_idx:])
+                self._is_receiving_frame = True
+            else:
+                return
 
-                if b"\xff\xd8" in payload:
-                    self._frame_buffer = bytearray(payload[payload.find(b"\xff\xd8") :])
-                    self._is_receiving_frame = True
-                elif self._is_receiving_frame:
-                    self._frame_buffer.extend(payload)
+        if soi_idx != -1:
+            self._frame_buffer = bytearray(payload[soi_idx:])
+            self._is_receiving_frame = True
+        elif self._is_receiving_frame:
+            self._frame_buffer.extend(payload)
 
-                if b"\xff\xd9" in self._frame_buffer:
-                    end_idx = self._frame_buffer.find(b"\xff\xd9") + 2
-                    jpeg = bytes(self._frame_buffer[:end_idx])
-                    self._frame_buffer = bytearray()
-                    self._is_receiving_frame = False
-                    self._update_frame(jpeg)
+        if len(self._frame_buffer) > MAX_UDP_FRAME_BUFFER:
+            _LOGGER.debug("[%s] Resetting oversized UDP frame buffer (%d bytes)", self.camera_id, len(self._frame_buffer))
+            self._frame_buffer = bytearray()
+            self._is_receiving_frame = False
+            return
+
+        while self._is_receiving_frame:
+            buf_eoi = self._frame_buffer.find(b"\xff\xd9")
+            if buf_eoi == -1:
+                break
+            end_idx = buf_eoi + 2
+            jpeg = bytes(self._frame_buffer[:end_idx])
+            next_soi = self._frame_buffer.find(b"\xff\xd8", end_idx)
+            if next_soi != -1:
+                self._frame_buffer = bytearray(self._frame_buffer[next_soi:])
+                self._is_receiving_frame = True
+            else:
+                self._frame_buffer = bytearray()
+                self._is_receiving_frame = False
+            self._update_frame(jpeg)
 
     def _update_frame(self, jpeg: bytes) -> None:
-        """Store new valid JPEG frame and notify callback."""
+        """Store new valid JPEG frame and notify subscribers."""
         if len(jpeg) < 100:
             return
-        self.last_snapshot = jpeg
-        self.last_snapshot_time = time.time()
+        self.is_connected = True
         self.status = STATUS_STREAMING if self.is_streaming else STATUS_ONLINE
+        self.notify_frame(jpeg)
 
         if self._pending_snapshot and not self._pending_snapshot.done():
             self._pending_snapshot.set_result(jpeg)
-
-        if self.on_frame_callback:
-            self.on_frame_callback(jpeg)
 
     async def async_get_snapshot(self) -> bytes | None:
         """Request a fresh snapshot from camera."""
@@ -230,11 +274,12 @@ class YsxLiteDriver(BaseCameraDriver):
     async def _fetch_http_snapshot(self) -> bytes | None:
         """Fallback HTTP snapshot request for standard web-enabled firmwares."""
         paths = ["/snapshot.jpg", "/tmpfs/snap.jpg", "/cgi-bin/snapshot.cgi", "/action/snap"]
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=1.2)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             for p in paths:
                 url = f"http://{self.host}:{self.http_port}{p}"
                 try:
-                    async with session.get(url, timeout=1.5) as resp:
+                    async with session.get(url) as resp:
                         if resp.status == 200 and "image" in resp.headers.get("Content-Type", ""):
                             return await resp.read()
                 except Exception:
@@ -267,7 +312,7 @@ class YsxLiteDriver(BaseCameraDriver):
         """Maintain stream session active."""
         while self.is_streaming:
             try:
-                await asyncio.sleep(3)
+                await asyncio.sleep(2.5)
                 await self._send_pppp_cmd(PPPP_CMD_LIVE_VIDEO_START)
             except asyncio.CancelledError:
                 break

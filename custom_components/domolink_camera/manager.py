@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 from .const import (
+    DRIVER_GENERIC_MJPEG,
     DRIVER_GENERIC_RTSP,
     DRIVER_HA_PROXY,
     DRIVER_YSXLITE_PPPP,
@@ -78,11 +79,12 @@ class CameraManager:
     def _init_driver(self, camera_id: str, config: dict[str, Any]) -> BaseCameraDriver:
         """Instantiate driver based on configuration."""
         driver_type = config.get("driver", DRIVER_YSXLITE_PPPP)
+        host = str(config.get("host", ""))
 
-        if driver_type == DRIVER_GENERIC_RTSP:
-            driver = GenericRtspDriver(camera_id, config)
-        elif driver_type == DRIVER_HA_PROXY:
+        if host.startswith("camera.") or driver_type == DRIVER_HA_PROXY:
             driver = HaProxyDriver(camera_id, config, hass=self.hass)
+        elif driver_type in (DRIVER_GENERIC_RTSP, DRIVER_GENERIC_MJPEG):
+            driver = GenericRtspDriver(camera_id, config, hass=self.hass)
         else:
             driver = YsxLiteDriver(camera_id, config)
 
@@ -110,9 +112,19 @@ class CameraManager:
                 "driver": c.get("driver", DRIVER_YSXLITE_PPPP),
                 "host": c.get("host", ""),
                 "port": c.get("port", 32108),
+                "http_port": c.get("http_port", 80),
+                "stream_path": c.get("stream_path", ""),
+                "snapshot_path": c.get("snapshot_path", ""),
+                "username": c.get("username", ""),
+                "stream_url": c.get("stream_url", ""),
+                "web_hls_url": c.get("web_hls_url", ""),
+                "channel_id": c.get("channel_id", ""),
                 "order": c.get("order", 0),
                 "linked_entities": c.get("linked_entities", []),
                 "status": status,
+                "is_streaming": bool(driver and driver.is_streaming),
+                "fps": round(driver.fps, 1) if driver else 0.0,
+                "hls_url": (driver._stream_url if driver else None) or c.get("web_hls_url") or "",
                 "capabilities": caps,
                 "has_snapshot": has_snap,
                 "snapshot_timestamp": snap_time,
@@ -186,6 +198,7 @@ class CameraManager:
         """Switch camera to active streaming mode."""
         driver = self.drivers.get(camera_id)
         if driver:
+            driver._explicit_live = True
             await driver.async_start_stream()
             return True
         return False
@@ -194,6 +207,7 @@ class CameraManager:
         """Return camera to periodic snapshot mode."""
         driver = self.drivers.get(camera_id)
         if driver:
+            driver._explicit_live = False
             await driver.async_stop_stream()
             return True
         return False

@@ -55,6 +55,26 @@ class DomolinkCameraPanel extends HTMLElement {
     this._tvFilter = "all";
     this._hlsPlayer = null;
     this._isLoadingTv = false;
+    this._fullscreenCamId = null;
+    this._liveFrameTimers = new Map();
+    this._blobUrls = new Map();
+    this._camHlsPlayers = new Map();
+    this._fitModes = new Map();
+    this._gridDensity = "standard";
+    try {
+      const savedDensity = localStorage.getItem("domolink_grid_density");
+      if (savedDensity) this._gridDensity = savedDensity;
+      const savedFits = localStorage.getItem("domolink_fit_modes");
+      if (savedFits) {
+        const parsed = JSON.parse(savedFits);
+        Object.entries(parsed).forEach(([k, v]) => this._fitModes.set(k, v));
+      }
+    } catch (e) {}
+    this._boundKeyDown = (e) => {
+      if (e.key === "Escape" && this._fullscreenCamId) {
+        this._closeLightbox();
+      }
+    };
   }
 
   set panel(panel) {
@@ -75,10 +95,31 @@ class DomolinkCameraPanel extends HTMLElement {
   connectedCallback() {
     this.render();
     this._startPeriodicRefresh();
+    window.addEventListener("keydown", this._boundKeyDown);
   }
 
   disconnectedCallback() {
     this._stopPeriodicRefresh();
+    window.removeEventListener("keydown", this._boundKeyDown);
+    this._cleanupAllStreamsAndBlobs();
+  }
+
+  _cleanupAllStreamsAndBlobs() {
+    for (const camId of Array.from(this._liveFrameTimers.keys())) {
+      this._stopLiveFramePump(camId);
+    }
+    for (const [key, player] of this._camHlsPlayers.entries()) {
+      try { player.destroy(); } catch (e) {}
+    }
+    this._camHlsPlayers.clear();
+    if (this._hlsPlayer) {
+      try { this._hlsPlayer.destroy(); } catch (e) {}
+      this._hlsPlayer = null;
+    }
+    for (const url of this._blobUrls.values()) {
+      try { URL.revokeObjectURL(url); } catch (e) {}
+    }
+    this._blobUrls.clear();
   }
 
   async _init() {
@@ -93,10 +134,10 @@ class DomolinkCameraPanel extends HTMLElement {
 
   _startPeriodicRefresh() {
     this._stopPeriodicRefresh();
-    // Refresh snapshot timestamps / status every 8 seconds if in cameras tab
+    // Targeted in-place refresh every 8 seconds without destroying active streams
     this._refreshTimer = setInterval(() => {
-      if (this._activeTab === "cameras") {
-        this._fetchCameras(false);
+      if (this._activeTab === "cameras" && this._draggedIndex === null) {
+        this._refreshCamerasInPlace();
       }
     }, 8000);
   }
@@ -106,6 +147,284 @@ class DomolinkCameraPanel extends HTMLElement {
       clearInterval(this._refreshTimer);
       this._refreshTimer = null;
     }
+  }
+
+  _appendCacheBuster(url, ts) {
+    if (!url) return "";
+    const sep = url.includes("?") ? "&" : "?";
+    return `${url}${sep}t=${ts}`;
+  }
+
+  _getSnapshotUrl(cam, forceTs = null) {
+    const ts = forceTs || cam.snapshot_timestamp || Date.now();
+    if (cam.signed_snapshot_url) {
+      return this._appendCacheBuster(cam.signed_snapshot_url, ts);
+    }
+    const stateObj = (cam.driver === "ha_proxy" && this._hass) ? this._hass.states[cam.host] : null;
+    if (cam.driver === "ha_proxy" && stateObj?.attributes?.entity_picture) {
+      return stateObj.attributes.entity_picture;
+    }
+    return `/api/domolink_camera/snapshot/${cam.id}?t=${ts}`;
+  }
+
+  _getStreamUrl(cam) {
+    if (cam.signed_stream_url) {
+      return cam.signed_stream_url;
+    }
+    return `/api/domolink_camera/stream/${cam.id}`;
+  }
+
+  _getFitMode(camId) {
+    return this._fitModes.get(camId) || "contain";
+  }
+
+  _toggleFitMode(camId) {
+    const next = this._getFitMode(camId) === "contain" ? "cover" : "contain";
+    this._fitModes.set(camId, next);
+    try {
+      const obj = {};
+      this._fitModes.forEach((v, k) => { obj[k] = v; });
+      localStorage.setItem("domolink_fit_modes", JSON.stringify(obj));
+    } catch (e) {}
+
+    const mediaEls = this.shadowRoot.querySelectorAll(
+      `.camera-card[data-id="${camId}"] .cam-media, #lightbox-host .cam-media`
+    );
+    mediaEls.forEach((el) => {
+      el.classList.toggle("fit-contain", next === "contain");
+      el.classList.toggle("fit-cover", next === "cover");
+    });
+
+    const fitBtns = this.shadowRoot.querySelectorAll(`.btn-fit-toggle[data-cam-id="${camId}"]`);
+    fitBtns.forEach((btn) => {
+      btn.title = next === "contain" ? "Remplir le cadre (Cover)" : "Afficher tout le cadre (Contain)";
+      btn.textContent = next === "contain" ? "📐 Remplir" : "📐 Entier";
+    });
+  }
+
+  async _fetchAuthBlobUrl(apiPath, camId, keyPrefix = "snap") {
+    try {
+      let resp;
+      if (this._hass && typeof this._hass.fetchWithAuth === "function") {
+        resp = await this._hass.fetchWithAuth(apiPath);
+      } else {
+        resp = await fetch(apiPath, { credentials: "same-origin" });
+      }
+      if (!resp || !resp.ok) return null;
+      const blob = await resp.blob();
+      if (!blob || blob.size === 0) return null;
+      const key = `${keyPrefix}_${camId}`;
+      const oldUrl = this._blobUrls.get(key);
+      if (oldUrl) {
+        try { URL.revokeObjectURL(oldUrl); } catch (e) {}
+      }
+      const objUrl = URL.createObjectURL(blob);
+      this._blobUrls.set(key, objUrl);
+      return objUrl;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async _loadSnapshotWithFallback(imgEl, camId) {
+    if (!imgEl || imgEl.dataset.authFallback === camId) return;
+    imgEl.dataset.authFallback = camId;
+    const objUrl = await this._fetchAuthBlobUrl(`/api/domolink_camera/snapshot/${camId}?t=${Date.now()}`, camId, "snap");
+    if (objUrl && imgEl.isConnected) {
+      imgEl.src = objUrl;
+    }
+  }
+
+  _stopLiveFramePump(camId) {
+    const state = this._liveFrameTimers.get(camId);
+    if (state) {
+      state.active = false;
+      this._liveFrameTimers.delete(camId);
+    }
+  }
+
+  async _startLiveFramePump(camId, imgEl) {
+    if (this._liveFrameTimers.has(camId) || !this._liveCameras.has(camId)) return;
+    const state = { active: true };
+    this._liveFrameTimers.set(camId, state);
+
+    while (state.active && this._liveCameras.has(camId) && imgEl && imgEl.isConnected) {
+      const objUrl = await this._fetchAuthBlobUrl(`/api/domolink_camera/snapshot/${camId}?t=${Date.now()}`, camId, "pump");
+      if (!state.active || !this._liveCameras.has(camId) || !imgEl.isConnected) break;
+      if (objUrl) {
+        imgEl.src = objUrl;
+      }
+      await new Promise((r) => setTimeout(r, 220));
+    }
+    this._liveFrameTimers.delete(camId);
+  }
+
+  _bindCameraMediaElement(slot, cam, isLive) {
+    if (!slot || !cam) return;
+    const fitClass = this._getFitMode(cam.id) === "cover" ? "fit-cover" : "fit-contain";
+
+    // Cleanup any existing HLS player for this camera card slot
+    const existingHls = this._camHlsPlayers.get(cam.id);
+    if (existingHls) {
+      try { existingHls.destroy(); } catch (e) {}
+      this._camHlsPlayers.delete(cam.id);
+    }
+
+    const useVideoPlayer = isLive && Boolean(cam.channel_id || (cam.hls_url && cam.hls_url.includes(".m3u8")));
+    if (useVideoPlayer) {
+      const video = document.createElement("video");
+      video.className = `cam-media ${fitClass}`;
+      video.playsInline = true;
+      video.autoplay = true;
+      video.muted = true;
+      video.controls = true;
+      slot.innerHTML = "";
+      slot.appendChild(video);
+      this._attachCameraVideo(video, cam);
+      return;
+    }
+
+    const img = document.createElement("img");
+    img.className = `cam-media ${fitClass}`;
+    img.alt = cam.name || "Caméra";
+    if (!isLive) img.loading = "lazy";
+    img.src = isLive ? this._getStreamUrl(cam) : this._getSnapshotUrl(cam);
+    img.onerror = () => {
+      if (this._liveCameras.has(cam.id)) {
+        this._startLiveFramePump(cam.id, img);
+      } else {
+        this._loadSnapshotWithFallback(img, cam.id);
+      }
+    };
+    slot.innerHTML = "";
+    slot.appendChild(img);
+  }
+
+  async _attachCameraVideo(videoEl, cam) {
+    const hlsUrl = cam.hls_url || cam.web_hls_url || "";
+    const mp4Url = cam.signed_tv_live_url || (cam.channel_id ? `/api/domolink_camera/tv_live/${cam.channel_id}` : "");
+    const fallbackToMjpeg = () => {
+      const slot = videoEl.parentElement;
+      if (!slot || !this._liveCameras.has(cam.id)) return;
+      const fitClass = this._getFitMode(cam.id) === "cover" ? "fit-cover" : "fit-contain";
+      const img = document.createElement("img");
+      img.className = `cam-media ${fitClass}`;
+      img.alt = cam.name || "Caméra";
+      img.src = this._getStreamUrl(cam);
+      img.onerror = () => this._startLiveFramePump(cam.id, img);
+      slot.innerHTML = "";
+      slot.appendChild(img);
+    };
+
+    if (hlsUrl && hlsUrl.includes(".m3u8")) {
+      if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
+        videoEl.src = hlsUrl;
+        videoEl.onerror = () => (mp4Url ? (videoEl.src = mp4Url) : fallbackToMjpeg());
+        videoEl.play().catch(() => {});
+        return;
+      }
+      try {
+        await this._ensureHlsJs();
+        if (window.Hls && window.Hls.isSupported()) {
+          const hls = new window.Hls({ enableWorker: true, lowLatencyMode: true });
+          this._camHlsPlayers.set(cam.id, hls);
+          hls.loadSource(hlsUrl);
+          hls.attachMedia(videoEl);
+          hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+            videoEl.play().catch(() => {});
+          });
+          hls.on(window.Hls.Events.ERROR, (_, data) => {
+            if (data && data.fatal) {
+              try { hls.destroy(); } catch (e) {}
+              this._camHlsPlayers.delete(cam.id);
+              if (mp4Url) {
+                videoEl.src = mp4Url;
+                videoEl.onerror = fallbackToMjpeg;
+                videoEl.play().catch(fallbackToMjpeg);
+              } else {
+                fallbackToMjpeg();
+              }
+            }
+          });
+          return;
+        }
+      } catch (e) {}
+    }
+
+    if (mp4Url) {
+      videoEl.src = this._appendCacheBuster(mp4Url, Date.now());
+      videoEl.onerror = fallbackToMjpeg;
+      videoEl.play().catch(() => {});
+    } else {
+      fallbackToMjpeg();
+    }
+  }
+
+  async _refreshCamerasInPlace() {
+    if (!this._hass || this._activeTab !== "cameras" || this._draggedIndex !== null) return;
+    const prevIds = this._cameras.map((c) => c.id).join(",");
+    try {
+      const resp = await this._hass.callWS({ type: "domolink_camera/get_cameras" });
+      if (!resp || !resp.cameras) return;
+      const nextIds = resp.cameras.map((c) => c.id).join(",");
+      this._cameras = resp.cameras;
+
+      if (prevIds !== nextIds) {
+        this.render();
+        return;
+      }
+
+      this._cameras.forEach((cam) => {
+        const card = this.shadowRoot.querySelector(`.camera-card[data-id="${cam.id}"]`);
+        if (!card) return;
+
+        const isLive = this._liveCameras.has(cam.id);
+        const dot = card.querySelector(".status-dot");
+        if (dot) {
+          dot.className = `status-dot ${isLive ? "streaming" : (cam.status || "offline")}`;
+        }
+
+        const badge = card.querySelector(".time-badge");
+        if (badge) {
+          badge.textContent = isLive
+            ? (cam.fps > 0 ? `🔴 ${cam.fps} FPS` : "Flux continu")
+            : this._formatTime(cam.snapshot_timestamp);
+        }
+
+        if (!isLive) {
+          const img = card.querySelector(".cam-media-slot img.cam-media");
+          if (img) {
+            this._preloadAndSwapSnapshot(img, cam);
+          }
+        }
+      });
+    } catch (e) {
+      console.error("[DomoLink-Camera] In-place refresh error:", e);
+    }
+  }
+
+  _preloadAndSwapSnapshot(imgEl, cam, forceNow = false) {
+    const nextUrl = this._getSnapshotUrl(cam, forceNow ? Date.now() : null);
+    const loader = new Image();
+    loader.onload = () => {
+      if (imgEl.isConnected && !this._liveCameras.has(cam.id)) {
+        delete imgEl.dataset.authFallback;
+        imgEl.src = nextUrl;
+      }
+    };
+    loader.onerror = async () => {
+      if (imgEl.isConnected && !this._liveCameras.has(cam.id)) {
+        const blobUrl = await this._fetchAuthBlobUrl(
+          `/api/domolink_camera/snapshot/${cam.id}?t=${Date.now()}`,
+          cam.id,
+          "snap"
+        );
+        if (blobUrl && imgEl.isConnected && !this._liveCameras.has(cam.id)) {
+          imgEl.src = blobUrl;
+        }
+      }
+    };
+    loader.src = nextUrl;
   }
 
   async _fetchCameras(renderAfter = true) {
@@ -230,16 +549,221 @@ class DomolinkCameraPanel extends HTMLElement {
     }
   }
 
-  // --- Live Stream Toggle ---
-  _toggleLive(camId) {
-    if (this._liveCameras.has(camId)) {
-      this._liveCameras.delete(camId);
-      this._hass.callWS({ type: "domolink_camera/trigger_live", camera_id: camId, live: false });
-    } else {
+  // --- Live Stream Toggle (targeted update, zero DOM teardown) ---
+  async _toggleLive(camId, forceLive = null) {
+    const currentlyLive = this._liveCameras.has(camId);
+    const targetLive = forceLive !== null ? forceLive : !currentlyLive;
+    const cam = this._cameras.find((c) => c.id === camId);
+    const hadHls = Boolean(cam && (cam.channel_id || (cam.hls_url && cam.hls_url.includes(".m3u8"))));
+
+    if (targetLive) {
       this._liveCameras.add(camId);
-      this._hass.callWS({ type: "domolink_camera/trigger_live", camera_id: camId, live: true });
+    } else {
+      this._liveCameras.delete(camId);
+      this._stopLiveFramePump(camId);
     }
-    this.render();
+
+    this._updateSingleCameraCardLiveState(camId);
+
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/trigger_live",
+        camera_id: camId,
+        live: targetLive,
+      });
+      if (resp && cam) {
+        if (resp.signed_stream_url) cam.signed_stream_url = resp.signed_stream_url;
+        if (resp.signed_snapshot_url) cam.signed_snapshot_url = resp.signed_snapshot_url;
+        if (resp.hls_url) cam.hls_url = resp.hls_url;
+        const nowHasHls = Boolean(cam.channel_id || (cam.hls_url && cam.hls_url.includes(".m3u8")));
+        if (targetLive && !hadHls && nowHasHls && this._liveCameras.has(camId)) {
+          this._updateSingleCameraCardLiveState(camId);
+        }
+      }
+    } catch (e) {
+      console.error("[DomoLink-Camera] trigger_live error:", e);
+    }
+  }
+
+  _updateSingleCameraCardLiveState(camId) {
+    const cam = this._cameras.find((c) => c.id === camId);
+    if (!cam) return;
+    const isLive = this._liveCameras.has(camId);
+
+    const card = this.shadowRoot.querySelector(`.camera-card[data-id="${camId}"]`);
+    if (card) {
+      const dot = card.querySelector(".status-dot");
+      if (dot) dot.className = `status-dot ${isLive ? "streaming" : (cam.status || "offline")}`;
+
+      const liveBtn = card.querySelector(".live-btn");
+      if (liveBtn) {
+        liveBtn.classList.toggle("active", isLive);
+        liveBtn.textContent = isLive ? "🔴 EN DIRECT" : "▶ LIVE";
+      }
+
+      const badge = card.querySelector(".time-badge");
+      if (badge) {
+        badge.textContent = isLive ? "Flux continu" : this._formatTime(cam.snapshot_timestamp);
+      }
+
+      const slot = card.querySelector(".cam-media-slot");
+      if (slot) {
+        this._bindCameraMediaElement(slot, cam, isLive);
+      }
+    }
+
+    // Update Lightbox if currently open for this camera
+    if (this._fullscreenCamId === camId) {
+      this._renderLightboxContent(camId);
+    }
+
+    // Update global "Tout en Direct" button state
+    const allLiveBtn = this.shadowRoot.querySelector("#btn-toggle-all-live");
+    if (allLiveBtn && this._cameras.length > 0) {
+      const allLive = this._cameras.every((c) => this._liveCameras.has(c.id));
+      allLiveBtn.classList.toggle("active", allLive);
+      allLiveBtn.textContent = allLive ? "⏹ Tout Arrêter" : "▶ Tout en Direct";
+    }
+  }
+
+  async _toggleAllLive() {
+    if (!this._cameras || this._cameras.length === 0) return;
+    const allLive = this._cameras.every((c) => this._liveCameras.has(c.id));
+    const target = !allLive;
+    await Promise.all(this._cameras.map((cam) => this._toggleLive(cam.id, target)));
+  }
+
+  _refreshAllSnapshots() {
+    if (!this._cameras) return;
+    let refreshed = 0;
+    this._cameras.forEach((cam) => {
+      if (!this._liveCameras.has(cam.id)) {
+        const img = this.shadowRoot.querySelector(`.camera-card[data-id="${cam.id}"] .cam-media-slot img.cam-media`);
+        if (img) {
+          this._preloadAndSwapSnapshot(img, cam, true);
+          refreshed++;
+        }
+      }
+    });
+    this._showToast(refreshed > 0 ? "Actualisation des vignettes..." : "Toutes les caméras sont déjà en direct");
+  }
+
+  async _toggleNightVision(camId) {
+    const cam = this._cameras.find((c) => c.id === camId);
+    if (!cam || !this._hass) return;
+    const nextState = !cam.night_vision;
+    try {
+      await this._hass.callWS({
+        type: "domolink_camera/set_ir",
+        camera_id: camId,
+        enabled: nextState,
+      });
+      cam.night_vision = nextState;
+      const irBtns = this.shadowRoot.querySelectorAll(`.btn-ir-toggle[data-cam-id="${camId}"]`);
+      irBtns.forEach((btn) => btn.classList.toggle("active", nextState));
+      this._showToast(`Vision nocturne IR ${nextState ? "activée" : "désactivée"}`);
+    } catch (e) {
+      this._showToast("Erreur lors du changement IR");
+    }
+  }
+
+  _setGridDensity(density) {
+    this._gridDensity = density;
+    try { localStorage.setItem("domolink_grid_density", density); } catch (e) {}
+    const grid = this.shadowRoot.querySelector(".camera-grid");
+    if (grid) {
+      grid.classList.remove("grid-compact", "grid-standard", "grid-large");
+      grid.classList.add(`grid-${density}`);
+    }
+    const btns = this.shadowRoot.querySelectorAll(".density-btn");
+    btns.forEach((b) => b.classList.toggle("active", b.dataset.density === density));
+  }
+
+  _openLightbox(camId) {
+    this._fullscreenCamId = camId;
+    if (!this._liveCameras.has(camId)) {
+      this._toggleLive(camId, true);
+    } else {
+      this._renderLightboxContent(camId);
+    }
+  }
+
+  _closeLightbox() {
+    if (this._fullscreenCamId) {
+      const existingHls = this._camHlsPlayers.get(`lb_${this._fullscreenCamId}`);
+      if (existingHls) {
+        try { existingHls.destroy(); } catch (e) {}
+        this._camHlsPlayers.delete(`lb_${this._fullscreenCamId}`);
+      }
+    }
+    this._fullscreenCamId = null;
+    const host = this.shadowRoot.querySelector("#lightbox-host");
+    if (host) host.innerHTML = "";
+  }
+
+  _renderLightboxContent(camId) {
+    const host = this.shadowRoot.querySelector("#lightbox-host");
+    const cam = this._cameras.find((c) => c.id === camId);
+    if (!host || !cam) return;
+
+    const isLive = this._liveCameras.has(camId);
+    const fitMode = this._getFitMode(camId);
+    const hasIr = Boolean(cam.capabilities && cam.capabilities.night_vision);
+
+    host.innerHTML = `
+      <div class="lightbox-overlay" id="lightbox-overlay">
+        <div class="lightbox-dialog">
+          <div class="lightbox-header">
+            <div class="card-title-box">
+              <div class="status-dot ${isLive ? "streaming" : (cam.status || "offline")}"></div>
+              <span class="card-name">${this._escapeHtml(cam.name)}</span>
+              <span class="driver-badge">${this._escapeHtml(cam.host || cam.driver)}</span>
+            </div>
+            <div class="lightbox-actions">
+              <button class="btn-secondary btn-fit-toggle" data-cam-id="${cam.id}">
+                ${fitMode === "contain" ? "📐 Remplir" : "📐 Entier"}
+              </button>
+              ${hasIr ? `<button class="btn-secondary btn-ir-toggle ${cam.night_vision ? "active" : ""}" data-cam-id="${cam.id}">🌙 IR</button>` : ""}
+              <button class="btn-secondary lb-live-btn ${isLive ? "active" : ""}" data-cam-id="${cam.id}">
+                ${isLive ? "🔴 EN DIRECT" : "▶ LIVE"}
+              </button>
+              <button class="btn-secondary" id="lb-native-fs">⛶ Plein écran</button>
+              <button class="btn-danger" id="lb-close">✕ Fermer</button>
+            </div>
+          </div>
+          <div class="lightbox-viewport" id="lb-viewport"></div>
+        </div>
+      </div>
+    `;
+
+    const vp = host.querySelector("#lb-viewport");
+    this._bindCameraMediaElement(vp, cam, isLive);
+
+    const overlay = host.querySelector("#lightbox-overlay");
+    if (overlay) {
+      overlay.onclick = (e) => {
+        if (e.target === overlay) this._closeLightbox();
+      };
+    }
+    const closeBtn = host.querySelector("#lb-close");
+    if (closeBtn) closeBtn.onclick = () => this._closeLightbox();
+
+    const fsBtn = host.querySelector("#lb-native-fs");
+    if (fsBtn && vp) {
+      fsBtn.onclick = () => {
+        if (vp.requestFullscreen) vp.requestFullscreen();
+        else if (vp.webkitRequestFullscreen) vp.webkitRequestFullscreen();
+      };
+    }
+
+    const fitBtn = host.querySelector(".btn-fit-toggle");
+    if (fitBtn) fitBtn.onclick = () => this._toggleFitMode(cam.id);
+
+    const irBtn = host.querySelector(".btn-ir-toggle");
+    if (irBtn) irBtn.onclick = () => this._toggleNightVision(cam.id);
+
+    const lbLive = host.querySelector(".lb-live-btn");
+    if (lbLive) lbLive.onclick = () => this._toggleLive(cam.id);
   }
 
   // --- Toggle HA Entity from Card Banner ---
@@ -542,7 +1066,10 @@ class DomolinkCameraPanel extends HTMLElement {
       description: dev.details || "Caméra intégrée",
       driver: dev.driver || "ha_proxy",
       host: dev.host,
-      port: dev.port || (dev.driver === "generic_rtsp" ? 554 : 32108),
+      port: dev.port !== undefined ? dev.port : (dev.driver === "generic_rtsp" ? 554 : 32108),
+      http_port: dev.http_port || 80,
+      stream_path: dev.stream_path || "",
+      snapshot_path: dev.snapshot_path || "",
       linked_entities: [],
     };
 
@@ -792,11 +1319,98 @@ class DomolinkCameraPanel extends HTMLElement {
           transform: scale(1.05);
         }
 
+        /* Camera Toolbar & Grid Densities */
+        .cameras-toolbar {
+          display: flex;
+          flex-wrap: wrap;
+          justify-content: space-between;
+          align-items: center;
+          gap: 12px;
+          margin-bottom: 18px;
+          padding: 10px 14px;
+          background: rgba(22, 27, 34, 0.72);
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 12px;
+        }
+
+        .toolbar-info {
+          font-size: 13px;
+          color: #94a3b8;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        }
+
+        .toolbar-actions {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .density-group {
+          display: inline-flex;
+          background: rgba(13, 17, 23, 0.8);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          border-radius: 8px;
+          padding: 2px;
+        }
+
+        .density-btn {
+          background: transparent;
+          border: none;
+          color: #8b949e;
+          font-size: 12px;
+          font-weight: 600;
+          padding: 5px 10px;
+          border-radius: 6px;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+
+        .density-btn.active {
+          background: #3b82f6;
+          color: #ffffff;
+        }
+
+        .btn-toolbar {
+          background: rgba(255, 255, 255, 0.07);
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          color: #f0f6fc;
+          font-size: 12px;
+          font-weight: 600;
+          padding: 6px 12px;
+          border-radius: 8px;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+
+        .btn-toolbar:hover {
+          background: rgba(59, 130, 246, 0.25);
+          border-color: #3b82f6;
+        }
+
+        .btn-toolbar.active {
+          background: rgba(239, 68, 68, 0.25);
+          border-color: #ef4444;
+          color: #fca5a5;
+        }
+
         /* Grid */
         .camera-grid {
           display: grid;
           grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
           gap: 24px;
+        }
+
+        .camera-grid.grid-compact {
+          grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+          gap: 16px;
+        }
+
+        .camera-grid.grid-large {
+          grid-template-columns: repeat(auto-fill, minmax(520px, 1fr));
+          gap: 26px;
         }
 
         /* Camera Card */
@@ -886,11 +1500,122 @@ class DomolinkCameraPanel extends HTMLElement {
           justify-content: center;
         }
 
-        .viewport img {
+        .cam-media-slot {
           width: 100%;
           height: 100%;
-          object-fit: cover;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+
+        .viewport img,
+        .viewport video,
+        .cam-media {
+          width: 100%;
+          height: 100%;
           display: block;
+          background: #000;
+        }
+
+        .cam-media.fit-contain { object-fit: contain; }
+        .cam-media.fit-cover { object-fit: cover; }
+
+        /* Quick Viewport Actions */
+        .viewport-actions {
+          position: absolute;
+          top: 8px;
+          right: 8px;
+          display: flex;
+          gap: 6px;
+          z-index: 6;
+          opacity: 0.85;
+          transition: opacity 0.2s ease;
+        }
+
+        .viewport:hover .viewport-actions {
+          opacity: 1;
+        }
+
+        .vp-action-btn {
+          background: rgba(13, 17, 23, 0.78);
+          backdrop-filter: blur(8px);
+          border: 1px solid rgba(255, 255, 255, 0.18);
+          color: #f0f6fc;
+          font-size: 11px;
+          font-weight: 600;
+          padding: 4px 8px;
+          border-radius: 6px;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+
+        .vp-action-btn:hover {
+          background: rgba(37, 99, 235, 0.85);
+          border-color: #60a5fa;
+        }
+
+        .vp-action-btn.active {
+          background: rgba(245, 158, 11, 0.85);
+          border-color: #fbbf24;
+          color: #111827;
+        }
+
+        /* Lightbox Fullscreen Modal */
+        .lightbox-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(3, 7, 18, 0.92);
+          backdrop-filter: blur(10px);
+          z-index: 3000;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 20px;
+        }
+
+        .lightbox-dialog {
+          width: 100%;
+          max-width: 1280px;
+          background: #0d1117;
+          border: 1px solid rgba(255, 255, 255, 0.15);
+          border-radius: 16px;
+          overflow: hidden;
+          display: flex;
+          flex-direction: column;
+          box-shadow: 0 24px 60px rgba(0, 0, 0, 0.8);
+        }
+
+        .lightbox-header {
+          padding: 12px 18px;
+          background: rgba(22, 27, 34, 0.95);
+          border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+          display: flex;
+          flex-wrap: wrap;
+          justify-content: space-between;
+          align-items: center;
+          gap: 10px;
+        }
+
+        .lightbox-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          align-items: center;
+        }
+
+        .lightbox-actions .lb-live-btn.active {
+          background: #ef4444;
+          border-color: #f87171;
+          color: #ffffff;
+        }
+
+        .lightbox-viewport {
+          width: 100%;
+          height: 75vh;
+          background: #000000;
+          display: flex;
+          align-items: center;
+          justify-content: center;
         }
 
         /* Rollover Tooltip */
@@ -1728,6 +2453,7 @@ class DomolinkCameraPanel extends HTMLElement {
       <div class="panel-container">
         <!-- Toast Notification -->
         <div class="toast-bar"></div>
+        <div id="lightbox-host"></div>
 
         <!-- Header -->
         <header>
@@ -1792,30 +2518,56 @@ class DomolinkCameraPanel extends HTMLElement {
       `;
     }
 
+    const allLive = this._cameras.every((c) => this._liveCameras.has(c.id));
+    const onlineCount = this._cameras.filter((c) => c.status === "online" || c.status === "streaming" || this._liveCameras.has(c.id)).length;
+
     return `
-      <div class="camera-grid">
+      <div class="cameras-toolbar">
+        <div class="toolbar-info">
+          <span>📡 <strong>${onlineCount}/${this._cameras.length}</strong> caméra(s) accessible(s)</span>
+          <span>•</span>
+          <span><strong>${this._liveCameras.size}</strong> flux en direct</span>
+        </div>
+        <div class="toolbar-actions">
+          <div class="density-group" title="Taille d'affichage de la grille">
+            <button class="density-btn ${this._gridDensity === "compact" ? "active" : ""}" data-density="compact">Compact</button>
+            <button class="density-btn ${this._gridDensity === "standard" ? "active" : ""}" data-density="standard">Standard</button>
+            <button class="density-btn ${this._gridDensity === "large" ? "active" : ""}" data-density="large">Large</button>
+          </div>
+          <button class="btn-toolbar" id="btn-refresh-all" title="Actualiser immédiatement toutes les vignettes">
+            🔄 Actualiser tout
+          </button>
+          <button class="btn-toolbar ${allLive ? "active" : ""}" id="btn-toggle-all-live" title="Basculer toutes les caméras en mode direct">
+            ${allLive ? "⏹ Tout Arrêter" : "▶ Tout en Direct"}
+          </button>
+        </div>
+      </div>
+
+      <div class="camera-grid grid-${this._escapeHtml(this._gridDensity)}">
         ${this._cameras
           .map((cam, idx) => {
             const isLive = this._liveCameras.has(cam.id);
             const statusClass = cam.status || "offline";
-            const stateObj = (cam.driver === "ha_proxy" && this._hass) ? this._hass.states[cam.host] : null;
+            const snapUrl = isLive ? this._getStreamUrl(cam) : this._getSnapshotUrl(cam);
+            const fitMode = this._getFitMode(cam.id);
+            const fitClass = fitMode === "cover" ? "fit-cover" : "fit-contain";
+            const hasIr = Boolean(cam.capabilities && cam.capabilities.night_vision);
 
-            let snapUrl = `/api/domolink_camera/snapshot/${cam.id}?t=${cam.snapshot_timestamp || Date.now()}`;
-            if (isLive) {
-              snapUrl = `/api/domolink_camera/stream/${cam.id}`;
-            } else if (cam.driver === "ha_proxy" && stateObj?.attributes?.entity_picture) {
-              const pic = stateObj.attributes.entity_picture;
-              snapUrl = pic;
-            }
-
-            const driverLabel = cam.driver === "ysxlite_pppp" ? "YsxLite" : cam.driver === "ha_proxy" ? "Passerelle HA" : "RTSP";
+            const driverLabel =
+              cam.driver === "ysxlite_pppp"
+                ? "YsxLite"
+                : cam.driver === "ha_proxy"
+                ? "Passerelle HA"
+                : cam.driver === "generic_mjpeg"
+                ? "MJPEG"
+                : "RTSP";
 
             return `
-            <div class="camera-card" 
-                 draggable="true" 
-                 data-id="${cam.id}" 
+            <div class="camera-card"
+                 draggable="true"
+                 data-id="${this._escapeHtml(cam.id)}"
                  data-index="${idx}">
-              
+
               <!-- Card Header -->
               <div class="card-header">
                 <div class="card-title-box">
@@ -1827,8 +2579,24 @@ class DomolinkCameraPanel extends HTMLElement {
               </div>
 
               <!-- Viewport with Image/Live Stream -->
-              <div class="viewport">
-                <img src="${snapUrl}" alt="${this._escapeHtml(cam.name)}" loading="lazy" />
+              <div class="viewport" data-cam-id="${this._escapeHtml(cam.id)}">
+                <div class="cam-media-slot" data-cam-id="${this._escapeHtml(cam.id)}">
+                  <img class="cam-media ${fitClass}" src="${this._escapeHtml(snapUrl)}" alt="${this._escapeHtml(cam.name)}" ${isLive ? "" : 'loading="lazy"'} />
+                </div>
+
+                <!-- Quick Readability & Stream Controls -->
+                <div class="viewport-actions">
+                  <button class="vp-action-btn btn-snap-refresh" data-cam-id="${this._escapeHtml(cam.id)}" title="Rafraîchir la vignette">🔄</button>
+                  ${
+                    hasIr
+                      ? `<button class="vp-action-btn btn-ir-toggle ${cam.night_vision ? "active" : ""}" data-cam-id="${this._escapeHtml(cam.id)}" title="Vision nocturne IR">🌙</button>`
+                      : ""
+                  }
+                  <button class="vp-action-btn btn-fit-toggle" data-cam-id="${this._escapeHtml(cam.id)}" title="${fitMode === "contain" ? "Remplir le cadre (Cover)" : "Afficher tout le cadre (Contain)"}">
+                    ${fitMode === "contain" ? "📐 Remplir" : "📐 Entier"}
+                  </button>
+                  <button class="vp-action-btn btn-cam-fullscreen" data-cam-id="${this._escapeHtml(cam.id)}" title="Agrandir / Plein écran">⛶</button>
+                </div>
 
                 <!-- Rollover Hover Tooltip -->
                 <div class="rollover-tooltip">
@@ -1837,13 +2605,13 @@ class DomolinkCameraPanel extends HTMLElement {
                 </div>
 
                 <!-- Live Button -->
-                <button class="live-btn ${isLive ? "active" : ""}" data-cam-id="${cam.id}">
+                <button class="live-btn ${isLive ? "active" : ""}" data-cam-id="${this._escapeHtml(cam.id)}">
                   ${isLive ? "🔴 EN DIRECT" : "▶ LIVE"}
                 </button>
 
-                <!-- Snapshot Time badge -->
+                <!-- Snapshot Time / FPS badge -->
                 <div class="time-badge">
-                  ${isLive ? "Flux continu" : this._formatTime(cam.snapshot_timestamp)}
+                  ${isLive ? (cam.fps > 0 ? `🔴 ${cam.fps} FPS` : "Flux continu") : this._formatTime(cam.snapshot_timestamp)}
                 </div>
               </div>
 
@@ -2453,6 +3221,7 @@ class DomolinkCameraPanel extends HTMLElement {
                         <select class="form-select cam-input-driver" data-id="${cam.id}">
                           <option value="ysxlite_pppp" ${cam.driver === "ysxlite_pppp" ? "selected" : ""}>YsxLite PPPP</option>
                           <option value="generic_rtsp" ${cam.driver === "generic_rtsp" ? "selected" : ""}>RTSP / ONVIF</option>
+                          <option value="generic_mjpeg" ${cam.driver === "generic_mjpeg" ? "selected" : ""}>MJPEG / HTTP (Webcam & ESP32-CAM)</option>
                           <option value="ha_proxy" ${cam.driver === "ha_proxy" ? "selected" : ""}>Passerelle HA</option>
                         </select>
                       </td>
@@ -2531,6 +3300,22 @@ class DomolinkCameraPanel extends HTMLElement {
       saveLayoutBtn.onclick = () => this._saveLayoutOrder();
     }
 
+    // Toolbar Controls
+    const densityBtns = this.shadowRoot.querySelectorAll(".density-btn");
+    densityBtns.forEach((btn) => {
+      btn.onclick = () => this._setGridDensity(btn.dataset.density);
+    });
+
+    const refreshAllBtn = this.shadowRoot.querySelector("#btn-refresh-all");
+    if (refreshAllBtn) {
+      refreshAllBtn.onclick = () => this._refreshAllSnapshots();
+    }
+
+    const toggleAllLiveBtn = this.shadowRoot.querySelector("#btn-toggle-all-live");
+    if (toggleAllLiveBtn) {
+      toggleAllLiveBtn.onclick = () => this._toggleAllLive();
+    }
+
     // Live Toggles
     const liveBtns = this.shadowRoot.querySelectorAll(".live-btn");
     liveBtns.forEach((btn) => {
@@ -2539,6 +3324,80 @@ class DomolinkCameraPanel extends HTMLElement {
         this._toggleLive(btn.dataset.camId);
       };
     });
+
+    // Quick Viewport Action Buttons (Refresh, IR, Fit Mode, Lightbox)
+    const snapRefreshBtns = this.shadowRoot.querySelectorAll(".btn-snap-refresh");
+    snapRefreshBtns.forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const camId = btn.dataset.camId;
+        const cam = this._cameras.find((c) => c.id === camId);
+        const img = this.shadowRoot.querySelector(`.camera-card[data-id="${camId}"] .cam-media-slot img.cam-media`);
+        if (cam && img) {
+          this._preloadAndSwapSnapshot(img, cam, true);
+        }
+      };
+    });
+
+    const irToggleBtns = this.shadowRoot.querySelectorAll(".btn-ir-toggle");
+    irToggleBtns.forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        this._toggleNightVision(btn.dataset.camId);
+      };
+    });
+
+    const fitToggleBtns = this.shadowRoot.querySelectorAll(".btn-fit-toggle");
+    fitToggleBtns.forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        this._toggleFitMode(btn.dataset.camId);
+      };
+    });
+
+    const fsCamBtns = this.shadowRoot.querySelectorAll(".btn-cam-fullscreen");
+    fsCamBtns.forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        this._openLightbox(btn.dataset.camId);
+      };
+    });
+
+    const viewports = this.shadowRoot.querySelectorAll(".viewport[data-cam-id]");
+    viewports.forEach((vp) => {
+      vp.ondblclick = (e) => {
+        e.stopPropagation();
+        this._openLightbox(vp.dataset.camId);
+      };
+    });
+
+    // Attach media fallback & HLS video player for active cards
+    const mediaSlots = this.shadowRoot.querySelectorAll(".cam-media-slot[data-cam-id]");
+    mediaSlots.forEach((slot) => {
+      const camId = slot.dataset.camId;
+      const cam = this._cameras.find((c) => c.id === camId);
+      if (!cam) return;
+      const isLive = this._liveCameras.has(camId);
+      const useVideoPlayer = isLive && Boolean(cam.channel_id || (cam.hls_url && cam.hls_url.includes(".m3u8")));
+      if (useVideoPlayer) {
+        this._bindCameraMediaElement(slot, cam, true);
+      } else {
+        const img = slot.querySelector("img.cam-media");
+        if (img) {
+          img.onerror = () => {
+            if (this._liveCameras.has(camId)) {
+              this._startLiveFramePump(camId, img);
+            } else {
+              this._loadSnapshotWithFallback(img, camId);
+            }
+          };
+        }
+      }
+    });
+
+    if (this._fullscreenCamId && this._activeTab === "cameras") {
+      this._renderLightboxContent(this._fullscreenCamId);
+    }
 
     // Entity Badges Toggle
     const entityBadges = this.shadowRoot.querySelectorAll(".entity-badge");

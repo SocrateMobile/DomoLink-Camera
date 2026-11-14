@@ -2,7 +2,7 @@
 
 DOMAIN = "domolink_camera"
 NAME = "DomoLink Camera"
-VERSION = "1.4.5"
+VERSION = "1.4.7"
 
 # Storage
 STORAGE_KEY = "domolink_camera_data"
@@ -26,6 +26,8 @@ DEFAULT_PPPP_DISCOVERY_PORT = 32108
 DEFAULT_RTSP_PORT = 554
 DEFAULT_HTTP_PORT = 80
 DEFAULT_SNAPSHOT_INTERVAL = 10  # seconds between snapshot updates in thumbnail mode
+DEFAULT_STREAM_FPS = 15
+MAX_UDP_FRAME_BUFFER = 524288  # 512 KiB max buffer for UDP JPEG reassembly
 
 # PPPP Packet Magic Headers
 PPPP_MAGIC = b"PPPP"
