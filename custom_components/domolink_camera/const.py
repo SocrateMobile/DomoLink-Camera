@@ -2,19 +2,21 @@
 
 DOMAIN = "domolink_camera"
 NAME = "DomoLink Camera"
-VERSION = "1.4.7"
+VERSION = "1.5.0"
 
 # Storage
 STORAGE_KEY = "domolink_camera_data"
 STORAGE_VERSION = 1
 
 # Supported camera drivers
+DRIVER_ARLO_CLOUD = "arlo_cloud"
 DRIVER_YSXLITE_PPPP = "ysxlite_pppp"
 DRIVER_GENERIC_RTSP = "generic_rtsp"
 DRIVER_GENERIC_MJPEG = "generic_mjpeg"
 DRIVER_HA_PROXY = "ha_proxy"
 
 SUPPORTED_DRIVERS = {
+    DRIVER_ARLO_CLOUD: "Arlo Cloud Direct (Caméras & Sonnettes Arlo)",
     DRIVER_YSXLITE_PPPP: "YsxLite / A9 / PPPP (Wi-Fi Mini Cam)",
     DRIVER_GENERIC_RTSP: "RTSP / ONVIF (Standard IP Camera)",
     DRIVER_GENERIC_MJPEG: "MJPEG / HTTP (Webcam & ESP32-CAM)",
@@ -140,3 +142,10 @@ WS_TYPE_DETECT_BOX = "domolink_camera/detect_box"
 WS_TYPE_GET_TV_CHANNELS = "domolink_camera/get_tv_channels"
 WS_TYPE_GET_TV_STREAM = "domolink_camera/get_tv_stream"
 WS_TYPE_PIN_TV_CAMERA = "domolink_camera/pin_tv_camera"
+WS_TYPE_GET_ARLO_ACCOUNTS = f"{DOMAIN}/get_arlo_accounts"
+WS_TYPE_ARLO_START_LOGIN = f"{DOMAIN}/arlo_start_login"
+WS_TYPE_ARLO_REQUEST_2FA = f"{DOMAIN}/arlo_request_2fa"
+WS_TYPE_ARLO_VERIFY_2FA = f"{DOMAIN}/arlo_verify_2fa"
+WS_TYPE_ARLO_SAVE_TOKEN = f"{DOMAIN}/arlo_save_token"
+WS_TYPE_ARLO_SYNC_ACCOUNT = f"{DOMAIN}/arlo_sync_account"
+WS_TYPE_ARLO_DELETE_ACCOUNT = f"{DOMAIN}/arlo_delete_account"

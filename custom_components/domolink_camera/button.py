@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
@@ -32,6 +33,9 @@ async def async_setup_entry(
 
     def _refresh() -> None:
         current_ids = {e.camera_id for e in entities}
+        for ent in entities:
+            if ent.hass:
+                ent.async_write_ha_state()
         new_entities = [
             DomoLinkRebootButton(mgr, c["id"])
             for c in mgr.get_cameras_list()
@@ -55,8 +59,12 @@ class DomoLinkRebootButton(ButtonEntity):
         self.manager = manager
         self.camera_id = camera_id
         self._attr_unique_id = f"{DOMAIN}_{camera_id}_reboot"
-        self._cam = self.manager.cameras.get(camera_id, {})
         self._attr_name = "Redémarrer"
+
+    @property
+    def _cam(self) -> dict[str, Any]:
+        """Resolve live camera configuration dictionary dynamically."""
+        return self.manager.cameras.get(self.camera_id, {})
 
     @property
     def device_info(self) -> DeviceInfo:

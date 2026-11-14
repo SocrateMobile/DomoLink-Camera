@@ -251,8 +251,10 @@ class YsxLiteDriver(BaseCameraDriver):
         if self.last_snapshot and self.last_snapshot_time and (time.time() - self.last_snapshot_time < 3):
             return self.last_snapshot
 
-        # Try requesting snapshot via UDP command
+        # Try requesting snapshot via UDP command (deduplicate concurrent waiters)
         try:
+            if self._pending_snapshot and not self._pending_snapshot.done():
+                return await asyncio.wait_for(asyncio.shield(self._pending_snapshot), timeout=2.5)
             loop = asyncio.get_running_loop()
             self._pending_snapshot = loop.create_future()
             await self._send_pppp_cmd(PPPP_CMD_SNAPSHOT_GET)

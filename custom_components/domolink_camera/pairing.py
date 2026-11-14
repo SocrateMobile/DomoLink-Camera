@@ -20,6 +20,7 @@ from .const import (
     CAMERA_AP_UID_REGEX,
     DEFAULT_PPPP_DISCOVERY_PORT,
     DOMAIN,
+    DRIVER_ARLO_CLOUD,
     DRIVER_GENERIC_MJPEG,
     DRIVER_GENERIC_RTSP,
     DRIVER_HA_PROXY,
@@ -187,22 +188,53 @@ class WifiPairingEngine:
         # Step 2: Scan Home Assistant camera entities and registry
         ha_compatible, ha_incompatible = await self._scan_ha_camera_entities()
 
-        # Step 3: Get already configured cameras in DomoLink-Camera
+        # Step 3: Collect Arlo Cloud account devices (multi-account) & configured cameras
         configured_hosts = set()
         configured_names = set()
+        arlo_cloud_devices: list[dict[str, Any]] = []
         mgr = self.hass.data.get(DOMAIN, {}).get("manager")
         if mgr and hasattr(mgr, "cameras"):
             for cam in mgr.cameras.values():
                 if cam.get("host"):
                     configured_hosts.add(str(cam.get("host")).strip().lower())
+                if cam.get("arlo_device_id"):
+                    configured_hosts.add(str(cam.get("arlo_device_id")).strip().lower())
                 if cam.get("name"):
                     configured_names.add(str(cam.get("name")).strip().lower())
+
+        if mgr and hasattr(mgr, "arlo_sessions"):
+            for aid, sess in mgr.arlo_sessions.items():
+                for dev in getattr(sess, "devices", []) or []:
+                    dev_id = str(dev.get("device_id") or "")
+                    if not dev_id:
+                        continue
+                    bat_str = f" • Batterie {dev['battery_level']}%" if dev.get("battery_level") is not None else ""
+                    arlo_cloud_devices.append({
+                        "host": dev_id,
+                        "port": 443,
+                        "device_id": dev_id,
+                        "arlo_account_id": aid,
+                        "arlo_device_id": dev_id,
+                        "parent_id": dev.get("parent_id", dev_id),
+                        "xcloud_id": dev.get("xcloud_id", ""),
+                        "model_id": dev.get("model_id", "Arlo"),
+                        "account_email": sess.email,
+                        "battery_level": dev.get("battery_level"),
+                        "signal_strength": dev.get("signal_strength"),
+                        "name": dev.get("name", f"Arlo {dev_id}"),
+                        "driver": DRIVER_ARLO_CLOUD,
+                        "protocol": f"Arlo Cloud Direct ({sess.name})",
+                        "model": dev.get("model_id") or "Caméra Arlo",
+                        "details": f"Compte Arlo ({sess.email}) • Mode veille batterie + Live RTSPS à la demande{bat_str}",
+                        "compatible": True,
+                        "source": "arlo_cloud",
+                    })
 
         # Combine compatible devices (de-duplicate by host/name)
         compatible_list: list[dict[str, Any]] = []
         seen_hosts: set[str] = set()
 
-        for item in lan_compatible + ha_compatible:
+        for item in arlo_cloud_devices + lan_compatible + ha_compatible:
             host_key = item.get("host", "").lower()
             name_key = item.get("name", "").lower()
             key = host_key or name_key
@@ -519,15 +551,24 @@ class WifiPairingEngine:
                     # Active camera in HA (Tuya, Arlo, Xiaomi, Blink, etc.) proxied through Home Assistant!
                     info = KNOWN_INCOMPATIBLE_PLATFORMS.get(platform, {})
                     plat_name = info.get("platform_name") or platform.capitalize()
+                    is_arlo_ent = platform in ("aarlo", "arlo") or "arlo" in eid.lower()
+                    bat = attrs.get("battery_level")
+                    bat_note = f" • Batterie {bat}%" if bat is not None else ""
                     compatible.append({
                         "host": eid,
                         "port": 0,
                         "device_id": eid,
                         "name": friendly_name,
                         "driver": DRIVER_HA_PROXY,
-                        "protocol": f"Passerelle Home Assistant ({plat_name})",
-                        "model": model if model != "Caméra Détectée" else f"Caméra {plat_name}",
-                        "details": f"Gérée par '{plat_name}' dans Home Assistant • Snapshot et Live streaming proxifiés automatiquement{unavail_note}",
+                        "protocol": "Passerelle HA (Arlo Externe)" if is_arlo_ent else f"Passerelle Home Assistant ({plat_name})",
+                        "model": model if model != "Caméra Détectée" else ("Arlo via HA" if is_arlo_ent else f"Caméra {plat_name}"),
+                        "details": (
+                            f"Entité Arlo Home Assistant détectée • Support RTSPS/HLS et miniatures S3 activé{bat_note}{unavail_note}"
+                            if is_arlo_ent
+                            else f"Gérée par '{plat_name}' dans Home Assistant • Snapshot et Live streaming proxifiés automatiquement{bat_note}{unavail_note}"
+                        ),
+                        "battery_level": bat,
+                        "signal_strength": attrs.get("signal_strength"),
                         "compatible": True,
                         "source": "ha_entity",
                     })

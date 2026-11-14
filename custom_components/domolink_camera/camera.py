@@ -36,9 +36,12 @@ async def async_setup_entry(
 
     async_add_entities(entities)
 
-    # Listen for added/removed cameras
+    # Listen for added/updated cameras
     def _refresh() -> None:
         current_ids = {e.camera_id for e in entities}
+        for ent in entities:
+            if ent.hass:
+                ent.async_write_ha_state()
         new_cams = [
             DomoLinkCameraEntity(mgr, c["id"], entry.entry_id)
             for c in mgr.get_cameras_list()
@@ -64,8 +67,16 @@ class DomoLinkCameraEntity(Camera):
         self.camera_id = camera_id
         self._entry_id = entry_id
         self._attr_unique_id = f"{DOMAIN}_{camera_id}"
-        self._cam = self.manager.cameras.get(camera_id, {})
-        self._attr_name = self._cam.get("name", "Caméra")
+
+    @property
+    def _cam(self) -> dict[str, Any]:
+        """Resolve live camera configuration dictionary dynamically."""
+        return self.manager.cameras.get(self.camera_id, {})
+
+    @property
+    def name(self) -> str:
+        """Return dynamic camera name."""
+        return str(self._cam.get("name", "Caméra"))
 
     @property
     def is_on(self) -> bool:
@@ -84,21 +95,28 @@ class DomoLinkCameraEntity(Camera):
         """Return device info for Home Assistant."""
         return DeviceInfo(
             identifiers={(DOMAIN, self.camera_id)},
-            name=self._attr_name,
-            manufacturer="DomoLink",
-            model=self._cam.get("driver", "YsxLite PPPP"),
+            name=self.name,
+            manufacturer="Arlo" if self._cam.get("driver") == "arlo_cloud" else "DomoLink",
+            model=self._cam.get("model_id") or self._cam.get("driver", "YsxLite PPPP"),
             sw_version=VERSION,
         )
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra state attributes."""
-        return {
+        attrs: dict[str, Any] = {
             "description": self._cam.get("description", ""),
             "host": self._cam.get("host", ""),
             "order": self._cam.get("order", 0),
             "linked_entities": self._cam.get("linked_entities", []),
         }
+        driver = self.manager.drivers.get(self.camera_id)
+        if driver:
+            caps = driver.get_capabilities() or {}
+            for key in ("battery_level", "signal_strength", "account_email", "model_id"):
+                if caps.get(key) is not None and caps.get(key) != "":
+                    attrs[key] = caps[key]
+        return attrs
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None

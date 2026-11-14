@@ -20,6 +20,28 @@ class DomolinkCameraPanel extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this._hass = null;
     this._cameras = [];
+    this._arloAccounts = [];
+    this._arloWizard = {
+      open: false,
+      mode: "credentials",
+      step: "login",
+      loading: false,
+      error: "",
+      message: "",
+      sessionId: "",
+      factors: [],
+      selectedFactorId: "",
+      factorAuthCode: "",
+      accountName: "",
+      email: "",
+      password: "",
+      otpCode: "",
+      token: "",
+      userId: "",
+      xcloudId: "",
+      cookie: "",
+      editingAccountId: "",
+    };
     this._availableEntities = [];
     this._activeTab = "cameras"; // "cameras" or "settings"
     this._liveCameras = new Set();
@@ -125,9 +147,12 @@ class DomolinkCameraPanel extends HTMLElement {
   async _init() {
     this.render();
     try {
-      await this._fetchCameras();
+      await Promise.all([
+        this._fetchCameras(false),
+        this._fetchArloAccounts(false),
+      ]);
     } catch (e) {
-      console.error("[DomoLink-Camera] Error fetching cameras:", e);
+      console.error("[DomoLink-Camera] Error fetching initial data:", e);
     }
     this.render();
   }
@@ -438,6 +463,248 @@ class DomolinkCameraPanel extends HTMLElement {
     } catch (e) {
       console.error("[DomoLink-Camera] Failed to fetch cameras:", e);
     }
+  }
+
+  _resetArloWizard(open = false, mode = "credentials", editingAcc = null) {
+    this._arloWizard = {
+      open: open,
+      mode: mode,
+      step: "login",
+      loading: false,
+      error: "",
+      message: "",
+      sessionId: "",
+      factors: [],
+      selectedFactorId: "",
+      factorAuthCode: "",
+      accountName: editingAcc ? (editingAcc.name || "") : "",
+      email: editingAcc ? (editingAcc.email || "") : "",
+      password: "",
+      otpCode: "",
+      token: "",
+      userId: editingAcc ? (editingAcc.user_id || "") : "",
+      xcloudId: editingAcc ? (editingAcc.xcloud_id || "") : "",
+      cookie: "",
+      editingAccountId: editingAcc ? (editingAcc.id || "") : "",
+    };
+  }
+
+  async _fetchArloAccounts(renderAfter = true) {
+    if (!this._hass) return;
+    try {
+      const resp = await this._hass.callWS({ type: "domolink_camera/get_arlo_accounts" });
+      if (resp && Array.isArray(resp.accounts)) {
+        this._arloAccounts = resp.accounts;
+        if (renderAfter) this.render();
+      }
+    } catch (e) {
+      console.error("[DomoLink-Camera] Failed to fetch Arlo accounts:", e);
+    }
+  }
+
+  async _startArloLogin() {
+    const w = this._arloWizard;
+    if (!w.email.trim() || !w.password) {
+      w.error = "Veuillez saisir l'e-mail et le mot de passe de votre compte Arlo.";
+      this.render();
+      return;
+    }
+    w.loading = true;
+    w.error = "";
+    w.message = "";
+    this.render();
+
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/arlo_start_login",
+        email: w.email.trim(),
+        password: w.password,
+        account_name: w.accountName.trim(),
+        auto_add: true,
+      });
+      w.loading = false;
+      if (resp.status === "connected") {
+        w.open = false;
+        w.password = "";
+        this._showToast(`Compte Arlo connecté ! ${resp.imported_count || 0} caméra(s) importée(s).`);
+        await Promise.all([this._fetchArloAccounts(false), this._fetchCameras(false)]);
+      } else if (resp.status === "2fa_required") {
+        w.step = "factor";
+        w.sessionId = resp.session_id || "";
+        w.factors = resp.factors || [];
+        w.selectedFactorId = w.factors.length > 0 ? w.factors[0].factorId : "";
+        w.message = "Authentification Arlo 2FA requise. Choisissez votre méthode de validation ci-dessous.";
+      } else if (resp.status === "cloudflare_blocked") {
+        w.mode = "token";
+        w.error = resp.error || "Cloudflare bloque la connexion directe. Passez par l'onglet Jeton Direct.";
+      } else {
+        w.error = resp.error || "Échec de connexion à Arlo.";
+      }
+    } catch (err) {
+      w.loading = false;
+      w.error = err?.message || String(err);
+    }
+    this.render();
+  }
+
+  async _requestArlo2faCode() {
+    const w = this._arloWizard;
+    if (!w.sessionId || !w.selectedFactorId) {
+      w.error = "Sélectionnez un facteur de vérification 2FA.";
+      this.render();
+      return;
+    }
+    w.loading = true;
+    w.error = "";
+    this.render();
+
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/arlo_request_2fa",
+        session_id: w.sessionId,
+        factor_id: w.selectedFactorId,
+      });
+      w.loading = false;
+      if (resp.status === "code_sent") {
+        w.step = "otp";
+        w.factorAuthCode = resp.factor_auth_code || "";
+        w.message = "Code de vérification envoyé ! Consultez votre e-mail / SMS et saisissez le code ci-dessous.";
+      } else {
+        w.error = resp.error || "Impossible d'envoyer le code 2FA.";
+      }
+    } catch (err) {
+      w.loading = false;
+      w.error = err?.message || String(err);
+    }
+    this.render();
+  }
+
+  async _verifyArlo2faCode() {
+    const w = this._arloWizard;
+    if (!w.otpCode.trim()) {
+      w.error = "Veuillez saisir le code OTP reçu.";
+      this.render();
+      return;
+    }
+    w.loading = true;
+    w.error = "";
+    this.render();
+
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/arlo_verify_2fa",
+        session_id: w.sessionId,
+        otp_code: w.otpCode.trim(),
+        factor_auth_code: w.factorAuthCode || undefined,
+        auto_add: true,
+      });
+      w.loading = false;
+      if (resp.status === "connected") {
+        this._resetArloWizard(false);
+        this._showToast(`Compte Arlo validé ! ${resp.imported_count || 0} caméra(s) importée(s).`);
+        await Promise.all([this._fetchArloAccounts(false), this._fetchCameras(false)]);
+      } else {
+        w.error = resp.error || "Code 2FA refusé par Arlo.";
+      }
+    } catch (err) {
+      w.loading = false;
+      w.error = err?.message || String(err);
+    }
+    this.render();
+  }
+
+  async _saveArloDirectToken() {
+    const w = this._arloWizard;
+    if (!w.token.trim()) {
+      w.error = "Veuillez coller le jeton Authorization Arlo.";
+      this.render();
+      return;
+    }
+    w.loading = true;
+    w.error = "";
+    this.render();
+
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/arlo_save_token",
+        email: w.email.trim(),
+        account_name: w.accountName.trim(),
+        token: w.token.trim(),
+        user_id: w.userId.trim(),
+        xcloud_id: w.xcloudId.trim(),
+        cookie: w.cookie.trim(),
+        account_id: w.editingAccountId || "",
+        auto_add: true,
+      });
+      w.loading = false;
+      if (resp.status === "connected") {
+        this._resetArloWizard(false);
+        this._showToast(`Compte Arlo synchronisé (${resp.total_devices || 0} caméra(s), ${resp.imported_count || 0} ajoutée(s)).`);
+        await Promise.all([this._fetchArloAccounts(false), this._fetchCameras(false)]);
+      } else {
+        w.error = resp.error || "Impossible de valider ce jeton Arlo.";
+      }
+    } catch (err) {
+      w.loading = false;
+      w.error = err?.message || String(err);
+    }
+    this.render();
+  }
+
+  async _syncArloAccount(accountId, autoAdd = true) {
+    this._showToast("Synchronisation du compte Arlo en cours...");
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/arlo_sync_account",
+        account_id: accountId,
+        auto_add: autoAdd,
+      });
+      if (resp.status === "synced") {
+        this._showToast(`Synchro Arlo réussie : ${resp.total_devices} caméra(s), ${resp.imported_count} nouvelle(s) !`);
+        await Promise.all([this._fetchArloAccounts(false), this._fetchCameras(false)]);
+      } else {
+        this._showToast(`Erreur synchro Arlo : ${resp.error || "Jeton expiré"}`);
+      }
+    } catch (err) {
+      this._showToast(`Erreur synchro Arlo : ${err?.message || err}`);
+    }
+    this.render();
+  }
+
+  async _deleteArloAccount(accountId) {
+    if (!confirm("Voulez-vous supprimer ce compte Arlo de DomoLink ?")) return;
+    const delCams = confirm("Souhaitez-vous également supprimer les caméras liées à ce compte ?");
+    try {
+      await this._hass.callWS({
+        type: "domolink_camera/arlo_delete_account",
+        account_id: accountId,
+        delete_cameras: delCams,
+      });
+      this._showToast("Compte Arlo supprimé.");
+      await Promise.all([this._fetchArloAccounts(false), this._fetchCameras(false)]);
+    } catch (err) {
+      this._showToast("Erreur lors de la suppression du compte Arlo");
+    }
+    this.render();
+  }
+
+  async _addArloCameraFromAccount(accountId, dev) {
+    const newCam = {
+      name: dev.name || `Arlo ${dev.device_id}`,
+      description: `Arlo ${dev.model_id || ""} (${dev.account_email || ""})`.trim(),
+      driver: "arlo_cloud",
+      host: dev.device_id,
+      port: 443,
+      arlo_account_id: accountId,
+      arlo_device_id: dev.device_id,
+      parent_id: dev.parent_id || dev.device_id,
+      xcloud_id: dev.xcloud_id || "",
+      model_id: dev.model_id || "Arlo",
+      account_email: dev.account_email || "",
+      linked_entities: [],
+    };
+    await this._saveCamera(newCam);
+    await this._fetchArloAccounts(true);
   }
 
   _fetchAvailableEntities() {
@@ -1070,6 +1337,12 @@ class DomolinkCameraPanel extends HTMLElement {
       http_port: dev.http_port || 80,
       stream_path: dev.stream_path || "",
       snapshot_path: dev.snapshot_path || "",
+      arlo_account_id: dev.arlo_account_id || "",
+      arlo_device_id: dev.arlo_device_id || "",
+      parent_id: dev.parent_id || "",
+      xcloud_id: dev.xcloud_id || "",
+      model_id: dev.model_id || "",
+      account_email: dev.account_email || "",
       linked_entities: [],
     };
 
@@ -2554,13 +2827,18 @@ class DomolinkCameraPanel extends HTMLElement {
             const hasIr = Boolean(cam.capabilities && cam.capabilities.night_vision);
 
             const driverLabel =
-              cam.driver === "ysxlite_pppp"
+              cam.driver === "arlo_cloud"
+                ? "Arlo Cloud"
+                : cam.driver === "ysxlite_pppp"
                 ? "YsxLite"
                 : cam.driver === "ha_proxy"
                 ? "Passerelle HA"
                 : cam.driver === "generic_mjpeg"
                 ? "MJPEG"
                 : "RTSP";
+
+            const batLevel = cam.capabilities && cam.capabilities.battery_level;
+            const hasBattery = batLevel !== undefined && batLevel !== null && batLevel !== "";
 
             return `
             <div class="camera-card"
@@ -2574,6 +2852,7 @@ class DomolinkCameraPanel extends HTMLElement {
                   <div class="status-dot ${isLive ? "streaming" : statusClass}"></div>
                   <div class="card-name">${this._escapeHtml(cam.name)}</div>
                   <span class="driver-badge">${driverLabel}</span>
+                  ${hasBattery ? `<span class="driver-badge" title="Niveau batterie">${Number(batLevel) <= 20 ? "🪫" : "🔋"} ${this._escapeHtml(batLevel)}%</span>` : ""}
                 </div>
                 <div style="font-size: 12px; color: #8b949e; cursor: grab;" title="Glisser pour réorganiser">⠿</div>
               </div>
@@ -2949,9 +3228,230 @@ class DomolinkCameraPanel extends HTMLElement {
     `;
   }
 
+  _renderArloAccountsSection() {
+    const w = this._arloWizard;
+    const accounts = this._arloAccounts || [];
+
+    return `
+        <!-- Section 0: Multi-Account Arlo Cloud Protocol -->
+        <div class="settings-card">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 12px; margin-bottom: 16px;">
+            <h3 style="margin: 0; border-bottom: none; padding-bottom: 0;">
+              <span>☁️</span> Comptes Caméras Cloud — Arlo (Multi-Comptes)
+            </h3>
+            <button class="btn-primary" id="btn-arlo-open-wizard">
+              ${w.open ? "✕ Fermer l'assistant" : "➕ Ajouter un compte Arlo"}
+            </button>
+          </div>
+          <p style="color: #8b949e; font-size: 13px; margin: 0 0 16px 0;">
+            Connectez un ou plusieurs comptes Arlo en natif (snapshots économie d'énergie &amp; flux RTSPS live à la demande) ou associez des caméras externes déjà présentes dans Home Assistant.
+          </p>
+
+          ${
+            w.open
+              ? `
+            <div style="background: rgba(13, 17, 23, 0.78); border: 1px solid rgba(59, 130, 246, 0.35); border-radius: 12px; padding: 18px; margin-bottom: 20px;">
+              <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px;">
+                <button class="btn-arlo-mode-tab ${w.mode === "credentials" ? "btn-primary" : "btn-secondary"}" data-mode="credentials">
+                  🔐 Email + Mot de passe + 2FA
+                </button>
+                <button class="btn-arlo-mode-tab ${w.mode === "token" ? "btn-primary" : "btn-secondary"}" data-mode="token">
+                  🔑 Jeton Direct (Authorization Token)
+                </button>
+              </div>
+
+              ${
+                w.error
+                  ? `<div style="background: rgba(239,68,68,0.18); border: 1px solid rgba(239,68,68,0.45); color: #fca5a5; padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px;">⚠️ ${this._escapeHtml(w.error)}</div>`
+                  : ""
+              }
+              ${
+                w.message
+                  ? `<div style="background: rgba(59,130,246,0.18); border: 1px solid rgba(59,130,246,0.45); color: #93c5fd; padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px;">ℹ️ ${this._escapeHtml(w.message)}</div>`
+                  : ""
+              }
+
+              ${
+                w.mode === "credentials"
+                  ? w.step === "login"
+                    ? `
+                  <div class="form-grid">
+                    <div class="form-group">
+                      <label for="arlo-account-name">Nom du compte (Libellé)</label>
+                      <input type="text" id="arlo-account-name" class="form-input" placeholder="Ex: Maison, Bureau, Parents..." value="${this._escapeHtml(w.accountName)}" />
+                    </div>
+                    <div class="form-group">
+                      <label for="arlo-email">Adresse e-mail Arlo</label>
+                      <input type="email" id="arlo-email" class="form-input" placeholder="prenom.nom@exemple.com" value="${this._escapeHtml(w.email)}" />
+                    </div>
+                    <div class="form-group">
+                      <label for="arlo-password">Mot de passe Arlo</label>
+                      <input type="password" id="arlo-password" class="form-input" placeholder="••••••••" value="${this._escapeHtml(w.password)}" />
+                    </div>
+                  </div>
+                  <div style="margin-top: 14px; display: flex; gap: 10px;">
+                    <button class="btn-primary" id="btn-arlo-login-submit" ${w.loading ? "disabled" : ""}>
+                      ${w.loading ? "⏳ Connexion à Arlo..." : "🔗 Se connecter à Arlo"}
+                    </button>
+                  </div>
+                `
+                    : w.step === "factor"
+                    ? `
+                  <div class="form-group">
+                    <label for="arlo-factor-select">Méthode de double authentification (2FA)</label>
+                    <select id="arlo-factor-select" class="form-select">
+                      ${
+                        w.factors && w.factors.length > 0
+                          ? w.factors
+                              .map(
+                                (f) =>
+                                  `<option value="${this._escapeHtml(f.factorId)}" ${w.selectedFactorId === f.factorId ? "selected" : ""}>${this._escapeHtml(f.factorType)} — ${this._escapeHtml(f.displayName)}</option>`
+                              )
+                              .join("")
+                          : `<option value="">Aucun facteur détecté</option>`
+                      }
+                    </select>
+                  </div>
+                  <div style="margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap;">
+                    <button class="btn-primary" id="btn-arlo-send-otp" ${w.loading ? "disabled" : ""}>
+                      ${w.loading ? "⏳ Envoi en cours..." : "📩 Envoyer le code de vérification"}
+                    </button>
+                    <button class="btn-secondary" id="btn-arlo-back-login">← Retour</button>
+                  </div>
+                `
+                    : `
+                  <div class="form-grid">
+                    <div class="form-group">
+                      <label for="arlo-otp-code">Code de vérification à 6 chiffres (OTP)</label>
+                      <input type="text" id="arlo-otp-code" class="form-input" placeholder="Ex: 123456" value="${this._escapeHtml(w.otpCode)}" />
+                    </div>
+                  </div>
+                  <div style="margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap;">
+                    <button class="btn-primary" id="btn-arlo-verify-otp" ${w.loading ? "disabled" : ""}>
+                      ${w.loading ? "⏳ Validation..." : "✅ Valider &amp; Importer les caméras"}
+                    </button>
+                    <button class="btn-secondary" id="btn-arlo-back-login">← Recommencer</button>
+                  </div>
+                `
+                  : `
+                <div style="font-size: 12px; color: #94a3b8; margin-bottom: 12px; line-height: 1.5;">
+                  💡 Si Cloudflare bloque l'authentification par mot de passe sur cette IP, connectez-vous sur <code>my.arlo.com</code> dans votre navigateur, copiez l'en-tête <code>Authorization</code> d'une requête réseau et collez-le ci-dessous.
+                </div>
+                <div class="form-grid">
+                  <div class="form-group">
+                    <label for="arlo-account-name">Nom du compte (Libellé)</label>
+                    <input type="text" id="arlo-account-name" class="form-input" placeholder="Ex: Maison Arlo" value="${this._escapeHtml(w.accountName)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="arlo-email">E-mail Arlo (optionnel)</label>
+                    <input type="email" id="arlo-email" class="form-input" placeholder="prenom.nom@exemple.com" value="${this._escapeHtml(w.email)}" />
+                  </div>
+                  <div class="form-group" style="grid-column: 1 / -1;">
+                    <label for="arlo-token">Jeton Authorization (Token Arlo)</label>
+                    <input type="password" id="arlo-token" class="form-input" placeholder="Collez votre jeton Authorization Arlo ici..." value="${this._escapeHtml(w.token)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="arlo-userid">User ID (optionnel — auto-détecté)</label>
+                    <input type="text" id="arlo-userid" class="form-input" placeholder="Auto" value="${this._escapeHtml(w.userId)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="arlo-xcloudid">xCloudId (optionnel — auto-détecté)</label>
+                    <input type="text" id="arlo-xcloudid" class="form-input" placeholder="Auto" value="${this._escapeHtml(w.xcloudId)}" />
+                  </div>
+                </div>
+                <div style="margin-top: 14px; display: flex; gap: 10px;">
+                  <button class="btn-primary" id="btn-arlo-save-token" ${w.loading ? "disabled" : ""}>
+                    ${w.loading ? "⏳ Vérification..." : "💾 Valider le jeton &amp; Importer"}
+                  </button>
+                </div>
+              `
+              }
+            </div>
+          `
+              : ""
+          }
+
+          ${
+            accounts.length === 0
+              ? `<div style="padding: 16px; border: 1px dashed rgba(255,255,255,0.12); border-radius: 10px; color: #8b949e; font-size: 13px; text-align: center;">
+                  Aucun compte Arlo Cloud configuré pour le moment. Cliquez sur <strong>➕ Ajouter un compte Arlo</strong> ci-dessus.
+                </div>`
+              : `
+            <div class="discovered-list">
+              ${accounts
+                .map((acc) => {
+                  const isOk = acc.status === "connected";
+                  const statusLabel = isOk
+                    ? "🟢 Connecté"
+                    : acc.status === "token_expired"
+                    ? "🟠 Jeton expiré"
+                    : "🔴 Déconnecté";
+                  const syncStr = acc.last_sync ? this._formatTime(acc.last_sync) : "Jamais";
+                  const devs = acc.devices || [];
+                  return `
+                  <div class="discovered-item" style="flex-direction: column; align-items: stretch; gap: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+                      <div>
+                        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                          <span class="badge-protocol ${isOk ? "badge-green" : "badge-orange"}">${statusLabel}</span>
+                          <strong style="color: #f0f6fc; font-size: 15px;">${this._escapeHtml(acc.name || acc.email || acc.id)}</strong>
+                          ${acc.email ? `<span style="color: #8b949e; font-size: 12px;">(${this._escapeHtml(acc.email)})</span>` : ""}
+                        </div>
+                        <div style="font-size: 12px; color: #8b949e; margin-top: 4px;">
+                          ${acc.camera_count || devs.length} caméra(s) détectée(s) • Dernière synchro : ${this._escapeHtml(syncStr)}
+                          ${acc.last_error ? `<span style="color: #fca5a5;"> • ⚠️ ${this._escapeHtml(acc.last_error)}</span>` : ""}
+                        </div>
+                      </div>
+                      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <button class="btn-secondary btn-arlo-sync" data-account-id="${this._escapeHtml(acc.id)}" title="Synchroniser et importer les nouvelles caméras">🔄 Synchroniser</button>
+                        <button class="btn-secondary btn-arlo-update-token" data-account-id="${this._escapeHtml(acc.id)}" title="Renouveler le jeton Authorization">🔑 Jeton</button>
+                        <button class="btn-danger btn-arlo-delete-acc" data-account-id="${this._escapeHtml(acc.id)}" title="Supprimer ce compte Arlo">🗑️</button>
+                      </div>
+                    </div>
+
+                    ${
+                      devs.length > 0
+                        ? `
+                      <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 10px;">
+                        ${devs
+                          .map(
+                            (dev) => `
+                          <div style="background: rgba(15,23,42,0.7); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+                            <div style="min-width: 0;">
+                              <div style="font-weight: 600; color: #f0f6fc; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${this._escapeHtml(dev.name)}</div>
+                              <div style="font-size: 11px; color: #8b949e;">
+                                ${this._escapeHtml(dev.model_id || "Arlo")}
+                                ${dev.battery_level !== null && dev.battery_level !== undefined ? ` • 🔋 ${this._escapeHtml(dev.battery_level)}%` : ""}
+                              </div>
+                            </div>
+                            ${
+                              dev.already_added
+                                ? `<span class="badge-already-added" style="font-size: 11px; padding: 3px 8px;">✓ Intégrée</span>`
+                                : `<button class="btn-primary btn-arlo-add-dev" data-account-id="${this._escapeHtml(acc.id)}" data-device-id="${this._escapeHtml(dev.device_id)}" style="padding: 5px 10px; font-size: 11px;">+ Ajouter</button>`
+                            }
+                          </div>
+                        `
+                          )
+                          .join("")}
+                      </div>
+                    `
+                        : ""
+                    }
+                  </div>
+                `;
+                })
+                .join("")}
+            </div>
+          `
+          }
+        </div>
+    `;
+  }
+
   _renderSettings() {
     return `
       <div class="settings-container">
+        ${this._renderArloAccountsSection()}
         <!-- Section 1: Autonomous Wi-Fi Pairing -->
         <div class="settings-card">
           <h3><span>📡</span> Appairage Wi-Fi Autonome (Sans Application Mobile)</h3>
@@ -3219,6 +3719,7 @@ class DomolinkCameraPanel extends HTMLElement {
                       </td>
                       <td>
                         <select class="form-select cam-input-driver" data-id="${cam.id}">
+                          <option value="arlo_cloud" ${cam.driver === "arlo_cloud" ? "selected" : ""}>Arlo Cloud Direct</option>
                           <option value="ysxlite_pppp" ${cam.driver === "ysxlite_pppp" ? "selected" : ""}>YsxLite PPPP</option>
                           <option value="generic_rtsp" ${cam.driver === "generic_rtsp" ? "selected" : ""}>RTSP / ONVIF</option>
                           <option value="generic_mjpeg" ${cam.driver === "generic_mjpeg" ? "selected" : ""}>MJPEG / HTTP (Webcam & ESP32-CAM)</option>
@@ -3283,8 +3784,11 @@ class DomolinkCameraPanel extends HTMLElement {
       tabSets.onclick = () => {
         this._activeTab = "settings";
         this.render();
+        this._fetchArloAccounts(true);
       };
     }
+
+    this._bindArloEvents();
 
     const gotoSets = this.shadowRoot.querySelector("#btn-goto-settings");
     if (gotoSets) {
@@ -3607,6 +4111,102 @@ class DomolinkCameraPanel extends HTMLElement {
 
     // Channel cards click
     this._bindChannelCards();
+  }
+
+  _bindArloEvents() {
+    const root = this.shadowRoot;
+    const w = this._arloWizard;
+
+    const openBtn = root.querySelector("#btn-arlo-open-wizard");
+    if (openBtn) {
+      openBtn.onclick = () => {
+        this._resetArloWizard(!w.open, "credentials");
+        this.render();
+      };
+    }
+
+    root.querySelectorAll(".btn-arlo-mode-tab").forEach((btn) => {
+      btn.onclick = () => {
+        w.mode = btn.dataset.mode || "credentials";
+        w.step = "login";
+        w.error = "";
+        w.message = "";
+        this.render();
+      };
+    });
+
+    const bindInput = (sel, key) => {
+      const el = root.querySelector(sel);
+      if (el) {
+        el.oninput = (e) => {
+          w[key] = e.target.value;
+        };
+      }
+    };
+    bindInput("#arlo-account-name", "accountName");
+    bindInput("#arlo-email", "email");
+    bindInput("#arlo-password", "password");
+    bindInput("#arlo-otp-code", "otpCode");
+    bindInput("#arlo-token", "token");
+    bindInput("#arlo-userid", "userId");
+    bindInput("#arlo-xcloudid", "xcloudId");
+
+    const factorSelect = root.querySelector("#arlo-factor-select");
+    if (factorSelect) {
+      factorSelect.onchange = (e) => {
+        w.selectedFactorId = e.target.value;
+      };
+    }
+
+    const loginBtn = root.querySelector("#btn-arlo-login-submit");
+    if (loginBtn) loginBtn.onclick = () => this._startArloLogin();
+
+    const sendOtpBtn = root.querySelector("#btn-arlo-send-otp");
+    if (sendOtpBtn) sendOtpBtn.onclick = () => this._requestArlo2faCode();
+
+    const verifyOtpBtn = root.querySelector("#btn-arlo-verify-otp");
+    if (verifyOtpBtn) verifyOtpBtn.onclick = () => this._verifyArlo2faCode();
+
+    const backBtn = root.querySelector("#btn-arlo-back-login");
+    if (backBtn) {
+      backBtn.onclick = () => {
+        w.step = "login";
+        w.error = "";
+        w.message = "";
+        this.render();
+      };
+    }
+
+    const saveTokenBtn = root.querySelector("#btn-arlo-save-token");
+    if (saveTokenBtn) saveTokenBtn.onclick = () => this._saveArloDirectToken();
+
+    root.querySelectorAll(".btn-arlo-sync").forEach((btn) => {
+      btn.onclick = () => this._syncArloAccount(btn.dataset.accountId, true);
+    });
+
+    root.querySelectorAll(".btn-arlo-update-token").forEach((btn) => {
+      btn.onclick = () => {
+        const acc = (this._arloAccounts || []).find((a) => a.id === btn.dataset.accountId);
+        this._resetArloWizard(true, "token", acc || null);
+        this.render();
+      };
+    });
+
+    root.querySelectorAll(".btn-arlo-delete-acc").forEach((btn) => {
+      btn.onclick = () => this._deleteArloAccount(btn.dataset.accountId);
+    });
+
+    root.querySelectorAll(".btn-arlo-add-dev").forEach((btn) => {
+      btn.onclick = () => {
+        const accId = btn.dataset.accountId;
+        const devId = btn.dataset.deviceId;
+        const acc = (this._arloAccounts || []).find((a) => a.id === accId);
+        const dev = acc && (acc.devices || []).find((d) => String(d.device_id) === String(devId));
+        if (dev) {
+          this._addArloCameraFromAccount(accId, dev);
+        }
+      };
+    });
   }
 
   _updateChannelGrid() {

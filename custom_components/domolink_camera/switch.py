@@ -34,6 +34,9 @@ async def async_setup_entry(
 
     def _refresh() -> None:
         current_ids = {e.camera_id for e in entities}
+        for ent in entities:
+            if ent.hass:
+                ent.async_write_ha_state()
         new_entities = [
             DomoLinkNightVisionSwitch(mgr, c["id"])
             for c in mgr.get_cameras_list()
@@ -57,8 +60,12 @@ class DomoLinkNightVisionSwitch(SwitchEntity):
         self.manager = manager
         self.camera_id = camera_id
         self._attr_unique_id = f"{DOMAIN}_{camera_id}_night_vision"
-        self._cam = self.manager.cameras.get(camera_id, {})
         self._attr_name = "Vision Nocturne IR"
+
+    @property
+    def _cam(self) -> dict[str, Any]:
+        """Resolve live camera configuration dictionary dynamically."""
+        return self.manager.cameras.get(self.camera_id, {})
 
     @property
     def is_on(self) -> bool:
