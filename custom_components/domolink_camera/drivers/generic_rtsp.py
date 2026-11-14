@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shutil
 import time
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -70,10 +69,10 @@ class GenericRtspDriver(BaseCameraDriver):
 
     @property
     def rtsp_url(self) -> str:
-        """Construct primary RTSP or stream URL with optional credentials."""
+        """Construct primary RTSP/RTSPS or stream URL with optional credentials."""
         if self._configured_stream_url:
             return self._configured_stream_url
-        if str(self.host).startswith(("rtsp://", "http://", "https://")):
+        if str(self.host).lower().startswith(("rtsp://", "rtsps://", "http://", "https://")):
             return str(self.host)
         auth = f"{self.username}:{self.password}@" if self.username else ""
         path = self.stream_path if str(self.stream_path).startswith("/") else f"/{self.stream_path}"
@@ -86,7 +85,7 @@ class GenericRtspDriver(BaseCameraDriver):
             return self._web_hls_url
         if self._configured_stream_url:
             return self._configured_stream_url
-        if str(self.host).startswith(("rtsp://", "http://", "https://")):
+        if str(self.host).lower().startswith(("rtsp://", "rtsps://", "http://", "https://")):
             return str(self.host)
         if self.driver_type == DRIVER_GENERIC_MJPEG:
             path = self.stream_path if str(self.stream_path).startswith("/") else f"/{self.stream_path}"
@@ -98,10 +97,11 @@ class GenericRtspDriver(BaseCameraDriver):
     @property
     def http_snapshot_url(self) -> str:
         """Construct HTTP snapshot URL."""
-        if str(self.host).startswith(("http://", "https://")):
+        lower_host = str(self.host).lower()
+        if lower_host.startswith(("http://", "https://")):
             parsed = urlparse(str(self.host))
             return f"{parsed.scheme}://{parsed.netloc}{self.snapshot_path}"
-        if str(self.host).startswith("rtsp://"):
+        if lower_host.startswith(("rtsp://", "rtsps://")):
             parsed = urlparse(str(self.host))
             hostname = parsed.hostname or ""
             return f"http://{hostname}:{self.http_port}{self.snapshot_path}"
@@ -219,81 +219,54 @@ class GenericRtspDriver(BaseCameraDriver):
             candidate_urls.append(f"http://{base_host}:{self.http_port}{p}")
 
         timeout = aiohttp.ClientTimeout(total=2.5)
+        shared_session = None
+        owns_session = False
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for url in dict.fromkeys(candidate_urls):
-                    if ".m3u8" in url:
-                        continue
-                    try:
-                        async with session.get(url, auth=auth) as resp:
-                            if resp.status != 200:
-                                continue
-                            ct = resp.headers.get("Content-Type", "").lower()
-                            if "multipart" in ct or "mjpeg" in ct:
-                                buf = bytearray()
-                                async for chunk in resp.content.iter_chunked(4096):
-                                    buf.extend(chunk)
-                                    frames = extract_jpegs_from_buffer(buf)
-                                    if frames and len(frames[0]) >= 100:
-                                        return frames[0]
-                                    if len(buf) > 262144:
-                                        break
-                            elif "image" in ct or "octet-stream" in ct:
-                                data = await resp.read()
-                                if data and len(data) >= 100 and (data.startswith(b"\xff\xd8") or "image" in ct):
-                                    return data
-                    except Exception:
-                        continue
+            if self.hass:
+                from homeassistant.helpers.aiohttp_client import async_get_clientsession
+                candidate = async_get_clientsession(self.hass)
+                if isinstance(candidate, aiohttp.ClientSession) and not candidate.closed:
+                    shared_session = candidate
+        except Exception:
+            shared_session = None
+
+        try:
+            if shared_session is None:
+                shared_session = aiohttp.ClientSession(timeout=timeout)
+                owns_session = True
+            for url in dict.fromkeys(candidate_urls):
+                if ".m3u8" in url:
+                    continue
+                try:
+                    async with shared_session.get(url, auth=auth, timeout=timeout) as resp:
+                        if resp.status != 200:
+                            continue
+                        ct = resp.headers.get("Content-Type", "").lower()
+                        if "multipart" in ct or "mjpeg" in ct:
+                            buf = bytearray()
+                            async for chunk in resp.content.iter_chunked(4096):
+                                buf.extend(chunk)
+                                frames = extract_jpegs_from_buffer(buf)
+                                if frames and len(frames[0]) >= 100:
+                                    return frames[0]
+                                if len(buf) > 262144:
+                                    break
+                        elif "image" in ct or "octet-stream" in ct:
+                            data = await resp.read()
+                            if data and len(data) >= 100 and (data.startswith(b"\xff\xd8") or "image" in ct):
+                                return data
+                except Exception:
+                    continue
         except Exception as err:
             _LOGGER.debug("[%s] HTTP snapshot fetch failed: %s", self.camera_id, err)
+        finally:
+            if owns_session and shared_session is not None and not shared_session.closed:
+                await shared_session.close()
         return None
 
     async def _fetch_ffmpeg_snapshot(self) -> bytes | None:
-        """Extract a single JPEG frame from RTSP or HLS stream via FFmpeg."""
-        if not shutil.which("ffmpeg"):
-            return None
-
-        url = self.primary_stream_url
-        if not url or not url.startswith(("rtsp://", "http://", "https://")):
-            return None
-
-        transports = ("tcp", "udp") if url.startswith("rtsp://") else (None,)
-        for transport in transports:
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
-            if transport:
-                cmd.extend(["-rtsp_transport", transport])
-            cmd.extend([
-                "-i", url,
-                "-frames:v", "1",
-                "-f", "image2",
-                "-vcodec", "mjpeg",
-                "-q:v", "3",
-                "pipe:1",
-            ])
-            proc = None
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=4.0)
-                if stdout and len(stdout) >= 100 and b"\xff\xd8" in stdout:
-                    start = stdout.find(b"\xff\xd8")
-                    end = stdout.rfind(b"\xff\xd9")
-                    if end > start:
-                        return stdout[start : end + 2]
-                    return stdout[start:]
-            except Exception as err:
-                _LOGGER.debug("[%s] FFmpeg snapshot (%s) failed: %s", self.camera_id, transport, err)
-            finally:
-                if proc and proc.returncode is None:
-                    try:
-                        proc.kill()
-                        await proc.wait()
-                    except Exception:
-                        pass
-        return None
+        """Extract a single JPEG frame from RTSP, RTSPS, or HLS stream via FFmpeg."""
+        return await self.async_capture_ffmpeg_snapshot(self.primary_stream_url, timeout_s=4.0)
 
     async def async_get_snapshot(self) -> bytes | None:
         """Fetch latest snapshot via HTTP or FFmpeg frame extraction."""
@@ -356,7 +329,7 @@ class GenericRtspDriver(BaseCameraDriver):
                 if self.driver_type == DRIVER_GENERIC_MJPEG and url.startswith(("http://", "https://")):
                     ok = await self._stream_http_mjpeg(url)
 
-                if not ok and self.is_streaming and url.startswith(("rtsp://", "http://", "https://")):
+                if not ok and self.is_streaming and url.lower().startswith(("rtsp://", "rtsps://", "http://", "https://")):
                     ok = await self.async_stream_ffmpeg_mjpeg(url)
 
                 if not ok and self.is_streaming:

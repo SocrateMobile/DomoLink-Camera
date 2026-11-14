@@ -120,27 +120,124 @@ class BaseCameraDriver(abc.ABC):
             except Exception:
                 pass
 
-    async def async_stream_ffmpeg_mjpeg(self, url: str) -> bool:
-        """Transcode an RTSP/HLS stream into JPEG frames via FFmpeg pipe."""
+    def _ffmpeg_input_attempts(self, url: str) -> list[tuple[str | None, list[str]]]:
+        """Build ordered FFmpeg input option attempts for RTSP, RTSPS, HTTP, or HLS URLs."""
+        lower = url.lower()
+        if lower.startswith("rtsps://"):
+            rtsp_flags = [
+                "-rtsp_transport", "tcp",
+                "-fflags", "nobuffer+genpts+discardcorrupt",
+                "-flags", "low_delay",
+                "-probesize", "500000",
+                "-analyzeduration", "500000",
+            ]
+            # Try with -tls_verify 0 first (needed for some Arlo/cloud RTSPS certs), then plain TCP
+            return [
+                ("tcp_noverify", [*rtsp_flags, "-tls_verify", "0"]),
+                ("tcp", rtsp_flags),
+            ]
+        if lower.startswith("rtsp://"):
+            pref = self.config.get("rtsp_transport", "tcp")
+            transports = [pref] + [t for t in ("tcp", "udp") if t != pref]
+            return [
+                (
+                    t,
+                    [
+                        "-rtsp_transport", t,
+                        "-fflags", "nobuffer+genpts+discardcorrupt",
+                        "-flags", "low_delay",
+                        "-probesize", "500000",
+                        "-analyzeduration", "500000",
+                    ],
+                )
+                for t in transports
+            ]
+        return [(None, ["-fflags", "nobuffer+discardcorrupt"])]
+
+    async def async_capture_ffmpeg_snapshot(
+        self, url: str, timeout_s: float = 8.0
+    ) -> bytes | None:
+        """Extract a single JPEG frame from an RTSP, RTSPS, HTTP, or HLS stream via FFmpeg."""
+        if not url or not shutil.which("ffmpeg"):
+            return None
+        if not url.lower().startswith(("rtsp://", "rtsps://", "http://", "https://")):
+            return None
+
+        for label, extra_args in self._ffmpeg_input_attempts(url):
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                *extra_args,
+                "-i",
+                url,
+                "-frames:v",
+                "1",
+                "-f",
+                "image2",
+                "-vcodec",
+                "mjpeg",
+                "-q:v",
+                "3",
+                "pipe:1",
+            ]
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+                if stdout and len(stdout) >= 100 and b"\xff\xd8" in stdout:
+                    start = stdout.find(b"\xff\xd8")
+                    end = stdout.rfind(b"\xff\xd9")
+                    if end > start:
+                        return stdout[start : end + 2]
+                    return stdout[start:]
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.debug("[%s] FFmpeg snapshot (%s) failed: %s", self.camera_id, label, err)
+            finally:
+                if proc and proc.returncode is None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+        return None
+
+    async def async_stream_ffmpeg_mjpeg(
+        self, url: str, fps: int = DEFAULT_STREAM_FPS, quality: int = 5
+    ) -> bool:
+        """Transcode an RTSP/RTSPS/HLS stream into JPEG frames via FFmpeg pipe."""
         if not url or not shutil.which("ffmpeg"):
             return False
 
-        transports = ("tcp", "udp") if url.startswith("rtsp://") else (None,)
-        for transport in transports:
+        for label, extra_args in self._ffmpeg_input_attempts(url):
             if not self.is_streaming:
                 return False
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
-            if transport:
-                cmd.extend(["-rtsp_transport", transport])
-            cmd.extend([
-                "-i", url,
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                *extra_args,
+                "-i",
+                url,
                 "-an",
-                "-f", "image2pipe",
-                "-vcodec", "mjpeg",
-                "-q:v", "5",
-                "-r", str(DEFAULT_STREAM_FPS),
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "-q:v",
+                str(quality),
+                "-r",
+                str(fps),
                 "pipe:1",
-            ])
+            ]
             proc = None
             received_any = False
             buf = bytearray()
@@ -152,7 +249,7 @@ class BaseCameraDriver(abc.ABC):
                 )
                 self._ffmpeg_proc = proc
                 while self.is_streaming and proc.stdout:
-                    chunk = await asyncio.wait_for(proc.stdout.read(16384), timeout=6.0)
+                    chunk = await asyncio.wait_for(proc.stdout.read(16384), timeout=8.0)
                     if not chunk:
                         break
                     buf.extend(chunk)
@@ -166,7 +263,7 @@ class BaseCameraDriver(abc.ABC):
             except asyncio.CancelledError:
                 raise
             except Exception as err:
-                _LOGGER.debug("[%s] FFmpeg stream (%s) error: %s", self.camera_id, transport, err)
+                _LOGGER.debug("[%s] FFmpeg stream (%s) error: %s", self.camera_id, label, err)
             finally:
                 self._ffmpeg_proc = None
                 if proc and proc.returncode is None:

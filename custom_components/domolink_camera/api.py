@@ -22,8 +22,15 @@ from .const import (
     ALLOWED_ENTITY_DOMAINS,
     DOMAIN,
     DRIVER_GENERIC_RTSP,
+    WS_TYPE_ARLO_DELETE_ACCOUNT,
+    WS_TYPE_ARLO_REQUEST_2FA,
+    WS_TYPE_ARLO_SAVE_TOKEN,
+    WS_TYPE_ARLO_START_LOGIN,
+    WS_TYPE_ARLO_SYNC_ACCOUNT,
+    WS_TYPE_ARLO_VERIFY_2FA,
     WS_TYPE_DELETE_CAMERA,
     WS_TYPE_DETECT_BOX,
+    WS_TYPE_GET_ARLO_ACCOUNTS,
     WS_TYPE_GET_CAMERAS,
     WS_TYPE_GET_ENTITIES,
     WS_TYPE_GET_TV_CHANNELS,
@@ -685,6 +692,138 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         mgr._notify_listeners()
         connection.send_result(msg["id"], {"success": True, "camera": cam_config})
 
+    # --- Multi-Account Arlo Cloud WebSocket Commands ---
+
+    @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_GET_ARLO_ACCOUNTS})
+    @websocket_api.async_response
+    async def ws_get_arlo_accounts(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        connection.send_result(msg["id"], {"accounts": mgr.get_arlo_accounts_list()})
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_ARLO_START_LOGIN,
+        vol.Required("email"): str,
+        vol.Required("password"): str,
+        vol.Optional("account_name", default=""): str,
+        vol.Optional("auto_add", default=True): bool,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_arlo_start_login(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        result = await mgr.async_arlo_start_login(
+            email=msg["email"],
+            password=msg["password"],
+            account_name=msg.get("account_name", ""),
+            auto_add=msg.get("auto_add", True),
+        )
+        connection.send_result(msg["id"], result)
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_ARLO_REQUEST_2FA,
+        vol.Required("session_id"): str,
+        vol.Required("factor_id"): str,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_arlo_request_2fa(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        result = await mgr.async_arlo_request_2fa(
+            session_id=msg["session_id"],
+            factor_id=msg["factor_id"],
+        )
+        connection.send_result(msg["id"], result)
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_ARLO_VERIFY_2FA,
+        vol.Required("session_id"): str,
+        vol.Required("otp_code"): str,
+        vol.Optional("factor_auth_code"): vol.Any(str, None),
+        vol.Optional("auto_add", default=True): bool,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_arlo_verify_2fa(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        result = await mgr.async_arlo_verify_2fa(
+            session_id=msg["session_id"],
+            otp_code=msg["otp_code"],
+            factor_auth_code=msg.get("factor_auth_code"),
+            auto_add=msg.get("auto_add", True),
+        )
+        connection.send_result(msg["id"], result)
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_ARLO_SAVE_TOKEN,
+        vol.Required("token"): str,
+        vol.Optional("email", default=""): str,
+        vol.Optional("account_name", default=""): str,
+        vol.Optional("user_id", default=""): str,
+        vol.Optional("xcloud_id", default=""): str,
+        vol.Optional("cookie", default=""): str,
+        vol.Optional("account_id", default=""): str,
+        vol.Optional("auto_add", default=True): bool,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_arlo_save_token(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        result = await mgr.async_arlo_save_token(
+            email=msg.get("email", ""),
+            token=msg["token"],
+            account_name=msg.get("account_name", ""),
+            user_id=msg.get("user_id", ""),
+            xcloud_id=msg.get("xcloud_id", ""),
+            cookie=msg.get("cookie", ""),
+            account_id=msg.get("account_id", ""),
+            auto_add=msg.get("auto_add", True),
+        )
+        connection.send_result(msg["id"], result)
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_ARLO_SYNC_ACCOUNT,
+        vol.Required("account_id"): str,
+        vol.Optional("auto_add", default=True): bool,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_arlo_sync_account(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        result = await mgr.async_arlo_sync_account(
+            account_id=msg["account_id"],
+            auto_add=msg.get("auto_add", True),
+        )
+        connection.send_result(msg["id"], result)
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_ARLO_DELETE_ACCOUNT,
+        vol.Required("account_id"): str,
+        vol.Optional("delete_cameras", default=False): bool,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_arlo_delete_account(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        ok = await mgr.async_arlo_delete_account(
+            account_id=msg["account_id"],
+            delete_cameras=msg.get("delete_cameras", False),
+        )
+        connection.send_result(msg["id"], {"success": ok})
+
     websocket_api.async_register_command(hass, ws_get_cameras)
     websocket_api.async_register_command(hass, ws_save_layout)
     websocket_api.async_register_command(hass, ws_save_camera)
@@ -702,3 +841,10 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_get_tv_channels)
     websocket_api.async_register_command(hass, ws_get_tv_stream)
     websocket_api.async_register_command(hass, ws_pin_tv_camera)
+    websocket_api.async_register_command(hass, ws_get_arlo_accounts)
+    websocket_api.async_register_command(hass, ws_arlo_start_login)
+    websocket_api.async_register_command(hass, ws_arlo_request_2fa)
+    websocket_api.async_register_command(hass, ws_arlo_verify_2fa)
+    websocket_api.async_register_command(hass, ws_arlo_save_token)
+    websocket_api.async_register_command(hass, ws_arlo_sync_account)
+    websocket_api.async_register_command(hass, ws_arlo_delete_account)

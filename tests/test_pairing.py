@@ -53,6 +53,7 @@ import unittest
 from custom_components.domolink_camera.const import (
     CAMERA_AP_SSID_PREFIXES,
     DEFAULT_PPPP_DISCOVERY_PORT,
+    DRIVER_ARLO_CLOUD,
     DRIVER_GENERIC_MJPEG,
     DRIVER_HA_PROXY,
     ILNK_MAGIC,
@@ -60,7 +61,13 @@ from custom_components.domolink_camera.const import (
     PPPP_CMD_WIFI_SET,
     PPPP_MAGIC,
 )
+from custom_components.domolink_camera.drivers.arlo_cloud import (
+    ArloCloudAccountSession,
+    ArloCloudDriver,
+    normalize_arlo_device,
+)
 from custom_components.domolink_camera.drivers.generic_rtsp import GenericRtspDriver
+from custom_components.domolink_camera.drivers.ha_proxy import HaProxyDriver
 from custom_components.domolink_camera.drivers.ysxlite_pppp import YsxLiteDriver
 from custom_components.domolink_camera.manager import CameraManager
 from custom_components.domolink_camera.pairing import WifiPairingEngine
@@ -322,6 +329,228 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsInstance(mjpeg_drv, GenericRtspDriver)
         self.assertEqual(mjpeg_drv.primary_stream_url, "http://192.168.1.90:81/stream")
+
+    def test_arlo_device_normalization_and_rtsps_ffmpeg_attempts(self) -> None:
+        """Verify Arlo raw device parsing filters non-cameras and BaseCameraDriver builds RTSPS args."""
+        raw_base = {"deviceId": "BASE123", "deviceType": "basestation", "deviceName": "SmartHub"}
+        self.assertIsNone(normalize_arlo_device(raw_base, "acc_1", "a@b.com"))
+
+        raw_cam = {
+            "deviceId": "ARLOCAM01",
+            "parentId": "BASE123",
+            "deviceType": "camera",
+            "deviceName": "Jardin Pro 4",
+            "modelId": "VMC4041P",
+            "xCloudId": "XCL-99",
+            "presignedLastImageUrl": "https://s3.example.com/last.jpg",
+            "properties": {"batteryLevel": 82, "signalStrength": 3},
+        }
+        norm = normalize_arlo_device(raw_cam, "acc_1", "a@b.com")
+        self.assertIsNotNone(norm)
+        self.assertEqual(norm["device_id"], "ARLOCAM01")
+        self.assertEqual(norm["parent_id"], "BASE123")
+        self.assertEqual(norm["battery_level"], 82)
+        self.assertEqual(norm["xcloud_id"], "XCL-99")
+
+        drv = HaProxyDriver("c_arlo", {"host": "camera.arlo_jardin", "entity_id": "camera.arlo_jardin"}, hass=self.mock_hass)
+        attempts = drv._ffmpeg_input_attempts("rtsps://vzwow01.arlo.com:443/vzmodulelive?egressToken=abc")
+        self.assertEqual(attempts[0][0], "tcp_noverify")
+        self.assertIn("-tls_verify", attempts[0][1])
+        self.assertIn("tcp", attempts[0][1])
+        self.assertEqual(attempts[1][0], "tcp")
+
+        # Relative HA HLS URL resolves safely to local HA URL
+        self.assertEqual(
+            drv._resolve_local_ha_url("/api/hls/tok123/master_playlist.m3u8"),
+            "http://127.0.0.1:8123/api/hls/tok123/master_playlist.m3u8",
+        )
+
+    async def test_arlo_2fa_flow_and_battery_safe_driver(self) -> None:
+        """Test Arlo 2FA authentication steps and passive snapshot/on-demand RTSPS lifecycle."""
+        sess = ArloCloudAccountSession("arlo_1", "user@example.com", name="Maison")
+
+        async def fake_post(url, payload, headers):
+            if url.endswith("/api/auth"):
+                return 200, {"meta": {"code": 200}, "data": {"token": "TMP_TOK", "userId": "USR1"}}, "{}"
+            if url.endswith("/api/startAuth"):
+                self.assertEqual(payload["factorId"], "FACT_EMAIL")
+                return 200, {"meta": {"code": 200}, "data": {"factorAuthCode": "FAC_99"}}, "{}"
+            if url.endswith("/api/finishAuth"):
+                self.assertEqual(payload["otp"], "654321")
+                return 200, {"meta": {"code": 200}, "data": {"token": "FINAL_TOK", "userId": "USR1"}}, "{}"
+            return 404, {}, "{}"
+
+        async def fake_get(url, headers):
+            if "/api/getFactors" in url:
+                return 200, {"meta": {"code": 200}, "data": {"items": [{"factorId": "FACT_EMAIL", "factorType": "EMAIL", "displayName": "u***@example.com"}]}}, "{}"
+            if "/hmsweb/v2/users/devices" in url:
+                return 200, {
+                    "success": True,
+                    "data": [{
+                        "deviceId": "DEV_FRONT",
+                        "parentId": "BASE_1",
+                        "deviceType": "doorbell",
+                        "deviceName": "Sonnette Entrée",
+                        "modelId": "AVD2001",
+                        "xCloudId": "XC1",
+                        "presignedLastImageUrl": "https://s3.example.com/doorbell.jpg",
+                        "properties": {"batteryLevel": 76, "signalStrength": 4},
+                    }],
+                }, "{}"
+            return 404, {}, "{}"
+
+        sess._post_json = AsyncMock(side_effect=fake_post)
+        sess._get_json = AsyncMock(side_effect=fake_get)
+
+        login_res = await sess.async_start_login("MySecretPass!")
+        self.assertEqual(login_res["status"], "2fa_required")
+        self.assertEqual(len(login_res["factors"]), 1)
+
+        otp_req = await sess.async_request_2fa_code("FACT_EMAIL")
+        self.assertEqual(otp_req["status"], "code_sent")
+
+        verify_res = await sess.async_verify_2fa_code("654321")
+        self.assertEqual(verify_res["status"], "connected")
+        self.assertEqual(sess.token, "FINAL_TOK")
+        self.assertEqual(len(sess.devices), 1)
+
+        # Battery-safe driver: async_connect fetches presigned image, never calls startStream
+        fake_jpeg = b"\xff\xd8\xff\xe0" + b"J" * 160 + b"\xff\xd9"
+        driver = ArloCloudDriver(
+            "cam_arlo_doorbell",
+            {
+                "id": "cam_arlo_doorbell",
+                "driver": DRIVER_ARLO_CLOUD,
+                "arlo_account_id": "arlo_1",
+                "arlo_device_id": "DEV_FRONT",
+                "parent_id": "BASE_1",
+                "xcloud_id": "XC1",
+            },
+            hass=self.mock_hass,
+            account_session=sess,
+        )
+        driver._download_presigned_image = AsyncMock(return_value=fake_jpeg)
+        sess.async_start_camera_stream = AsyncMock(return_value="rtsps://vzwow.arlo.com:443/vzmodulelive")
+        sess.async_stop_camera_stream = AsyncMock()
+
+        ok = await driver.async_connect()
+        self.assertTrue(ok)
+        self.assertEqual(driver.last_snapshot, fake_jpeg)
+        sess.async_start_camera_stream.assert_not_awaited()
+
+        caps = driver.get_capabilities()
+        self.assertEqual(caps["driver_type"], DRIVER_ARLO_CLOUD)
+        self.assertEqual(caps["battery_level"], 76)
+        self.assertTrue(caps["battery_protected_mode"])
+
+        # On-demand RTSPS live stream starts and calls stopStream when closed
+        driver.async_stream_ffmpeg_mjpeg = AsyncMock(return_value=True)
+        await driver.async_start_stream()
+        await asyncio.sleep(0.05)
+        sess.async_start_camera_stream.assert_awaited()
+        await driver.async_stop_stream()
+        sess.async_stop_camera_stream.assert_awaited()
+
+    async def test_manager_multi_account_arlo_persistence_and_sync(self) -> None:
+        """Verify CameraManager handles multiple Arlo accounts, persists data, and deletes cleanly."""
+        self.mock_hass.states.async_all.return_value = [
+            MagicMock(
+                entity_id="camera.aarlo_terrasse",
+                state="idle",
+                attributes={"friendly_name": "Terrasse", "brand": "Arlo", "battery_level": 64},
+            )
+        ]
+        mgr = CameraManager(self.mock_hass)
+        mgr.store.async_save = AsyncMock()
+        mgr.store.async_load = AsyncMock(return_value=None)
+
+        async def mock_get_json(session_self, url, headers):
+            if headers.get("Authorization") == "TOK_1":
+                return 200, {
+                    "success": True,
+                    "data": [{
+                        "deviceId": "DEV_A1",
+                        "parentId": "BASE_A",
+                        "deviceType": "camera",
+                        "deviceName": "Terrasse",
+                        "modelId": "VMC5040",
+                        "xCloudId": "XCA",
+                        "properties": {"batteryLevel": 91, "signalStrength": 4},
+                    }],
+                }, "{}"
+            return 200, {
+                "success": True,
+                "data": [{
+                    "deviceId": "DEV_B1",
+                    "parentId": "BASE_B",
+                    "deviceType": "camera",
+                    "deviceName": "Entrepot",
+                    "modelId": "VMC4030P",
+                    "xCloudId": "XCB",
+                    "properties": {"batteryLevel": 48, "signalStrength": 3},
+                }],
+            }, "{}"
+
+        with patch.object(
+            ArloCloudAccountSession,
+            "_get_json",
+            autospec=True,
+            side_effect=mock_get_json,
+        ), patch.object(ArloCloudDriver, "async_connect", return_value=True):
+            res1 = await mgr.async_arlo_save_token(
+                email="maison@example.com",
+                token="Bearer TOK_1",
+                account_name="Maison",
+            )
+            res2 = await mgr.async_arlo_save_token(
+                email="bureau@example.com",
+                token="TOK_2",
+                account_name="Bureau",
+            )
+
+        self.assertEqual(res1["status"], "connected")
+        self.assertEqual(res2["status"], "connected")
+        self.assertEqual(len(mgr.arlo_sessions), 2)
+        self.assertEqual(len(mgr.cameras), 2)
+
+        # Verify hybrid HA entity auto-linking on DEV_A1 ("Terrasse" -> camera.aarlo_terrasse)
+        cam_a = next(c for c in mgr.cameras.values() if c.get("arlo_device_id") == "DEV_A1")
+        self.assertEqual(cam_a["ha_entity_id"], "camera.aarlo_terrasse")
+        self.assertEqual(cam_a["driver"], DRIVER_ARLO_CLOUD)
+        self.assertIsInstance(mgr.drivers[cam_a["id"]], ArloCloudDriver)
+
+        # Verify store save received both arlo_accounts and cameras
+        last_saved = mgr.store.async_save.call_args.args[0]
+        self.assertEqual(len(last_saved["arlo_accounts"]), 2)
+        self.assertEqual(len(last_saved["cameras"]), 2)
+
+        # Delete second account along with its cameras
+        acc2_id = res2["account"]["id"]
+        deleted = await mgr.async_arlo_delete_account(acc2_id, delete_cameras=True)
+        self.assertTrue(deleted)
+        self.assertEqual(len(mgr.arlo_sessions), 1)
+        self.assertEqual(len(mgr.cameras), 1)
+
+    async def test_ysxlite_concurrent_snapshot_deduplication(self) -> None:
+        """Verify concurrent YsxLite async_get_snapshot calls share one pending future."""
+        drv = YsxLiteDriver("cam_ysx", {"host": "192.168.1.77", "port": 32108})
+        drv.is_connected = True
+        drv._send_pppp_cmd = AsyncMock()
+        fake_jpeg = b"\xff\xd8\xff\xe0" + b"Y" * 140 + b"\xff\xd9"
+
+        async def resolve_soon():
+            await asyncio.sleep(0.03)
+            drv._update_frame(fake_jpeg)
+
+        t1 = asyncio.create_task(drv.async_get_snapshot())
+        t2 = asyncio.create_task(drv.async_get_snapshot())
+        t3 = asyncio.create_task(resolve_soon())
+        r1, r2, _ = await asyncio.gather(t1, t2, t3)
+
+        self.assertEqual(r1, fake_jpeg)
+        self.assertEqual(r2, fake_jpeg)
+        # Only one UDP snapshot request should have been dispatched for both waiters
+        drv._send_pppp_cmd.assert_awaited_once()
 
 
 if __name__ == "__main__":

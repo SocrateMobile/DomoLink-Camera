@@ -96,9 +96,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         manager: CameraManager = hass.data[DOMAIN].get("manager")
         if manager:
-            # Disconnect all active camera drivers
-            for driver in manager.drivers.values():
+            # Disconnect all active camera drivers and close cloud sessions
+            for driver in list(manager.drivers.values()):
                 await driver.async_disconnect()
+            for session in list(getattr(manager, "arlo_sessions", {}).values()):
+                await session.async_close()
+            manager._listeners.clear()
 
         hass.data[DOMAIN].pop(entry.entry_id, None)
         try:

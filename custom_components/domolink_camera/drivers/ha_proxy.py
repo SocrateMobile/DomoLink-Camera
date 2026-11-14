@@ -69,18 +69,48 @@ class HaProxyDriver(BaseCameraDriver):
             except Exception as err:
                 _LOGGER.debug("[%s] Periodic snapshot poll error: %s", self.entity_id, err)
 
+    def _resolve_local_ha_url(self, path_or_url: str) -> str:
+        """Resolve a relative Home Assistant API path (e.g. /api/hls/...) to a full local URL."""
+        raw = str(path_or_url or "")
+        if not raw or raw.startswith(("http://", "https://", "rtsp://", "rtsps://")):
+            return raw
+        base = "http://127.0.0.1:8123"
+        try:
+            from homeassistant.helpers.network import get_url
+            detected = get_url(self.hass, allow_internal=True, prefer_external=False)
+            if detected and detected.startswith(("http://", "https://")):
+                base = detected.rstrip("/")
+        except Exception:
+            pass
+        return f"{base}{raw}" if raw.startswith("/") else f"{base}/{raw}"
+
     async def _live_feed_loop(self) -> None:
-        """Stream via entity stream_source FFmpeg pipe when available, else poll snapshots rapidly."""
+        """Stream via entity stream_source or HA HLS endpoint with FFmpeg, else poll snapshots rapidly."""
+        has_ffmpeg = bool(shutil.which("ffmpeg"))
         entity = self._get_ha_camera_entity()
-        if entity and hasattr(entity, "stream_source") and shutil.which("ffmpeg"):
+        if entity and hasattr(entity, "stream_source") and has_ffmpeg:
             try:
                 src = await entity.stream_source()
-                if src and str(src).startswith(("rtsp://", "http://", "https://")):
-                    await self.async_stream_ffmpeg_mjpeg(str(src))
+                if src and str(src).lower().startswith(("rtsp://", "rtsps://", "http://", "https://")):
+                    ok = await self.async_stream_ffmpeg_mjpeg(str(src))
+                    if ok or not self.is_streaming:
+                        return
             except asyncio.CancelledError:
                 raise
             except Exception as err:
                 _LOGGER.debug("[%s] HA stream_source FFmpeg error: %s", self.entity_id, err)
+
+        if self._stream_url and has_ffmpeg and self.is_streaming:
+            try:
+                hls_full = self._resolve_local_ha_url(self._stream_url)
+                if hls_full.lower().startswith(("http://", "https://", "rtsp://", "rtsps://")):
+                    ok = await self.async_stream_ffmpeg_mjpeg(hls_full)
+                    if ok or not self.is_streaming:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.debug("[%s] HA HLS FFmpeg error: %s", self.entity_id, err)
 
         while self.is_streaming:
             try:
@@ -91,7 +121,7 @@ class HaProxyDriver(BaseCameraDriver):
                 break
             except Exception as err:
                 _LOGGER.debug("[%s] Error in live stream loop: %s", self.entity_id, err)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.25)
 
     async def async_connect(self) -> bool:
         """Verify camera entity exists and is available in Home Assistant."""
@@ -192,13 +222,23 @@ class HaProxyDriver(BaseCameraDriver):
         except Exception as err:
             _LOGGER.debug("[%s] entity.async_camera_image failed: %s", self.entity_id, err)
 
-        # 3. Tertiary fallback: entity attributes (last_thumbnail for Arlo / cloud cameras)
+        # 3. Tertiary fallback: entity attributes (aarlo / Arlo / cloud thumbnails)
         try:
             state = self.hass.states.get(self.entity_id)
             if state and state.attributes:
-                last_thumb = state.attributes.get("last_thumbnail")
-                if last_thumb and str(last_thumb).startswith(("http://", "https://")):
-                    data = await self._fetch_http_url(str(last_thumb))
+                for attr_key in (
+                    "presignedFullFrameSnapshotUrl",
+                    "presignedLastImageUrl",
+                    "last_thumbnail",
+                    "entity_picture",
+                ):
+                    thumb_val = state.attributes.get(attr_key)
+                    if not thumb_val:
+                        continue
+                    thumb_url = self._resolve_local_ha_url(str(thumb_val))
+                    if not thumb_url.startswith(("http://", "https://")):
+                        continue
+                    data = await self._fetch_http_url(thumb_url)
                     if data and len(data) > 100:
                         self.last_snapshot = data
                         self.last_snapshot_time = time.time()
@@ -206,7 +246,7 @@ class HaProxyDriver(BaseCameraDriver):
                         self.status = STATUS_STREAMING if self.is_streaming else STATUS_ONLINE
                         return data
         except Exception as err:
-            _LOGGER.debug("[%s] Fallback to last_thumbnail failed: %s", self.entity_id, err)
+            _LOGGER.debug("[%s] Fallback to entity attributes failed: %s", self.entity_id, err)
 
         return self.last_snapshot
 
@@ -220,7 +260,6 @@ class HaProxyDriver(BaseCameraDriver):
 
         if self._stream_task and not self._stream_task.done():
             self._stream_task.cancel()
-        self._stream_task = asyncio.create_task(self._live_feed_loop())
 
         try:
             from homeassistant.components.camera import async_request_stream
@@ -237,6 +276,9 @@ class HaProxyDriver(BaseCameraDriver):
             except Exception as err:
                 _LOGGER.debug("[%s] Stream request to HA failed: %s", self.entity_id, err)
 
+        if self.is_streaming:
+            self._stream_task = asyncio.create_task(self._live_feed_loop())
+
     async def async_stop_stream(self) -> None:
         """Stop streaming and clean up FFmpeg or polling task."""
         self.is_streaming = False
@@ -248,7 +290,7 @@ class HaProxyDriver(BaseCameraDriver):
             self._stream_task = None
 
     def get_capabilities(self) -> dict[str, Any]:
-        """Return capabilities for HA Proxy camera."""
+        """Return capabilities for HA Proxy camera (including battery/signal for aarlo/cloud)."""
         state = self.hass.states.get(self.entity_id) if self.hass else None
         attrs = state.attributes if state else {}
         return {
@@ -260,5 +302,7 @@ class HaProxyDriver(BaseCameraDriver):
             "entity_picture": attrs.get("entity_picture"),
             "access_token": attrs.get("access_token"),
             "brand": attrs.get("brand") or attrs.get("device_brand") or "Home Assistant",
-            "model": attrs.get("model_name") or attrs.get("device_model") or "Caméra",
+            "model": attrs.get("model_name") or attrs.get("model_id") or attrs.get("device_model") or "Caméra",
+            "battery_level": attrs.get("battery_level"),
+            "signal_strength": attrs.get("signal_strength"),
         }
