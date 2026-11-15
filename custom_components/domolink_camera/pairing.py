@@ -21,14 +21,25 @@ from .const import (
     DEFAULT_PPPP_DISCOVERY_PORT,
     DOMAIN,
     DRIVER_ARLO_CLOUD,
+    DRIVER_BLINK_HYBRID,
+    DRIVER_EZVIZ_HYBRID,
     DRIVER_GENERIC_MJPEG,
     DRIVER_GENERIC_RTSP,
     DRIVER_HA_PROXY,
+    DRIVER_REOLINK_HYBRID,
+    DRIVER_TUYA_HYBRID,
     DRIVER_YSXLITE_PPPP,
     ILNK_MAGIC,
     PPPP_CMD_DEV_SEARCH,
     PPPP_CMD_WIFI_SET,
     PPPP_MAGIC,
+)
+from .drivers.ha_proxy import (
+    _normalize_label,
+    _normalize_mac,
+    _read_local_hybrid_caches_sync,
+    extract_tuya_device_id,
+    is_private_lan_ip,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -503,20 +514,76 @@ class WifiPairingEngine:
             all_states = self.hass.states.async_all()
             existing_eids = {s.entity_id for s in all_states if s.entity_id.startswith("camera.")}
 
+            # Optional one-shot local cache & Tuya OEM lookup for richer hybrid discovery
+            local_caches: dict[str, Any] = {}
+            if hasattr(self.hass, "config") and hasattr(self.hass.config, "path"):
+                try:
+                    cfg_dir = self.hass.config.path()
+                    if isinstance(cfg_dir, str) and cfg_dir and callable(getattr(self.hass, "async_add_executor_job", None)):
+                        local_caches = await self.hass.async_add_executor_job(_read_local_hybrid_caches_sync, cfg_dir)
+                except Exception:
+                    local_caches = {}
+
+            tuya_oem_meta: dict[str, dict[str, Any]] = {}
+            tuya_oem_by_entity: dict[str, str] = {}
+            tuya_oem_entries = self.hass.data.get("domolink_tuya_oem") if isinstance(getattr(self.hass, "data", None), dict) else None
+            if isinstance(tuya_oem_entries, dict):
+                for entry_val in tuya_oem_entries.values():
+                    if not isinstance(entry_val, dict):
+                        continue
+                    coord = entry_val.get("coordinator")
+                    if coord is None:
+                        continue
+                    devices = getattr(coord, "devices", {}) or {}
+                    overrides = getattr(coord, "overrides", {}) or {}
+                    local_devs = getattr(coord, "local_devices", {}) or {}
+                    find_linked = getattr(coord, "find_linked_camera_entity", None)
+                    for did, dobj in devices.items():
+                        did_str = str(did)
+                        ov = overrides.get(did_str, {}) if isinstance(overrides, dict) else {}
+                        loc = local_devs.get(did_str, {}) if isinstance(local_devs, dict) else {}
+                        ip_val = str(
+                            (ov.get("local_ip") or ov.get("ip") if isinstance(ov, dict) else "")
+                            or (loc.get("local_ip") or loc.get("ip") if isinstance(loc, dict) else "")
+                            or (getattr(dobj, "ip", "") or "")
+                        ).strip()
+                        linked = ""
+                        if callable(find_linked):
+                            try:
+                                linked = str(find_linked(did_str) or "")
+                            except Exception:
+                                pass
+                        tuya_oem_meta[did_str] = {
+                            "local_ip": ip_val if is_private_lan_ip(ip_val) else "",
+                            "mac_address": _normalize_mac(loc.get("mac") if isinstance(loc, dict) else ""),
+                            "tuya_oem_entity_id": linked,
+                            "model_id": str(getattr(dobj, "product_name", "") or getattr(dobj, "model", "") or ""),
+                        }
+                        if linked:
+                            tuya_oem_by_entity[linked] = did_str
+
+            dev_reg = self.hass.data.get("device_registry") if isinstance(getattr(self.hass, "data", None), dict) else None
+            seen_tuya_idx: dict[str, int] = {}
+
             for state in all_states:
                 eid = state.entity_id
                 if not eid.startswith("camera."):
                     continue
 
                 attrs = state.attributes or {}
+
+                # Ignore orphaned HA "restored" entities that no longer belong to any loaded integration
+                if state.state == "unavailable" and bool(attrs.get("restored")):
+                    continue
+
                 friendly_name = attrs.get("friendly_name") or eid
                 model = attrs.get("model_name") or attrs.get("brand") or "Caméra Détectée"
 
                 # Find platform in entity registry
                 reg_entry = ent_map.get(eid)
                 platform = getattr(reg_entry, "platform", "") if reg_entry else ""
-                if not platform:
-                    platform = attrs.get("platform") or "inconnu"
+                if not isinstance(platform, str) or not platform:
+                    platform = str(attrs.get("platform") or "inconnu")
 
                 # Skip DomoLink-Camera self entities to avoid recursion
                 if platform == DOMAIN:
@@ -531,9 +598,163 @@ class WifiPairingEngine:
                         continue
 
                 unavail_note = " • Actuellement indisponible dans HA" if state.state == "unavailable" else ""
+                plat_low = platform.lower()
 
-                # All HA camera entities proxy cleanly through DRIVER_HA_PROXY
-                if platform in KNOWN_COMPATIBLE_PLATFORMS:
+                reg_uid = str(getattr(reg_entry, "unique_id", "") or "") if reg_entry else ""
+                reg_did = str(getattr(reg_entry, "device_id", "") or "") if reg_entry else ""
+                tuya_dev_id = tuya_oem_by_entity.get(eid) or extract_tuya_device_id(reg_uid, eid)
+                local_ip = ""
+                mac_addr = _normalize_mac(attrs.get("mac") or attrs.get("mac_address"))
+                for ip_k in ("local_ip", "ip_address", "lan_ip", "host"):
+                    cand = str(attrs.get(ip_k) or "").strip()
+                    if is_private_lan_ip(cand):
+                        local_ip = cand
+                        break
+
+                if reg_did and dev_reg and hasattr(dev_reg, "async_get"):
+                    try:
+                        dev_e = dev_reg.async_get(reg_did)
+                        if dev_e:
+                            if not tuya_dev_id:
+                                tuya_dev_id = extract_tuya_device_id(getattr(dev_e, "identifiers", None))
+                            for c_t, c_v in getattr(dev_e, "connections", ()) or ():
+                                if str(c_t).lower() == "mac" and not mac_addr:
+                                    mac_addr = _normalize_mac(c_v)
+                            if not local_ip and isinstance(getattr(dev_e, "configuration_url", None), str):
+                                from urllib.parse import urlsplit
+                                h = urlsplit(dev_e.configuration_url).hostname or ""
+                                if is_private_lan_ip(h):
+                                    local_ip = h
+                    except Exception:
+                        pass
+
+                oem_entity_id = ""
+                if tuya_dev_id:
+                    meta = tuya_oem_meta.get(tuya_dev_id, {})
+                    local_ip = local_ip or meta.get("local_ip", "")
+                    mac_addr = mac_addr or meta.get("mac_address", "")
+                    oem_entity_id = meta.get("tuya_oem_entity_id", "") or (eid if plat_low == "domolink_tuya_oem" else "")
+                    ov = local_caches.get("tuya_overrides", {}).get(tuya_dev_id, {})
+                    local_ip = local_ip or ov.get("local_ip", "")
+                    mac_addr = mac_addr or ov.get("mac", "")
+                    if model == "Caméra Détectée" and meta.get("model_id"):
+                        model = meta["model_id"]
+
+                if "xiaomi" in plat_low:
+                    xm = (
+                        local_caches.get("xiaomi_by_mac", {}).get(mac_addr)
+                        or local_caches.get("xiaomi_by_name", {}).get(_normalize_label(friendly_name))
+                        or {}
+                    )
+                    local_ip = local_ip or xm.get("local_ip", "")
+                    mac_addr = mac_addr or xm.get("mac", "")
+                    if model == "Caméra Détectée" and xm.get("model"):
+                        model = xm["model"]
+
+                if mac_addr and not local_ip:
+                    local_ip = local_caches.get("arp_mac_to_ip", {}).get(mac_addr, "")
+
+                lan_note = f" • LAN {local_ip}" if local_ip else ""
+                bat = attrs.get("battery_level")
+                bat_note = f" • Batterie {bat}%" if bat is not None else ""
+
+                # Hybrid Option 2 driver routing by brand/platform
+                if plat_low in ("tuya", "domolink_tuya_oem", "localtuya", "tuya_local"):
+                    item = {
+                        "host": eid,
+                        "port": 554 if local_ip else 0,
+                        "device_id": eid,
+                        "name": friendly_name,
+                        "driver": DRIVER_TUYA_HYBRID,
+                        "protocol": "Tuya / OEM Hybride (Local + Cloud)",
+                        "model": model if model != "Caméra Détectée" else "Caméra Tuya / SmartLife",
+                        "details": f"Pilote Hybride Option 2 ({plat_low}) • Priorité RTSP LAN + Fallback Cloud OEM{lan_note}{bat_note}{unavail_note}",
+                        "tuya_device_id": tuya_dev_id,
+                        "tuya_oem_entity_id": oem_entity_id,
+                        "local_ip": local_ip,
+                        "mac_address": mac_addr,
+                        "brand": "Tuya",
+                        "battery_level": bat,
+                        "signal_strength": attrs.get("signal_strength"),
+                        "compatible": True,
+                        "source": "ha_entity",
+                    }
+                    # Deduplicate same physical Tuya device exposed by both tuya and domolink_tuya_oem
+                    if tuya_dev_id and tuya_dev_id in seen_tuya_idx:
+                        prev_idx = seen_tuya_idx[tuya_dev_id]
+                        prev = compatible[prev_idx]
+                        prev_is_oem = "domolink_tuya_oem" in prev.get("details", "")
+                        cur_is_oem = plat_low == "domolink_tuya_oem"
+                        prev_avail = "indisponible" not in prev.get("details", "")
+                        cur_avail = state.state != "unavailable"
+                        if (cur_avail and not prev_avail) or (cur_is_oem and not prev_is_oem and cur_avail):
+                            item["tuya_oem_entity_id"] = oem_entity_id or prev.get("tuya_oem_entity_id", "")
+                            item["local_ip"] = local_ip or prev.get("local_ip", "")
+                            compatible[prev_idx] = item
+                        else:
+                            if oem_entity_id and not prev.get("tuya_oem_entity_id"):
+                                prev["tuya_oem_entity_id"] = oem_entity_id
+                            if local_ip and not prev.get("local_ip"):
+                                prev["local_ip"] = local_ip
+                        continue
+                    if tuya_dev_id:
+                        seen_tuya_idx[tuya_dev_id] = len(compatible)
+                    compatible.append(item)
+                elif plat_low == "reolink":
+                    compatible.append({
+                        "host": eid,
+                        "port": 554,
+                        "device_id": eid,
+                        "name": friendly_name,
+                        "driver": DRIVER_REOLINK_HYBRID,
+                        "protocol": "Reolink Hybride (RTSP/FLV LAN + Fallback HA)",
+                        "model": model if model != "Caméra Détectée" else "Caméra Reolink",
+                        "details": f"Pilote Hybride Reolink • RTSP LAN (Sub/Main) + Fallback HA{lan_note}{bat_note}{unavail_note}",
+                        "local_ip": local_ip,
+                        "mac_address": mac_addr,
+                        "brand": "Reolink",
+                        "battery_level": bat,
+                        "signal_strength": attrs.get("signal_strength"),
+                        "compatible": True,
+                        "source": "ha_entity",
+                    })
+                elif plat_low == "ezviz":
+                    compatible.append({
+                        "host": eid,
+                        "port": 554,
+                        "device_id": eid,
+                        "name": friendly_name,
+                        "driver": DRIVER_EZVIZ_HYBRID,
+                        "protocol": "Ezviz Hybride (RTSP LAN + Fallback HA)",
+                        "model": model if model != "Caméra Détectée" else "Caméra Ezviz",
+                        "details": f"Pilote Hybride Ezviz • RTSP LAN direct + Fallback Cloud/HA{lan_note}{bat_note}{unavail_note}",
+                        "local_ip": local_ip,
+                        "mac_address": mac_addr,
+                        "brand": "Ezviz",
+                        "battery_level": bat,
+                        "signal_strength": attrs.get("signal_strength"),
+                        "compatible": True,
+                        "source": "ha_entity",
+                    })
+                elif plat_low == "blink":
+                    compatible.append({
+                        "host": eid,
+                        "port": 0,
+                        "device_id": eid,
+                        "name": friendly_name,
+                        "driver": DRIVER_BLINK_HYBRID,
+                        "protocol": "Blink Hybride (Éco-Batterie + Fallback Cloud)",
+                        "model": model if model != "Caméra Détectée" else "Caméra Blink",
+                        "details": f"Mode Économie Batterie actif (poll 60s) • Stream on-demand + Fallback Cloud{bat_note}{unavail_note}",
+                        "local_ip": local_ip,
+                        "mac_address": mac_addr,
+                        "brand": "Blink",
+                        "battery_level": bat,
+                        "signal_strength": attrs.get("signal_strength"),
+                        "compatible": True,
+                        "source": "ha_entity",
+                    })
+                elif platform in KNOWN_COMPATIBLE_PLATFORMS:
                     info = KNOWN_COMPATIBLE_PLATFORMS[platform]
                     compatible.append({
                         "host": eid,
@@ -543,20 +764,20 @@ class WifiPairingEngine:
                         "driver": DRIVER_HA_PROXY,
                         "protocol": info["protocol"],
                         "model": model if model != "Caméra Détectée" else info["model"],
-                        "details": f"Entité Home Assistant ({platform}) avec flux proxifié et support stream natif{unavail_note}",
+                        "details": f"Entité Home Assistant ({platform}) avec flux proxifié et support stream natif{lan_note}{unavail_note}",
+                        "local_ip": local_ip,
+                        "mac_address": mac_addr,
                         "compatible": True,
                         "source": "ha_entity",
                     })
                 else:
-                    # Active camera in HA (Tuya, Arlo, Xiaomi, Blink, etc.) proxied through Home Assistant!
+                    # Active camera in HA (Xiaomi, Arlo, etc.) proxied through hybrid HaProxyDriver
                     info = KNOWN_INCOMPATIBLE_PLATFORMS.get(platform, {})
                     plat_name = info.get("platform_name") or platform.capitalize()
                     is_arlo_ent = platform in ("aarlo", "arlo") or "arlo" in eid.lower()
-                    bat = attrs.get("battery_level")
-                    bat_note = f" • Batterie {bat}%" if bat is not None else ""
                     compatible.append({
                         "host": eid,
-                        "port": 0,
+                        "port": 554 if local_ip else 0,
                         "device_id": eid,
                         "name": friendly_name,
                         "driver": DRIVER_HA_PROXY,
@@ -565,8 +786,10 @@ class WifiPairingEngine:
                         "details": (
                             f"Entité Arlo Home Assistant détectée • Support RTSPS/HLS et miniatures S3 activé{bat_note}{unavail_note}"
                             if is_arlo_ent
-                            else f"Gérée par '{plat_name}' dans Home Assistant • Snapshot et Live streaming proxifiés automatiquement{bat_note}{unavail_note}"
+                            else f"Gérée par '{plat_name}' dans HA • Direct LAN/Stream prioritaire + Fallback HLS{lan_note}{bat_note}{unavail_note}"
                         ),
+                        "local_ip": local_ip,
+                        "mac_address": mac_addr,
                         "battery_level": bat,
                         "signal_strength": attrs.get("signal_strength"),
                         "compatible": True,

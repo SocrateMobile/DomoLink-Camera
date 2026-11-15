@@ -1344,6 +1344,11 @@ class DomolinkCameraPanel extends HTMLElement {
       xcloud_id: dev.xcloud_id || "",
       model_id: dev.model_id || "",
       account_email: dev.account_email || "",
+      tuya_device_id: dev.tuya_device_id || "",
+      tuya_oem_entity_id: dev.tuya_oem_entity_id || "",
+      local_ip: dev.local_ip || "",
+      mac_address: dev.mac_address || "",
+      brand: dev.brand || "",
       linked_entities: [],
     };
 
@@ -2830,6 +2835,14 @@ class DomolinkCameraPanel extends HTMLElement {
             const driverLabel =
               cam.driver === "arlo_cloud"
                 ? "Arlo Cloud"
+                : cam.driver === "tuya_hybrid"
+                ? "Tuya Hybride"
+                : cam.driver === "reolink_hybrid"
+                ? "Reolink Hybride"
+                : cam.driver === "ezviz_hybrid"
+                ? "Ezviz Hybride"
+                : cam.driver === "blink_hybrid"
+                ? "Blink Hybride"
                 : cam.driver === "ysxlite_pppp"
                 ? "YsxLite"
                 : cam.driver === "ha_proxy"
@@ -3732,6 +3745,10 @@ class DomolinkCameraPanel extends HTMLElement {
                       <td>
                         <select class="form-select cam-input-driver" data-id="${cam.id}">
                           <option value="arlo_cloud" ${cam.driver === "arlo_cloud" ? "selected" : ""}>Arlo Cloud Direct</option>
+                          <option value="tuya_hybrid" ${cam.driver === "tuya_hybrid" ? "selected" : ""}>Tuya / OEM Hybride (Local + Cloud)</option>
+                          <option value="reolink_hybrid" ${cam.driver === "reolink_hybrid" ? "selected" : ""}>Reolink Hybride (LAN + HA)</option>
+                          <option value="ezviz_hybrid" ${cam.driver === "ezviz_hybrid" ? "selected" : ""}>Ezviz Hybride (LAN + HA)</option>
+                          <option value="blink_hybrid" ${cam.driver === "blink_hybrid" ? "selected" : ""}>Blink Hybride (Éco-Batterie)</option>
                           <option value="ysxlite_pppp" ${cam.driver === "ysxlite_pppp" ? "selected" : ""}>YsxLite PPPP</option>
                           <option value="generic_rtsp" ${cam.driver === "generic_rtsp" ? "selected" : ""}>RTSP / ONVIF</option>
                           <option value="generic_mjpeg" ${cam.driver === "generic_mjpeg" ? "selected" : ""}>MJPEG / HTTP (Webcam & ESP32-CAM)</option>

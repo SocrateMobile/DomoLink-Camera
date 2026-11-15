@@ -14,10 +14,15 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     DRIVER_ARLO_CLOUD,
+    DRIVER_BLINK_HYBRID,
+    DRIVER_EZVIZ_HYBRID,
     DRIVER_GENERIC_MJPEG,
     DRIVER_GENERIC_RTSP,
     DRIVER_HA_PROXY,
+    DRIVER_REOLINK_HYBRID,
+    DRIVER_TUYA_HYBRID,
     DRIVER_YSXLITE_PPPP,
+    HYBRID_PROXY_DRIVERS,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
@@ -99,9 +104,10 @@ class CameraManager:
         for driver in self.drivers.values():
             asyncio.create_task(driver.async_connect())
 
-        # Automatically reuse valid HA .aarlo sessions if present on disk
+        # Automatically reuse valid HA .aarlo sessions and upgrade/enrich hybrid cameras
         if self._has_local_aarlo_dir():
             asyncio.create_task(self.async_auto_import_aarlo_sessions())
+            asyncio.create_task(self.async_auto_enrich_hybrid_cameras(delay=3.0))
 
     def _has_local_aarlo_dir(self) -> bool:
         """Return True when running inside HA with a concrete string .aarlo config path."""
@@ -223,7 +229,7 @@ class CameraManager:
             driver = ArloCloudDriver(
                 camera_id, config, hass=self.hass, account_session=session
             )
-        elif host.startswith("camera.") or driver_type == DRIVER_HA_PROXY:
+        elif host.startswith("camera.") or driver_type in HYBRID_PROXY_DRIVERS:
             driver = HaProxyDriver(camera_id, config, hass=self.hass)
         elif driver_type in (DRIVER_GENERIC_RTSP, DRIVER_GENERIC_MJPEG):
             driver = GenericRtspDriver(camera_id, config, hass=self.hass)
@@ -232,6 +238,77 @@ class CameraManager:
 
         self.drivers[camera_id] = driver
         return driver
+
+    async def async_auto_enrich_hybrid_cameras(self, delay: float = 0.0) -> int:
+        """Auto-upgrade existing HA proxy cameras (Tuya, Reolink, Ezviz, Blink, Xiaomi) with LAN metadata."""
+        if delay > 0:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return 0
+
+        changed = 0
+        for cid, cam_cfg in list(self.cameras.items()):
+            if not isinstance(cam_cfg, dict):
+                continue
+            cur_driver = str(cam_cfg.get("driver") or "")
+            host = str(cam_cfg.get("host") or "")
+            if cur_driver not in HYBRID_PROXY_DRIVERS and not host.startswith("camera."):
+                continue
+
+            drv = self.drivers.get(cid)
+            if not isinstance(drv, HaProxyDriver):
+                drv = self._init_driver(cid, cam_cfg)
+                if not isinstance(drv, HaProxyDriver):
+                    continue
+
+            try:
+                meta = await drv.async_resolve_hybrid_metadata(force=True)
+            except Exception as err:
+                _LOGGER.debug("[%s] Hybrid metadata enrichment failed: %s", cid, err)
+                continue
+
+            plat = str(meta.get("platform") or cam_cfg.get("platform") or "").lower()
+            brand_hint = f"{plat} {cam_cfg.get('brand', '')} {host}".lower()
+            target_driver = cur_driver
+
+            if cur_driver == DRIVER_HA_PROXY:
+                if plat in ("tuya", "domolink_tuya_oem", "localtuya", "tuya_local") or meta.get("tuya_device_id"):
+                    target_driver = DRIVER_TUYA_HYBRID
+                elif plat == "reolink" or "reolink" in brand_hint:
+                    target_driver = DRIVER_REOLINK_HYBRID
+                elif plat == "ezviz" or "ezviz" in brand_hint:
+                    target_driver = DRIVER_EZVIZ_HYBRID
+                elif plat == "blink" or "blink" in brand_hint:
+                    target_driver = DRIVER_BLINK_HYBRID
+
+            cam_modified = False
+            if target_driver != cur_driver:
+                cam_cfg["driver"] = target_driver
+                drv.driver_type = target_driver
+                cam_modified = True
+
+            for field_name in (
+                "local_ip",
+                "mac_address",
+                "tuya_device_id",
+                "tuya_oem_entity_id",
+                "brand",
+                "model_id",
+            ):
+                val = cam_cfg.get(field_name) or meta.get(field_name) or getattr(drv, field_name, "")
+                if val and cam_cfg.get(field_name) != val:
+                    cam_cfg[field_name] = val
+                    cam_modified = True
+
+            if cam_modified:
+                changed += 1
+
+        if changed:
+            await self.async_save()
+            self._notify_listeners()
+            _LOGGER.info("Hybrid Option 2 enrichment updated %d camera(s)", changed)
+        return changed
 
     def get_cameras_list(self) -> list[dict[str, Any]]:
         """Return list of all cameras sorted by their layout order."""
@@ -267,6 +344,15 @@ class CameraManager:
                 "xcloud_id": c.get("xcloud_id", ""),
                 "model_id": c.get("model_id", ""),
                 "ha_entity_id": c.get("ha_entity_id", ""),
+                "tuya_device_id": c.get("tuya_device_id", ""),
+                "tuya_oem_entity_id": c.get("tuya_oem_entity_id", ""),
+                "local_ip": c.get("local_ip", "") or caps.get("local_ip", ""),
+                "mac_address": c.get("mac_address", "") or caps.get("mac_address", ""),
+                "wifi_ssid": c.get("wifi_ssid", "") or caps.get("wifi_ssid", ""),
+                "wifi_rssi": c.get("wifi_rssi") if c.get("wifi_rssi") is not None else caps.get("wifi_rssi"),
+                "brand": c.get("brand", "") or caps.get("brand", ""),
+                "stream_mode": caps.get("stream_mode", ""),
+                "battery_protected_mode": bool(caps.get("battery_protected_mode", False)),
                 "order": c.get("order", 0),
                 "linked_entities": c.get("linked_entities", []),
                 "status": status,
@@ -303,7 +389,15 @@ class CameraManager:
             cid = f"cam_{slug}_{int(time.time())}"
             camera_data["id"] = cid
 
-        # Keep existing order or assign to end
+        # Keep existing order or assign to end, and preserve stored secrets if omitted
+        existing = self.cameras.get(cid)
+        if existing:
+            for secret_key in ("password", "local_key", "verification_code"):
+                if secret_key not in camera_data and existing.get(secret_key):
+                    camera_data[secret_key] = existing[secret_key]
+            if "order" not in camera_data and "order" in existing:
+                camera_data["order"] = existing["order"]
+
         if "order" not in camera_data:
             max_order = max([c.get("order", 0) for c in self.cameras.values()], default=-1)
             camera_data["order"] = max_order + 1
