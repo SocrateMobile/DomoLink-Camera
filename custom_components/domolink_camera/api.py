@@ -250,7 +250,7 @@ class DomolinkTvLiveStreamView(HomeAssistantView):
                 proc = await asyncio.create_subprocess_exec(
                     *ffmpeg_cmd,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
                 )
                 while True:
                     chunk = await proc.stdout.read(32768)
@@ -576,24 +576,30 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
             connection.send_error(msg["id"], "not_found", "Chaîne non trouvée")
             return
 
-        # 1. Prefer direct web HLS stream if available
-        if channel.get("web_hls_url"):
+        signed_tv_live = _sign_api_path(hass, f"/api/domolink_camera/tv_live/{channel_id}")
+        rtsp_url = channel.get("stream_url") or ""
+        has_local_rtsp = rtsp_url.startswith("rtsp://")
+
+        # 1. Prefer direct web HLS stream only when no local box RTSP stream is available
+        if not has_local_rtsp and channel.get("web_hls_url"):
             connection.send_result(
                 msg["id"],
                 {
                     "url": channel["web_hls_url"],
+                    "fallback_url": signed_tv_live,
                     "format": "hls",
                     "channel": channel,
                 },
             )
             return
 
-        # 2. If it's a web HLS stream directly
-        if channel.get("type") == "hls" and channel.get("stream_url"):
+        # 2. If it's a pure web HLS stream directly
+        if channel.get("type") == "hls" and rtsp_url and not has_local_rtsp:
             connection.send_result(
                 msg["id"],
                 {
-                    "url": channel["stream_url"],
+                    "url": rtsp_url,
+                    "fallback_url": signed_tv_live,
                     "format": "hls",
                     "channel": channel,
                 },
@@ -601,8 +607,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
             return
 
         # 3. For Freebox RTSP stream, try HA stream component with UDP transport
-        rtsp_url = channel.get("stream_url")
-        if rtsp_url and "stream" in hass.config.components:
+        if has_local_rtsp and "stream" in hass.config.components:
             try:
                 from homeassistant.components.stream import create_stream
                 stream = create_stream(hass, rtsp_url, options={"rtsp_transport": "udp"})
@@ -614,6 +619,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
                         msg["id"],
                         {
                             "url": hls_url,
+                            "fallback_url": signed_tv_live,
                             "format": "hls",
                             "channel": channel,
                         },
@@ -626,7 +632,8 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         connection.send_result(
             msg["id"],
             {
-                "url": _sign_api_path(hass, f"/api/domolink_camera/tv_live/{channel_id}"),
+                "url": signed_tv_live,
+                "fallback_url": signed_tv_live,
                 "format": "mp4",
                 "proxied": True,
                 "channel": channel,

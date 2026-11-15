@@ -197,6 +197,8 @@ class DomolinkCameraPanel extends HTMLElement {
 
   _appendCacheBuster(url, ts) {
     if (!url) return "";
+    // Never append &t=... to HA authSig URLs; extra query params invalidate the signature (HTTP 401).
+    if (url.includes("authSig=")) return url;
     const sep = url.includes("?") ? "&" : "?";
     return `${url}${sep}t=${ts}`;
   }
@@ -3255,7 +3257,8 @@ class DomolinkCameraPanel extends HTMLElement {
             this._hlsPlayer.on(window.Hls.Events.ERROR, (event, data) => {
               if (data && data.fatal) {
                 console.warn("HLS fatal error, switching to proxy:", data);
-                video.src = `/api/domolink_camera/tv_live/${channel.id}?t=${Date.now()}`;
+                const fbUrl = resp.fallback_url || `/api/domolink_camera/tv_live/${channel.id}`;
+                video.src = this._appendCacheBuster(fbUrl, Date.now());
                 startPlayback();
               }
             });
@@ -3266,7 +3269,7 @@ class DomolinkCameraPanel extends HTMLElement {
         }
       } else {
         const fullUrl = streamUrl.startsWith("http") || streamUrl.startsWith("/")
-          ? `${streamUrl}${streamUrl.includes("?") ? "&" : "?"}t=${Date.now()}`
+          ? this._appendCacheBuster(streamUrl, Date.now())
           : streamUrl;
         video.src = fullUrl;
         startPlayback();
