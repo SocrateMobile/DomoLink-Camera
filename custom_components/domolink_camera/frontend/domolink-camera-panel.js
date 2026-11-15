@@ -183,7 +183,8 @@ class DomolinkCameraPanel extends HTMLElement {
   _getSnapshotUrl(cam, forceTs = null) {
     const ts = forceTs || cam.snapshot_timestamp || Date.now();
     if (cam.signed_snapshot_url) {
-      return this._appendCacheBuster(cam.signed_snapshot_url, ts);
+      // Do not append &t=... to authSig URLs; extra query params invalidate HA's authSig signature.
+      return cam.signed_snapshot_url;
     }
     const stateObj = (cam.driver === "ha_proxy" && this._hass) ? this._hass.states[cam.host] : null;
     if (cam.driver === "ha_proxy" && stateObj?.attributes?.entity_picture) {

@@ -17,7 +17,7 @@ def test_manifest_structure_and_version():
 
     assert manifest["domain"] == "domolink_camera"
     assert manifest["name"] == "DomoLink Camera"
-    assert manifest["version"] == "1.5.0"
+    assert manifest["version"] == "1.5.1"
     assert manifest["codeowners"] == ["@SocrateMobile"]
     assert "socratemobile" in manifest["documentation"].lower()
     assert "SocrateMobile" in manifest["issue_tracker"]
