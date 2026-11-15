@@ -46,10 +46,7 @@ v9cj5nhJ0GjNklkShZCwTd8fRQPsQ5g0cc44vK7H2Z5uKbCyQbyulNb71jxkD2FG
 ARLO_CAMERA_DEVICE_TYPES = {"camera", "doorbell", "arloq", "arloqs", "lights"}
 ARLO_EXCLUDED_DEVICE_TYPES = {"basestation", "siren", "bridge", "keypad", "sensor", "router"}
 
-ARLO_DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
-)
+ARLO_DEFAULT_USER_AGENT = "Arlo/7.5.1 (Android 14; Pixel 8) okhttp/4.12.0"
 
 
 def _encode_arlo_password(password: str) -> str:
@@ -232,17 +229,23 @@ class ArloCloudAccountSession:
                 pass
         self._session = None
 
-    def _ocapi_headers(self, auth_token: str = "", encode_b64: bool = True) -> dict[str, str]:
-        """Build headers for Arlo OCAPI authentication endpoints."""
-        headers = {
+    def _mobile_device_headers(self) -> dict[str, str]:
+        """Return native Arlo Android app headers extracted from APK v7.5.1."""
+        dev_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, self.account_id or self.email or "domolink-arlo"))
+        return {
             "Accept": "application/json, text/plain, */*",
             "Auth-Version": "2",
             "Content-Type": "application/json; charset=UTF-8",
-            "Origin": ARLO_API_HOST,
-            "Referer": f"{ARLO_API_HOST}/",
-            "Source": "arloCamWeb",
+            "Source": "arloCamAndroid",
             "User-Agent": ARLO_DEFAULT_USER_AGENT,
+            "x-user-device-id": dev_id,
+            "x-user-device-name": "DomoLink-HA",
+            "x-user-device-type": "Android",
         }
+
+    def _ocapi_headers(self, auth_token: str = "", encode_b64: bool = True) -> dict[str, str]:
+        """Build headers for Arlo OCAPI authentication endpoints."""
+        headers = self._mobile_device_headers()
         if auth_token:
             headers["Authorization"] = _b64(auth_token) if encode_b64 else auth_token
         if self.cookie:
@@ -251,15 +254,8 @@ class ArloCloudAccountSession:
 
     def _hmsweb_headers(self, xcloud_id: str = "") -> dict[str, str]:
         """Build headers for Arlo HMSWeb API endpoints."""
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Auth-Version": "2",
-            "Authorization": self.token,
-            "Content-Type": "application/json; charset=UTF-8",
-            "Origin": ARLO_API_HOST,
-            "Referer": f"{ARLO_API_HOST}/",
-            "User-Agent": ARLO_DEFAULT_USER_AGENT,
-        }
+        headers = self._mobile_device_headers()
+        headers["Authorization"] = self.token
         target_xcloud = xcloud_id or self.xcloud_id
         if target_xcloud:
             headers["xcloudId"] = target_xcloud

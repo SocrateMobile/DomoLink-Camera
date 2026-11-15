@@ -354,6 +354,10 @@ class CameraManager:
     ) -> dict[str, Any]:
         """Start Arlo Cloud login flow (returns 2FA factors or connects directly)."""
         account_id = self._make_account_id(email, account_name)
+        stale_pending = self._pending_arlo_logins.pop(account_id, None)
+        if stale_pending:
+            await stale_pending.async_close()
+
         existing = self.arlo_sessions.get(account_id)
         session = ArloCloudAccountSession(
             account_id=account_id,
@@ -361,7 +365,11 @@ class CameraManager:
             name=account_name or (existing.name if existing else ""),
             hass=self.hass,
         )
-        res = await session.async_start_login(password)
+        try:
+            res = await session.async_start_login(password)
+        except Exception as err:
+            await session.async_close()
+            return {"status": "error", "error": str(err)}
         status = res.get("status")
 
         if status == "2fa_required":
@@ -369,6 +377,8 @@ class CameraManager:
             return res
 
         if status == "connected":
+            if existing and existing is not session:
+                await existing.async_close()
             self.arlo_sessions[account_id] = session
             self.arlo_accounts[account_id] = session.to_dict()
             sync_res = await self.async_arlo_sync_account(
@@ -444,7 +454,9 @@ class CameraManager:
         """Register or refresh an Arlo account directly using an Authorization token."""
         target_id = account_id.strip() or self._make_account_id(email, account_name)
         session = self.arlo_sessions.get(target_id)
+        created_new = False
         if not session:
+            created_new = True
             session = ArloCloudAccountSession(
                 account_id=target_id,
                 email=email,
@@ -465,9 +477,13 @@ class CameraManager:
                 cookie=cookie,
             )
         except Exception as err:
+            if created_new:
+                await session.async_close()
             return {"status": "error", "error": str(err)}
 
         if res.get("status") != "connected":
+            if created_new:
+                await session.async_close()
             return res
 
         self.arlo_sessions[target_id] = session
