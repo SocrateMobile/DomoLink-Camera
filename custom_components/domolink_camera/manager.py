@@ -28,8 +28,14 @@ from .const import (
 )
 from .drivers.arlo_cloud import ArloCloudAccountSession, ArloCloudDriver
 from .drivers.base import BaseCameraDriver
+from .drivers.cloud_accounts import (
+    PROVIDER_DRIVER_MAP,
+    ProviderAccountSession,
+    _read_ha_provider_entries_sync,
+    get_tuya_oem_brands_list,
+)
 from .drivers.generic_rtsp import GenericRtspDriver
-from .drivers.ha_proxy import HaProxyDriver
+from .drivers.ha_proxy import HaProxyDriver, _normalize_label
 from .drivers.ysxlite_pppp import YsxLiteDriver
 from .pairing import WifiPairingEngine
 from .box_detector import BoxDetectorService
@@ -64,6 +70,9 @@ class CameraManager:
         self.arlo_accounts: dict[str, dict[str, Any]] = {}
         self.arlo_sessions: dict[str, ArloCloudAccountSession] = {}
         self._pending_arlo_logins: dict[str, ArloCloudAccountSession] = {}
+        self.provider_accounts: dict[str, dict[str, Any]] = {}
+        self.provider_sessions: dict[str, ProviderAccountSession] = {}
+        self._pending_provider_logins: dict[str, ProviderAccountSession] = {}
         self.pairing_engine = WifiPairingEngine(hass)
         self.box_detector = BoxDetectorService(hass)
         self._listeners: list[Any] = []
@@ -92,6 +101,37 @@ class CameraManager:
                     cookie=str(acfg.get("cookie") or ""),
                 )
 
+            raw_providers = data.get("provider_accounts", {})
+            for aid, pcfg in raw_providers.items():
+                if not isinstance(pcfg, dict):
+                    continue
+                self.provider_accounts[aid] = pcfg
+                self.provider_sessions[aid] = ProviderAccountSession(
+                    account_id=str(pcfg.get("id") or aid),
+                    provider=str(pcfg.get("provider") or "tuya_oem"),
+                    name=str(pcfg.get("name") or ""),
+                    username=str(pcfg.get("username") or ""),
+                    password=str(pcfg.get("password") or ""),
+                    brand=str(pcfg.get("brand") or "smartlife"),
+                    country_code=str(pcfg.get("country_code") or "33"),
+                    host=str(pcfg.get("host") or ""),
+                    port=int(pcfg.get("port") or 80),
+                    rtsp_port=int(pcfg.get("rtsp_port") or 554),
+                    verification_code=str(pcfg.get("verification_code") or ""),
+                    region=str(pcfg.get("region") or "eu"),
+                    token=str(pcfg.get("token") or ""),
+                    refresh_token=str(pcfg.get("refresh_token") or ""),
+                    uid=str(pcfg.get("uid") or ""),
+                    account_num_id=str(pcfg.get("account_num_id") or ""),
+                    client_id=str(pcfg.get("client_id") or ""),
+                    hardware_id=str(pcfg.get("hardware_id") or ""),
+                    status=str(pcfg.get("status") or ("connected" if pcfg.get("token") else "disconnected")),
+                    last_sync=pcfg.get("last_sync"),
+                    last_error=str(pcfg.get("last_error") or ""),
+                    devices=list(pcfg.get("devices") or []),
+                    hass=self.hass,
+                )
+
             raw_cams = data.get("cameras", {})
             for cid, ccfg in raw_cams.items():
                 self.cameras[cid] = ccfg
@@ -108,6 +148,7 @@ class CameraManager:
         if self._has_local_aarlo_dir():
             asyncio.create_task(self.async_auto_import_aarlo_sessions())
             asyncio.create_task(self.async_auto_enrich_hybrid_cameras(delay=3.0))
+            asyncio.create_task(self.async_auto_import_ha_provider_accounts(delay=15.0))
 
     def _has_local_aarlo_dir(self) -> bool:
         """Return True when running inside HA with a concrete string .aarlo config path."""
@@ -210,12 +251,15 @@ class CameraManager:
         return updated
 
     async def async_save(self) -> None:
-        """Persist cameras, layout, and Arlo cloud accounts to disk."""
+        """Persist cameras, layout, and Cloud accounts to disk."""
         for aid, session in self.arlo_sessions.items():
             self.arlo_accounts[aid] = session.to_dict()
+        for aid, session in self.provider_sessions.items():
+            self.provider_accounts[aid] = session.to_dict()
         await self.store.async_save({
             "cameras": self.cameras,
             "arlo_accounts": self.arlo_accounts,
+            "provider_accounts": self.provider_accounts,
         })
 
     def _init_driver(self, camera_id: str, config: dict[str, Any]) -> BaseCameraDriver:
@@ -892,3 +936,368 @@ class CameraManager:
             await self.async_save()
             self._notify_listeners()
         return existed
+
+    # --- Multi-Brand Cloud / LAN Accounts (Tuya OEM, Blink, Ezviz, Reolink) ---
+
+    def _configured_provider_keys(self) -> set[str]:
+        """Collect all identifying keys of already registered cameras."""
+        keys: set[str] = set()
+        for c in self.cameras.values():
+            for k in ("device_id", "tuya_device_id", "ha_entity_id", "tuya_oem_entity_id", "host"):
+                v = str(c.get(k) or "").strip()
+                if v:
+                    keys.add(v)
+            lip = str(c.get("local_ip") or "").strip()
+            if lip:
+                keys.add(f"ip:{lip}")
+        return keys
+
+    def get_provider_accounts_list(self) -> dict[str, Any]:
+        """Return sanitized list of all multi-brand provider accounts and supported Tuya OEM apps."""
+        cfg = self._configured_provider_keys()
+        return {
+            "accounts": [sess.to_public_dict(cfg) for sess in self.provider_sessions.values()],
+            "tuya_oem_brands": get_tuya_oem_brands_list(),
+        }
+
+    def _make_provider_account_id(self, provider: str, identifier: str, account_name: str = "") -> str:
+        """Reuse an existing account ID or generate a clean unique ID for provider session."""
+        norm = (identifier or "").strip().lower()
+        for aid, sess in self.provider_sessions.items():
+            if sess.provider != provider:
+                continue
+            cand = (sess.username or sess.host or "").strip().lower()
+            if norm and cand == norm:
+                return aid
+        base = self._slugify(account_name or norm.split("@")[0], fallback=provider)
+        aid = f"prov_{provider}_{base}_{int(time.time())}"
+        while aid in self.provider_sessions:
+            aid = f"{aid}_x"
+        return aid
+
+    async def async_provider_start_login(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Initiate login or direct connection for Tuya OEM, Blink, Ezviz, or Reolink."""
+        provider = str(payload.get("provider") or "").strip().lower()
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "")
+        host = str(payload.get("host") or "").strip()
+        account_name = str(payload.get("account_name") or "").strip()
+        account_id = str(payload.get("account_id") or "").strip() or self._make_provider_account_id(
+            provider, username or host, account_name
+        )
+
+        stale = self._pending_provider_logins.pop(account_id, None)
+        if stale:
+            await stale.async_close()
+
+        session = ProviderAccountSession(
+            account_id=account_id,
+            provider=provider,
+            name=account_name,
+            username=username,
+            password=password,
+            brand=str(payload.get("brand") or "smartlife"),
+            country_code=str(payload.get("country_code") or "33"),
+            host=host,
+            port=int(payload.get("port") or 80),
+            rtsp_port=int(payload.get("rtsp_port") or 554),
+            verification_code=str(payload.get("verification_code") or ""),
+            region=str(payload.get("region") or "eu"),
+            hass=self.hass,
+        )
+        res = await session.async_start_login()
+        status = res.get("status")
+
+        if status == "2fa_required":
+            self._pending_provider_logins[account_id] = session
+            return res
+
+        if status == "connected":
+            existing = self.provider_sessions.get(account_id)
+            if existing and existing is not session:
+                await existing.async_close()
+            self.provider_sessions[account_id] = session
+            self.provider_accounts[account_id] = session.to_dict()
+            sync_res = await self.async_provider_sync_account(
+                account_id,
+                auto_add=bool(payload.get("auto_add", True)),
+                refresh_remote=False,
+            )
+            return {
+                "status": "connected",
+                "account": sync_res.get("account"),
+                "imported_count": sync_res.get("imported_count", 0),
+                "total_devices": sync_res.get("total_devices", 0),
+            }
+
+        await session.async_close()
+        return res
+
+    async def async_provider_verify_2fa(
+        self, session_id: str, otp_code: str, auto_add: bool = True
+    ) -> dict[str, Any]:
+        """Complete 2FA challenge for Blink or Ezviz and sync cameras."""
+        session = self._pending_provider_logins.get(session_id)
+        if not session:
+            return {"status": "error", "error": "Session 2FA introuvable ou expirée."}
+
+        res = await session.async_verify_2fa(otp_code)
+        if res.get("status") == "connected":
+            self._pending_provider_logins.pop(session_id, None)
+            existing = self.provider_sessions.get(session_id)
+            if existing and existing is not session:
+                await existing.async_close()
+            self.provider_sessions[session_id] = session
+            self.provider_accounts[session_id] = session.to_dict()
+            sync_res = await self.async_provider_sync_account(
+                session_id, auto_add=auto_add, refresh_remote=False
+            )
+            return {
+                "status": "connected",
+                "account": sync_res.get("account"),
+                "imported_count": sync_res.get("imported_count", 0),
+                "total_devices": sync_res.get("total_devices", 0),
+            }
+        return res
+
+    async def async_provider_sync_account(
+        self, account_id: str, auto_add: bool = True, refresh_remote: bool = True
+    ) -> dict[str, Any]:
+        """Sync cameras from a multi-brand provider session without duplicating existing cameras."""
+        session = self.provider_sessions.get(account_id)
+        if not session:
+            return {"status": "error", "error": "Compte fournisseur introuvable."}
+
+        if refresh_remote:
+            devices = await session.async_fetch_devices()
+        else:
+            devices = session.devices or await session.async_fetch_devices()
+
+        target_driver = PROVIDER_DRIVER_MAP.get(session.provider, DRIVER_HA_PROXY)
+        imported_count = 0
+
+        for dev in devices:
+            dev_id = str(dev.get("device_id") or "").strip()
+            tuya_id = str(dev.get("tuya_device_id") or "").strip()
+            ha_eid = str(dev.get("ha_entity_id") or "").strip()
+            oem_eid = str(dev.get("tuya_oem_entity_id") or "").strip()
+            local_ip = str(dev.get("local_ip") or "").strip()
+            dev_norm = _normalize_label(dev.get("name"))
+
+            existing_cid = None
+            for cid, cam in self.cameras.items():
+                if tuya_id and cam.get("tuya_device_id") == tuya_id:
+                    existing_cid = cid
+                    break
+                if dev_id and (cam.get("device_id") == dev_id or cam.get("host") == dev_id):
+                    existing_cid = cid
+                    break
+                if ha_eid and (cam.get("ha_entity_id") == ha_eid or cam.get("host") == ha_eid):
+                    existing_cid = cid
+                    break
+                if oem_eid and (cam.get("tuya_oem_entity_id") == oem_eid or cam.get("host") == oem_eid):
+                    existing_cid = cid
+                    break
+                if local_ip and cam.get("local_ip") == local_ip and cam.get("driver") == target_driver:
+                    existing_cid = cid
+                    break
+                if dev_norm and _normalize_label(cam.get("name")) == dev_norm and cam.get("driver") in (DRIVER_HA_PROXY, target_driver):
+                    existing_cid = cid
+                    break
+
+            if existing_cid:
+                cam = self.cameras[existing_cid]
+                old_drv = cam.get("driver")
+                if old_drv == DRIVER_HA_PROXY:
+                    cam["driver"] = target_driver
+                cam["provider_account_id"] = account_id
+                if tuya_id:
+                    cam["tuya_device_id"] = tuya_id
+                if oem_eid:
+                    cam["tuya_oem_entity_id"] = oem_eid
+                if ha_eid and not cam.get("ha_entity_id"):
+                    cam["ha_entity_id"] = ha_eid
+                if local_ip:
+                    cam["local_ip"] = local_ip
+                for fld in ("mac_address", "local_key", "rtsp_url", "model_id"):
+                    if dev.get(fld):
+                        cam[fld] = dev[fld]
+                if session.provider in ("ezviz", "reolink"):
+                    if session.username:
+                        cam["username"] = session.username
+                    if session.password:
+                        cam["password"] = session.password
+                    if session.verification_code:
+                        cam["verification_code"] = session.verification_code
+                if old_drv != cam.get("driver"):
+                    old_obj = self.drivers.get(existing_cid)
+                    if old_obj:
+                        try:
+                            await old_obj.async_disconnect()
+                        except Exception:
+                            pass
+                    new_drv = self._init_driver(existing_cid, cam)
+                    asyncio.create_task(new_drv.async_connect())
+            elif auto_add:
+                slug = self._slugify(dev.get("name") or dev_id or session.provider, fallback=session.provider)
+                cid = f"{session.provider}_{slug}"
+                if cid in self.cameras:
+                    cid = f"{cid}_{int(time.time())}"
+                max_order = max([c.get("order", 0) for c in self.cameras.values()], default=-1)
+                cam_host = ha_eid or oem_eid or local_ip or dev_id or session.host
+                cam_cfg: dict[str, Any] = {
+                    "id": cid,
+                    "name": dev.get("name") or f"Caméra {session.provider.upper()}",
+                    "description": f"{session.provider.upper()} {dev.get('model_id', '')}".strip(),
+                    "driver": target_driver,
+                    "host": cam_host,
+                    "port": int(dev.get("rtsp_port") or session.rtsp_port or 554),
+                    "provider_account_id": account_id,
+                    "device_id": dev_id,
+                    "tuya_device_id": tuya_id,
+                    "tuya_oem_entity_id": oem_eid,
+                    "ha_entity_id": ha_eid,
+                    "local_ip": local_ip,
+                    "mac_address": dev.get("mac_address", ""),
+                    "local_key": dev.get("local_key", ""),
+                    "rtsp_url": dev.get("rtsp_url", ""),
+                    "model_id": dev.get("model_id", session.provider.upper()),
+                    "brand": session.provider.upper(),
+                    "order": max_order + 1,
+                    "linked_entities": [],
+                }
+                if session.provider in ("ezviz", "reolink"):
+                    cam_cfg["username"] = session.username
+                    cam_cfg["password"] = session.password
+                    cam_cfg["verification_code"] = session.verification_code
+                self.cameras[cid] = cam_cfg
+                drv = self._init_driver(cid, cam_cfg)
+                asyncio.create_task(drv.async_connect())
+                imported_count += 1
+
+        self.provider_accounts[account_id] = session.to_dict()
+        await self.async_save()
+        self._notify_listeners()
+
+        return {
+            "status": "synced",
+            "account": session.to_public_dict(self._configured_provider_keys()),
+            "imported_count": imported_count,
+            "total_devices": len(devices),
+        }
+
+    async def async_provider_delete_account(
+        self, account_id: str, delete_cameras: bool = False
+    ) -> bool:
+        """Delete a multi-brand provider account session."""
+        session = self.provider_sessions.pop(account_id, None)
+        if session:
+            await session.async_close()
+        existed = account_id in self.provider_accounts or session is not None
+        self.provider_accounts.pop(account_id, None)
+        self._pending_provider_logins.pop(account_id, None)
+
+        if delete_cameras:
+            to_delete = [
+                cid for cid, cam in list(self.cameras.items()) if cam.get("provider_account_id") == account_id
+            ]
+            for cid in to_delete:
+                if cid in self.drivers:
+                    await self.drivers[cid].async_disconnect()
+                    del self.drivers[cid]
+                del self.cameras[cid]
+
+        if existed:
+            await self.async_save()
+            self._notify_listeners()
+        return existed
+
+    async def async_auto_import_ha_provider_accounts(self, delay: float = 0.0) -> int:
+        """Auto-import existing HA config entries for domolink_tuya_oem, blink, ezviz, reolink."""
+        if delay > 0:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return 0
+
+        if not self.hass or not hasattr(self.hass, "config") or not hasattr(self.hass.config, "path"):
+            return 0
+        try:
+            cfg_dir = self.hass.config.path()
+        except Exception:
+            return 0
+        if not isinstance(cfg_dir, str) or not cfg_dir:
+            return 0
+
+        if not callable(getattr(self.hass, "async_add_executor_job", None)):
+            return 0
+
+        try:
+            cache = await self.hass.async_add_executor_job(_read_ha_provider_entries_sync, cfg_dir)
+        except Exception as err:
+            _LOGGER.debug("Could not inspect HA config entries for auto-import: %s", err)
+            return 0
+
+        imported = 0
+        for entry in cache.get("entries") or []:
+            domain = entry.get("domain", "")
+            edata = entry.get("data") or {}
+            title = str(entry.get("title") or "").strip()
+
+            if domain == "domolink_tuya_oem":
+                prov = "tuya_oem"
+                uname = str(edata.get("username") or title or "").strip()
+                brand = str(edata.get("brand") or "tuya").strip().lower()
+                aid = self._make_provider_account_id(prov, uname, title or f"Tuya {brand}")
+                if aid not in self.provider_sessions:
+                    sess = ProviderAccountSession(
+                        account_id=aid,
+                        provider=prov,
+                        name=title or f"Tuya OEM ({brand})",
+                        username=uname,
+                        password=str(edata.get("password") or ""),
+                        brand=brand,
+                        country_code=str(edata.get("country_code") or "33"),
+                        uid=str(edata.get("uid") or ""),
+                        status="connected",
+                        hass=self.hass,
+                    )
+                    self.provider_sessions[aid] = sess
+                else:
+                    sess = self.provider_sessions[aid]
+                    sess.hass = self.hass
+                if not sess.devices or aid not in self.provider_accounts:
+                    await self.async_provider_sync_account(aid, auto_add=False, refresh_remote=True)
+                    imported += 1
+
+            elif domain == "blink":
+                prov = "blink"
+                uname = str(edata.get("username") or title or "blink").strip()
+                aid = self._make_provider_account_id(prov, uname, title or "Blink")
+                if aid not in self.provider_sessions:
+                    sess = ProviderAccountSession(
+                        account_id=aid,
+                        provider=prov,
+                        name=title or f"Blink ({uname})",
+                        username=uname,
+                        password=str(edata.get("password") or ""),
+                        host=str(edata.get("host") or ""),
+                        region=str(edata.get("region_id") or "prod"),
+                        token=str(edata.get("token") or ""),
+                        refresh_token=str(edata.get("refresh_token") or ""),
+                        uid=str(edata.get("uid") or ""),
+                        account_num_id=str(edata.get("account_id") or ""),
+                        client_id=str(edata.get("client_id") or ""),
+                        hardware_id=str(edata.get("hardware_id") or ""),
+                        status="connected" if edata.get("token") else "disconnected",
+                        hass=self.hass,
+                    )
+                    self.provider_sessions[aid] = sess
+                else:
+                    sess = self.provider_sessions[aid]
+                    sess.hass = self.hass
+                if not sess.devices or aid not in self.provider_accounts:
+                    await self.async_provider_sync_account(aid, auto_add=True, refresh_remote=True)
+                    imported += 1
+
+        return imported

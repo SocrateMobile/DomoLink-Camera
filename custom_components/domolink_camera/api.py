@@ -33,10 +33,15 @@ from .const import (
     WS_TYPE_GET_ARLO_ACCOUNTS,
     WS_TYPE_GET_CAMERAS,
     WS_TYPE_GET_ENTITIES,
+    WS_TYPE_GET_PROVIDER_ACCOUNTS,
     WS_TYPE_GET_TV_CHANNELS,
     WS_TYPE_GET_TV_STREAM,
     WS_TYPE_PAIR_STATUS,
     WS_TYPE_PIN_TV_CAMERA,
+    WS_TYPE_PROVIDER_DELETE_ACCOUNT,
+    WS_TYPE_PROVIDER_LOGIN,
+    WS_TYPE_PROVIDER_SYNC_ACCOUNT,
+    WS_TYPE_PROVIDER_VERIFY_2FA,
     WS_TYPE_REBOOT,
     WS_TYPE_SAVE_CAMERA,
     WS_TYPE_SAVE_LAYOUT,
@@ -824,6 +829,92 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         )
         connection.send_result(msg["id"], {"success": ok})
 
+    @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_GET_PROVIDER_ACCOUNTS})
+    @websocket_api.async_response
+    async def ws_get_provider_accounts(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        connection.send_result(msg["id"], mgr.get_provider_accounts_list())
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_PROVIDER_LOGIN,
+        vol.Required("provider"): str,
+        vol.Optional("account_name", default=""): str,
+        vol.Optional("username", default=""): str,
+        vol.Optional("password", default=""): str,
+        vol.Optional("brand", default="smartlife"): str,
+        vol.Optional("country_code", default="33"): str,
+        vol.Optional("host", default=""): str,
+        vol.Optional("port", default=80): int,
+        vol.Optional("rtsp_port", default=554): int,
+        vol.Optional("verification_code", default=""): str,
+        vol.Optional("region", default="eu"): str,
+        vol.Optional("account_id", default=""): str,
+        vol.Optional("auto_add", default=True): bool,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_provider_login(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        result = await mgr.async_provider_start_login(msg)
+        connection.send_result(msg["id"], result)
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_PROVIDER_VERIFY_2FA,
+        vol.Required("session_id"): str,
+        vol.Required("otp_code"): str,
+        vol.Optional("auto_add", default=True): bool,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_provider_verify_2fa(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        result = await mgr.async_provider_verify_2fa(
+            session_id=msg["session_id"],
+            otp_code=msg["otp_code"],
+            auto_add=msg.get("auto_add", True),
+        )
+        connection.send_result(msg["id"], result)
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_PROVIDER_SYNC_ACCOUNT,
+        vol.Required("account_id"): str,
+        vol.Optional("auto_add", default=True): bool,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_provider_sync_account(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        result = await mgr.async_provider_sync_account(
+            account_id=msg["account_id"],
+            auto_add=msg.get("auto_add", True),
+        )
+        connection.send_result(msg["id"], result)
+
+    @websocket_api.websocket_command({
+        vol.Required("type"): WS_TYPE_PROVIDER_DELETE_ACCOUNT,
+        vol.Required("account_id"): str,
+        vol.Optional("delete_cameras", default=False): bool,
+    })
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_provider_delete_account(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+    ) -> None:
+        mgr = hass.data[DOMAIN]["manager"]
+        ok = await mgr.async_provider_delete_account(
+            account_id=msg["account_id"],
+            delete_cameras=msg.get("delete_cameras", False),
+        )
+        connection.send_result(msg["id"], {"success": ok})
+
     websocket_api.async_register_command(hass, ws_get_cameras)
     websocket_api.async_register_command(hass, ws_save_layout)
     websocket_api.async_register_command(hass, ws_save_camera)
@@ -848,3 +939,8 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_arlo_save_token)
     websocket_api.async_register_command(hass, ws_arlo_sync_account)
     websocket_api.async_register_command(hass, ws_arlo_delete_account)
+    websocket_api.async_register_command(hass, ws_get_provider_accounts)
+    websocket_api.async_register_command(hass, ws_provider_login)
+    websocket_api.async_register_command(hass, ws_provider_verify_2fa)
+    websocket_api.async_register_command(hass, ws_provider_sync_account)
+    websocket_api.async_register_command(hass, ws_provider_delete_account)
