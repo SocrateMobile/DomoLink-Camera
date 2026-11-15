@@ -552,6 +552,255 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
         # Only one UDP snapshot request should have been dispatched for both waiters
         drv._send_pppp_cmd.assert_awaited_once()
 
+    async def test_arlo_option2_lan_metadata_and_stream_candidates(self) -> None:
+        """Verify LAN metadata extraction and Option 2 Cloud wakeup + local RTSP priority."""
+        from custom_components.domolink_camera.drivers.arlo_cloud import normalize_arlo_device
+
+        raw_dev = {
+            "deviceId": "AGC123456",
+            "parentId": "AGC123456",
+            "xCloudId": "XC_TEST",
+            "deviceName": "Façade",
+            "deviceType": "camera",
+            "modelId": "VMC3050A",
+            "properties": {
+                "batteryLevel": 82,
+                "signalStrength": 4,
+                "connectivity": [
+                    {
+                        "type": "wifi",
+                        "connected": True,
+                        "ipAddr": "192.168.1.182",
+                        "macAddr": "AA:BB:CC:DD:EE:FF",
+                        "ssid": "Freebox-LAN",
+                        "wifiRssi": -54,
+                    }
+                ],
+            },
+        }
+        norm = normalize_arlo_device(raw_dev, account_id="acc1", email="test@example.com")
+        self.assertIsNotNone(norm)
+        assert norm is not None
+        self.assertEqual(norm["local_ip"], "192.168.1.182")
+        self.assertEqual(norm["mac_address"], "AA:BB:CC:DD:EE:FF")
+        self.assertEqual(norm["wifi_ssid"], "Freebox-LAN")
+        self.assertEqual(norm["wifi_rssi"], -54)
+        self.assertTrue(norm["local_streaming_supported"])
+
+        sess = ArloCloudAccountSession(
+            account_id="acc1",
+            email="test@example.com",
+            token="TOK_OK",
+            user_id="USR_1",
+            xcloud_id="XC_TEST",
+        )
+        sess.devices = [norm]
+        sess.async_start_camera_stream = AsyncMock(return_value="rtsps://cloud.arlo.com/stream")
+
+        # Case A: Local port 554 open after Cloud wakeup -> local LAN candidates come first
+        with patch.object(sess, "_probe_local_rtsp_port", new=AsyncMock(return_value=True)):
+            cands_open = await sess.async_get_stream_candidates("AGC123456")
+        self.assertEqual(
+            cands_open,
+            [
+                ("rtsps://192.168.1.182:554/AGC123456/tcp/avc", "local_lan"),
+                ("rtsp://192.168.1.182:554/AGC123456/tcp/avc", "local_lan"),
+                ("rtsps://cloud.arlo.com/stream", "cloud_hybrid"),
+            ],
+        )
+
+        # Case B: Explicit localURI from startStream + port 554 closed -> explicit localURI + cloud
+        sess._last_local_uri["AGC123456"] = "rtsps://192.168.1.182:554/custom"
+        with patch.object(sess, "_probe_local_rtsp_port", new=AsyncMock(return_value=False)):
+            cands_uri = await sess.async_get_stream_candidates("AGC123456")
+        self.assertEqual(
+            cands_uri,
+            [
+                ("rtsps://192.168.1.182:554/custom", "local_lan"),
+                ("rtsps://cloud.arlo.com/stream", "cloud_hybrid"),
+            ],
+        )
+
+        # Case C: Port 554 closed and no localURI -> pure Cloud fallback
+        sess._last_local_uri.clear()
+        with patch.object(sess, "_probe_local_rtsp_port", new=AsyncMock(return_value=False)):
+            cands_cloud = await sess.async_get_stream_candidates("AGC123456")
+        self.assertEqual(cands_cloud, [("rtsps://cloud.arlo.com/stream", "cloud_hybrid")])
+
+    async def test_arlo_aarlo_session_adoption_and_401_refresh(self) -> None:
+        """Verify .aarlo session reuse avoids OCAPI Cloudflare and auto-refreshes stale 401 tokens."""
+        import pickle
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            aarlo_dir = os.path.join(tmpdir, ".aarlo")
+            os.makedirs(aarlo_dir, exist_ok=True)
+            with open(os.path.join(aarlo_dir, "session.pickle"), "wb") as f:
+                pickle.dump(
+                    {
+                        "user@example.com": {
+                            "token": "FRESH_AARLO_TOK",
+                            "user_id": "UID_42",
+                        }
+                    },
+                    f,
+                )
+            with open(os.path.join(aarlo_dir, "cookies.txt"), "w", encoding="utf-8") as f:
+                f.write("#LWP-Cookies-2.0\n")
+
+            self.mock_hass.config.path = MagicMock(side_effect=lambda p: os.path.join(tmpdir, p))
+
+            sess = ArloCloudAccountSession(
+                account_id="acc_aarlo",
+                email="user@example.com",
+                hass=self.mock_hass,
+            )
+
+            async def ok_devices(self_obj, url, headers):
+                if headers.get("Authorization") == "FRESH_AARLO_TOK":
+                    return 200, {
+                        "success": True,
+                        "data": [
+                            {
+                                "deviceId": "DEV_LAN",
+                                "deviceName": "Cuisine",
+                                "deviceType": "camera",
+                                "modelId": "VMC3050A",
+                                "properties": {
+                                    "connectivity": [{"ipAddr": "192.168.1.90", "connected": True}]
+                                },
+                            }
+                        ],
+                    }, "{}"
+                return 401, {"success": False}, "{}"
+
+            with patch.object(
+                ArloCloudAccountSession,
+                "_get_json",
+                autospec=True,
+                side_effect=ok_devices,
+            ), patch.object(
+                ArloCloudAccountSession,
+                "_post_json",
+                autospec=True,
+                side_effect=AssertionError("OCAPI /api/auth should not be called when .aarlo is valid"),
+            ):
+                login_res = await sess.async_start_login("password123")
+
+            self.assertEqual(login_res["status"], "connected")
+            self.assertTrue(login_res.get("adopted_from_aarlo"))
+            self.assertEqual(sess.token, "FRESH_AARLO_TOK")
+            self.assertEqual(len(sess.devices), 1)
+
+            # Now test stale token auto-refresh on 401
+            sess.token = "STALE_BROWSER_TOK"
+            with patch.object(
+                ArloCloudAccountSession,
+                "_get_json",
+                autospec=True,
+                side_effect=ok_devices,
+            ):
+                devs = await sess.async_fetch_devices()
+
+            self.assertEqual(sess.token, "FRESH_AARLO_TOK")
+            self.assertEqual(len(devs), 1)
+            self.assertEqual(devs[0]["local_ip"], "192.168.1.90")
+
+    async def test_arlo_sync_upgrades_matching_ha_proxy_camera(self) -> None:
+        """Verify syncing Arlo upgrades matching ha_proxy camera in-place with LAN info."""
+        from custom_components.domolink_camera.const import DRIVER_HA_PROXY
+
+        mgr = CameraManager(self.mock_hass)
+        mgr.store.async_save = AsyncMock()
+        mgr.cameras["cam_facade_old"] = {
+            "id": "cam_facade_old",
+            "name": "Façade",
+            "driver": DRIVER_HA_PROXY,
+            "host": "camera.aarlo_facade",
+            "order": 0,
+            "linked_entities": ["light.porche"],
+        }
+        mgr._init_driver("cam_facade_old", mgr.cameras["cam_facade_old"])
+
+        st_cam = MagicMock()
+        st_cam.entity_id = "camera.aarlo_facade"
+        st_cam.name = "Façade"
+        st_cam.attributes = {"friendly_name": "Façade"}
+        self.mock_hass.states.async_all.return_value = [st_cam]
+
+        sess = ArloCloudAccountSession(
+            account_id="acc_main",
+            email="main@example.com",
+            token="TOK_SYNC",
+        )
+        sess.devices = [
+            {
+                "device_id": "AGC13B71E0940",
+                "parent_id": "AGC13B71E0940",
+                "xcloud_id": "XC1",
+                "name": "Façade",
+                "model_id": "VMC3050A",
+                "local_ip": "192.168.1.182",
+                "mac_address": "11:22:33:44:55:66",
+                "wifi_ssid": "MonWiFi",
+                "wifi_rssi": -50,
+            }
+        ]
+        mgr.arlo_sessions["acc_main"] = sess
+
+        with patch.object(ArloCloudDriver, "async_connect", return_value=True):
+            res = await mgr.async_arlo_sync_account("acc_main", auto_add=True, refresh_remote=False)
+
+        self.assertEqual(res["status"], "synced")
+        self.assertIn("cam_facade_old", mgr.cameras)
+        self.assertEqual(len(mgr.cameras), 1)
+        cam = mgr.cameras["cam_facade_old"]
+        self.assertEqual(cam["driver"], DRIVER_ARLO_CLOUD)
+        self.assertEqual(cam["arlo_device_id"], "AGC13B71E0940")
+        self.assertEqual(cam["ha_entity_id"], "camera.aarlo_facade")
+        self.assertEqual(cam["local_ip"], "192.168.1.182")
+        self.assertEqual(cam["linked_entities"], ["light.porche"])
+        self.assertIsInstance(mgr.drivers["cam_facade_old"], ArloCloudDriver)
+
+        # Also test early-boot fallback (empty hass.states) & duplicate merge when both exist
+        self.mock_hass.states.async_all.return_value = []
+        mgr2 = CameraManager(self.mock_hass)
+        mgr2.store.async_save = AsyncMock()
+        mgr2.cameras["cam_cuisine_old"] = {
+            "id": "cam_cuisine_old",
+            "name": "Cuisine",
+            "driver": DRIVER_HA_PROXY,
+            "host": "camera.aarlo_cuisine",
+            "order": 2,
+            "linked_entities": [],
+        }
+        mgr2.cameras["arlo_dup"] = {
+            "id": "arlo_dup",
+            "name": "Cuisine",
+            "driver": DRIVER_ARLO_CLOUD,
+            "host": "AGC13B7EE0A66",
+            "arlo_device_id": "AGC13B7EE0A66",
+            "order": 12,
+            "linked_entities": [],
+        }
+        sess2 = ArloCloudAccountSession(account_id="acc_main", email="main@example.com", token="TOK")
+        sess2.devices = [{
+            "device_id": "AGC13B7EE0A66",
+            "parent_id": "AGC13B7EE0A66",
+            "xcloud_id": "XC2",
+            "name": "Cuisine",
+            "model_id": "VMC3050A",
+            "local_ip": "192.168.1.150",
+        }]
+        mgr2.arlo_sessions["acc_main"] = sess2
+        with patch.object(ArloCloudDriver, "async_connect", return_value=True):
+            await mgr2.async_arlo_sync_account("acc_main", auto_add=True, refresh_remote=False)
+
+        self.assertEqual(list(mgr2.cameras.keys()), ["cam_cuisine_old"])
+        self.assertEqual(mgr2.cameras["cam_cuisine_old"]["driver"], DRIVER_ARLO_CLOUD)
+        self.assertEqual(mgr2.cameras["cam_cuisine_old"]["ha_entity_id"], "camera.aarlo_cuisine")
+        self.assertEqual(mgr2.cameras["cam_cuisine_old"]["local_ip"], "192.168.1.150")
+
 
 if __name__ == "__main__":
     unittest.main()
