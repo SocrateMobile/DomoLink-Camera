@@ -99,6 +99,110 @@ class CameraManager:
         for driver in self.drivers.values():
             asyncio.create_task(driver.async_connect())
 
+        # Automatically reuse valid HA .aarlo sessions if present on disk
+        if self._has_local_aarlo_dir():
+            asyncio.create_task(self.async_auto_import_aarlo_sessions())
+
+    def _has_local_aarlo_dir(self) -> bool:
+        """Return True when running inside HA with a concrete string .aarlo config path."""
+        if self.hass and hasattr(self.hass, "config") and hasattr(self.hass.config, "path"):
+            try:
+                p = self.hass.config.path(".aarlo")
+                return isinstance(p, str) and bool(p)
+            except Exception:
+                return False
+        return False
+
+    async def async_auto_import_aarlo_sessions(self) -> int:
+        """Import or refresh active Arlo sessions from HA's .aarlo cache on startup."""
+        if not self._has_local_aarlo_dir():
+            return 0
+
+        probe = ArloCloudAccountSession(account_id="__aarlo_probe__", email="", hass=self.hass)
+        try:
+            cache = await probe.async_load_local_aarlo_cache()
+        finally:
+            await probe.async_close()
+
+        sessions_map = cache.get("sessions") or {}
+        if not sessions_map:
+            return 0
+
+        updated = 0
+        for email_key, sess_info in sessions_map.items():
+            tok = str(sess_info.get("token") or "").strip()
+            email_val = str(sess_info.get("email") or email_key).strip()
+            if not tok or not email_val:
+                continue
+
+            existing_aid = None
+            for aid, s in self.arlo_sessions.items():
+                if s.email.strip().lower() == email_key:
+                    existing_aid = aid
+                    break
+
+            if existing_aid:
+                sess = self.arlo_sessions[existing_aid]
+                if sess.devices:
+                    await self.async_arlo_sync_account(
+                        existing_aid, auto_add=True, refresh_remote=False
+                    )
+                    updated += 1
+                if sess.token == tok and sess.status == "connected":
+                    try:
+                        await sess.async_fetch_devices()
+                        await self.async_arlo_sync_account(
+                            existing_aid, auto_add=True, refresh_remote=False
+                        )
+                        updated += 1
+                    except Exception as err:
+                        _LOGGER.debug("Existing .aarlo session refresh failed for %s: %s", email_val, err)
+                    continue
+
+                sess.token = tok
+                if sess_info.get("user_id"):
+                    sess.user_id = str(sess_info["user_id"])
+                if cache.get("cookie_header") and not sess.cookie:
+                    sess.cookie = str(cache["cookie_header"])
+                try:
+                    await sess.async_fetch_devices()
+                    await self.async_arlo_sync_account(
+                        existing_aid, auto_add=True, refresh_remote=False
+                    )
+                    updated += 1
+                except Exception as err:
+                    _LOGGER.debug("Skipped .aarlo refresh for %s: %s", email_val, err)
+                continue
+
+            aid = self._make_account_id(email_val)
+            sess = ArloCloudAccountSession(
+                account_id=aid,
+                email=email_val,
+                name=f"Arlo ({email_val})",
+                token=tok,
+                user_id=str(sess_info.get("user_id") or ""),
+                hass=self.hass,
+                cookie=str(cache.get("cookie_header") or ""),
+            )
+            try:
+                await sess.async_fetch_devices()
+            except Exception as err:
+                _LOGGER.debug("Skipping stale .aarlo session for %s: %s", email_val, err)
+                await sess.async_close()
+                continue
+
+            self.arlo_sessions[aid] = sess
+            self.arlo_accounts[aid] = sess.to_dict()
+            await self.async_arlo_sync_account(aid, auto_add=True, refresh_remote=False)
+            _LOGGER.info(
+                "Auto-imported active Arlo session '%s' (%d camera(s)) from .aarlo",
+                email_val,
+                len(sess.devices),
+            )
+            updated += 1
+
+        return updated
+
     async def async_save(self) -> None:
         """Persist cameras, layout, and Arlo cloud accounts to disk."""
         for aid, session in self.arlo_sessions.items():
@@ -477,14 +581,24 @@ class CameraManager:
                 cookie=cookie,
             )
         except Exception as err:
-            if created_new:
-                await session.async_close()
-            return {"status": "error", "error": str(err)}
+            adopted = False
+            if "401" in str(err) or "403" in str(err):
+                adopted = await session.async_try_adopt_local_aarlo_session(test_connection=True)
+            if adopted:
+                res = {"status": "connected", "devices": session.devices}
+            else:
+                if created_new:
+                    await session.async_close()
+                return {"status": "error", "error": str(err)}
 
         if res.get("status") != "connected":
-            if created_new:
-                await session.async_close()
-            return res
+            adopted = await session.async_try_adopt_local_aarlo_session(test_connection=True)
+            if adopted:
+                res = {"status": "connected", "devices": session.devices}
+            else:
+                if created_new:
+                    await session.async_close()
+                return res
 
         self.arlo_sessions[target_id] = session
         self.arlo_accounts[target_id] = session.to_dict()
@@ -523,6 +637,7 @@ class CameraManager:
         if auto_add:
             for dev in devices:
                 dev_id = str(dev["device_id"])
+                dev_slug = self._slugify(dev["name"], fallback="")
                 ha_ent = self._find_matching_ha_arlo_entity(dev["name"], dev_id)
                 existing_cid = None
                 for cid, cam in self.cameras.items():
@@ -530,18 +645,84 @@ class CameraManager:
                         existing_cid = cid
                         break
 
+                ha_match_cid = None
+                for cid, cam in self.cameras.items():
+                    if cid == existing_cid:
+                        continue
+                    c_host = str(cam.get("host") or "").lower()
+                    c_ha_ent = str(cam.get("ha_entity_id") or "").lower()
+                    if ha_ent and (c_ha_ent == ha_ent.lower() or c_host == ha_ent.lower()):
+                        ha_match_cid = cid
+                        break
+                    if cam.get("driver") == DRIVER_HA_PROXY and (
+                        "aarlo" in c_host or "arlo" in c_host
+                    ):
+                        c_name_slug = self._slugify(cam.get("name", ""), fallback="")
+                        if dev_id.lower() in c_host or (
+                            dev_slug and (c_name_slug == dev_slug or dev_slug in c_host)
+                        ):
+                            ha_match_cid = cid
+                            if not ha_ent and c_host.startswith("camera."):
+                                ha_ent = str(cam.get("host") or "")
+                            break
+
+                stale_dup_cid = None
+                if existing_cid and ha_match_cid:
+                    dup_cam = self.cameras.get(existing_cid, {})
+                    orig_cam = self.cameras.get(ha_match_cid, {})
+                    if orig_cam.get("order", 999) <= dup_cam.get("order", 999):
+                        stale_dup_cid = existing_cid
+                        existing_cid = ha_match_cid
+                    else:
+                        stale_dup_cid = ha_match_cid
+                elif not existing_cid and ha_match_cid:
+                    existing_cid = ha_match_cid
+
+                if stale_dup_cid and stale_dup_cid in self.cameras:
+                    if stale_dup_cid in self.drivers:
+                        try:
+                            await self.drivers[stale_dup_cid].async_disconnect()
+                        except Exception:
+                            pass
+                        del self.drivers[stale_dup_cid]
+                    self.cameras.pop(stale_dup_cid, None)
+
                 if existing_cid:
                     cam = self.cameras[existing_cid]
+                    was_cloud_driver = cam.get("driver") == DRIVER_ARLO_CLOUD
+                    cam["driver"] = DRIVER_ARLO_CLOUD
+                    cam["host"] = dev_id
+                    cam["port"] = 443
                     cam["arlo_account_id"] = account_id
                     cam["account_email"] = session.email
+                    cam["arlo_device_id"] = dev_id
                     cam["parent_id"] = dev.get("parent_id", dev_id)
                     cam["xcloud_id"] = dev.get("xcloud_id", "")
                     cam["model_id"] = dev.get("model_id", cam.get("model_id", "Arlo"))
-                    if ha_ent and not cam.get("ha_entity_id"):
+                    if dev.get("local_ip"):
+                        cam["local_ip"] = dev["local_ip"]
+                    if dev.get("mac_address"):
+                        cam["mac_address"] = dev["mac_address"]
+                    if dev.get("wifi_ssid"):
+                        cam["wifi_ssid"] = dev["wifi_ssid"]
+                    if dev.get("wifi_rssi") is not None:
+                        cam["wifi_rssi"] = dev["wifi_rssi"]
+                    if ha_ent:
                         cam["ha_entity_id"] = ha_ent
                     drv = self.drivers.get(existing_cid)
-                    if isinstance(drv, ArloCloudDriver):
+                    if isinstance(drv, ArloCloudDriver) and was_cloud_driver:
                         drv.account_session = session
+                        drv.config = cam
+                        if dev.get("local_ip"):
+                            drv.local_ip = str(dev["local_ip"])
+                    else:
+                        if drv is not None:
+                            try:
+                                await drv.async_disconnect()
+                            except Exception:
+                                pass
+                        new_drv = self._init_driver(existing_cid, cam)
+                        asyncio.create_task(new_drv.async_connect())
                 else:
                     slug = self._slugify(dev["device_id"], fallback="arlo")
                     cid = f"arlo_{slug}"
@@ -562,6 +743,10 @@ class CameraManager:
                         "model_id": dev.get("model_id", "Arlo"),
                         "account_email": session.email,
                         "ha_entity_id": ha_ent,
+                        "local_ip": dev.get("local_ip", ""),
+                        "mac_address": dev.get("mac_address", ""),
+                        "wifi_ssid": dev.get("wifi_ssid", ""),
+                        "wifi_rssi": dev.get("wifi_rssi"),
                         "order": max_order + 1,
                         "linked_entities": [],
                     }

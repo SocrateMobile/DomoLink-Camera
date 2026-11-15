@@ -9,9 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.cookiejar
 import json
 import logging
+import os
+import pickle
+import ssl
 import time
+import urllib.parse
 import uuid
 from typing import Any, Callable
 
@@ -80,6 +85,115 @@ def _clean_arlo_token(raw_token: str) -> str:
     return tok
 
 
+def _extract_aarlo_devices_from_pickle(
+    raw_pickle: dict[str, Any], user_id_filter: str = ""
+) -> list[dict[str, Any]]:
+    """Convert .aarlo/aarlo.pickle key-value store into raw HMSWeb-compatible device dicts."""
+    if not isinstance(raw_pickle, dict):
+        return []
+    grouped: dict[str, dict[str, Any]] = {}
+    for key, val in raw_pickle.items():
+        if not isinstance(key, str):
+            continue
+        parts = key.split("/")
+        if len(parts) != 3:
+            continue
+        _, dev_id, prop = parts
+        grouped.setdefault(dev_id, {"deviceId": dev_id})[prop] = val
+
+    devices: list[dict[str, Any]] = []
+    for dev_id, props in grouped.items():
+        if not props.get("deviceType"):
+            continue
+        if user_id_filter and props.get("userId") and str(props["userId"]) != str(user_id_filter):
+            continue
+        raw = {
+            "deviceId": props.get("deviceId") or dev_id,
+            "parentId": props.get("parentId") or dev_id,
+            "deviceType": props.get("deviceType"),
+            "deviceName": props.get("deviceName") or f"Arlo {dev_id}",
+            "modelId": props.get("modelId") or "Arlo",
+            "xCloudId": props.get("xCloudId") or "",
+            "userId": props.get("userId") or "",
+            "uniqueId": props.get("uniqueId") or "",
+            "presignedLastImageUrl": props.get("presignedLastImageUrl") or "",
+            "presignedFullFrameSnapshotUrl": props.get("presignedFullFrameSnapshotUrl") or "",
+            "properties": {
+                "connectionState": props.get("connectionState") or "available",
+                "batteryLevel": props.get("batteryLevel"),
+                "signalStrength": props.get("signalStrength"),
+                "chargingState": props.get("chargingState"),
+                "connectivity": props.get("connectivity"),
+            },
+        }
+        devices.append(raw)
+    return devices
+
+
+def _read_local_aarlo_cache_sync(aarlo_dir: str) -> dict[str, Any]:
+    """Read Home Assistant's local .aarlo directory caches synchronously (executor-only)."""
+    if not aarlo_dir or not isinstance(aarlo_dir, str) or not os.path.isdir(aarlo_dir):
+        return {}
+
+    result: dict[str, Any] = {
+        "sessions": {},
+        "cookies": [],
+        "cookie_header": "",
+        "devices_raw": [],
+    }
+
+    session_path = os.path.join(aarlo_dir, "session.pickle")
+    if os.path.isfile(session_path):
+        try:
+            with open(session_path, "rb") as f:
+                raw_sess = pickle.load(f)
+            if isinstance(raw_sess, dict):
+                for key, val in raw_sess.items():
+                    if isinstance(val, dict) and val.get("token"):
+                        result["sessions"][str(key).strip().lower()] = {
+                            "email": str(key).strip(),
+                            "token": _clean_arlo_token(str(val.get("token") or "")),
+                            "user_id": str(val.get("user_id") or ""),
+                            "expires_in": val.get("expires_in"),
+                            "device_id": str(val.get("device_id") or ""),
+                            "browser_auth_code": str(val.get("browser_auth_code") or ""),
+                        }
+        except Exception as err:
+            _LOGGER.debug("Failed reading .aarlo/session.pickle: %s", err)
+
+    cookies_path = os.path.join(aarlo_dir, "cookies.txt")
+    if os.path.isfile(cookies_path):
+        cookie_pairs: list[str] = []
+        cookie_objs: list[dict[str, Any]] = []
+        try:
+            jar = http.cookiejar.LWPCookieJar(cookies_path)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            for c in jar:
+                cookie_objs.append({
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain,
+                    "path": c.path,
+                    "secure": bool(c.secure),
+                })
+                cookie_pairs.append(f"{c.name}={c.value}")
+        except Exception as err:
+            _LOGGER.debug("LWPCookieJar parse failed for %s: %s", cookies_path, err)
+        result["cookies"] = cookie_objs
+        result["cookie_header"] = "; ".join(cookie_pairs)
+
+    aarlo_pickle_path = os.path.join(aarlo_dir, "aarlo.pickle")
+    if os.path.isfile(aarlo_pickle_path):
+        try:
+            with open(aarlo_pickle_path, "rb") as f:
+                raw_aarlo = pickle.load(f)
+            result["devices_raw"] = _extract_aarlo_devices_from_pickle(raw_aarlo)
+        except Exception as err:
+            _LOGGER.debug("Failed reading .aarlo/aarlo.pickle: %s", err)
+
+    return result
+
+
 def normalize_arlo_device(
     raw: dict[str, Any],
     account_id: str = "",
@@ -101,6 +215,30 @@ def normalize_arlo_device(
     props = raw.get("properties") or {}
     if not isinstance(props, dict):
         props = {}
+
+    local_ip = ""
+    mac_addr = ""
+    wifi_ssid = ""
+    wifi_rssi = None
+    conn_list = props.get("connectivity")
+    if conn_list is None:
+        conn_list = raw.get("connectivity")
+    if isinstance(conn_list, dict):
+        conn_list = [conn_list]
+    if isinstance(conn_list, list):
+        for entry in conn_list:
+            if not isinstance(entry, dict):
+                continue
+            cand_ip = str(entry.get("ipAddr") or entry.get("ip") or entry.get("localIp") or "").strip()
+            if cand_ip and not local_ip:
+                local_ip = cand_ip
+                mac_addr = str(entry.get("macAddr") or entry.get("mac") or "").strip()
+                wifi_ssid = str(entry.get("ssid") or "").strip()
+                wifi_rssi = entry.get("wifiRssi")
+                if entry.get("connected"):
+                    break
+    if not local_ip:
+        local_ip = str(props.get("localIpAddress") or raw.get("localIpAddress") or "").strip()
 
     parent_id = str(raw.get("parentId") or device_id)
     xcloud_id = str(raw.get("xCloudId") or raw.get("xcloudId") or "")
@@ -124,6 +262,11 @@ def normalize_arlo_device(
         "battery_level": props.get("batteryLevel"),
         "signal_strength": props.get("signalStrength"),
         "charging_state": props.get("chargingState"),
+        "local_ip": local_ip,
+        "mac_address": mac_addr,
+        "wifi_ssid": wifi_ssid,
+        "wifi_rssi": wifi_rssi,
+        "local_streaming_supported": bool(local_ip),
         "presigned_last_image_url": raw.get("presignedLastImageUrl") or "",
         "presigned_snapshot_url": raw.get("presignedFullFrameSnapshotUrl") or "",
     }
@@ -170,6 +313,10 @@ class ArloCloudAccountSession:
         self._session: aiohttp.ClientSession | None = None
         self._last_device_refresh: float = 0.0
         self._auth_lock = asyncio.Lock()
+        self._aarlo_cache_loaded: bool = False
+        self._aarlo_cookies: list[dict[str, Any]] = []
+        self._last_local_uri: dict[str, str] = {}
+        self._adopting_from_aarlo: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize account metadata and persistent token for Home Assistant Store."""
@@ -211,11 +358,18 @@ class ArloCloudAccountSession:
         }
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Return isolated per-account aiohttp session so cookies never bleed across accounts."""
+        """Return isolated per-account aiohttp session with prime256v1 TLS curve."""
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=15.0)
+            ssl_ctx = ssl.create_default_context()
+            try:
+                ssl_ctx.set_ecdh_curve("prime256v1")
+            except Exception:
+                pass
+            connector = aiohttp.TCPConnector(ssl=ssl_ctx)
             self._session = aiohttp.ClientSession(
                 timeout=timeout,
+                connector=connector,
                 cookie_jar=aiohttp.CookieJar(),
             )
         return self._session
@@ -228,6 +382,104 @@ class ArloCloudAccountSession:
             except Exception:
                 pass
         self._session = None
+
+    def _resolve_aarlo_dir(self) -> str:
+        """Safely resolve HA .aarlo folder path if available (returns '' in offline mocks)."""
+        if self.hass and hasattr(self.hass, "config") and hasattr(self.hass.config, "path"):
+            try:
+                path_val = self.hass.config.path(".aarlo")
+                if isinstance(path_val, str):
+                    return path_val
+            except Exception:
+                pass
+        return ""
+
+    async def async_load_local_aarlo_cache(self) -> dict[str, Any]:
+        """Load Home Assistant's .aarlo session/cookies/device cache without blocking the event loop."""
+        aarlo_dir = self._resolve_aarlo_dir()
+        if not aarlo_dir:
+            return {}
+        if self.hass and hasattr(self.hass, "async_add_executor_job"):
+            cache = await self.hass.async_add_executor_job(_read_local_aarlo_cache_sync, aarlo_dir)
+        else:
+            cache = await asyncio.to_thread(_read_local_aarlo_cache_sync, aarlo_dir)
+        if cache.get("cookies"):
+            self._aarlo_cookies = list(cache["cookies"])
+        if cache.get("cookie_header") and not self.cookie:
+            self.cookie = str(cache["cookie_header"])
+        self._aarlo_cache_loaded = True
+        return cache
+
+    async def _async_refresh_token_from_aarlo_cache(self) -> bool:
+        """Adopt a fresher token/cookie from .aarlo/session.pickle if available."""
+        cache = await self.async_load_local_aarlo_cache()
+        sessions = cache.get("sessions") or {}
+        if not sessions:
+            return False
+
+        target_email = self.email.strip().lower()
+        sess_info = sessions.get(target_email) if target_email else None
+        if not sess_info and len(sessions) == 1 and not target_email:
+            sess_info = next(iter(sessions.values()))
+        elif not sess_info and self.user_id:
+            for item in sessions.values():
+                if str(item.get("user_id") or "") == self.user_id:
+                    sess_info = item
+                    break
+
+        if not sess_info or not sess_info.get("token"):
+            return False
+
+        new_tok = _clean_arlo_token(str(sess_info["token"]))
+        if not new_tok or new_tok == self.token:
+            return False
+
+        self.token = new_tok
+        if sess_info.get("user_id"):
+            self.user_id = str(sess_info["user_id"])
+        if sess_info.get("email") and not self.email:
+            self.email = str(sess_info["email"])
+        return True
+
+    async def async_try_adopt_local_aarlo_session(self, test_connection: bool = True) -> bool:
+        """Adopt active .aarlo session for this email (prevents single-session kickouts)."""
+        if self._adopting_from_aarlo:
+            return False
+        self._adopting_from_aarlo = True
+        try:
+            cache = await self.async_load_local_aarlo_cache()
+            sessions = cache.get("sessions") or {}
+            if not sessions:
+                return False
+
+            target_email = self.email.strip().lower()
+            sess_info = sessions.get(target_email) if target_email else None
+            if not sess_info and not target_email:
+                # Pick newest valid token in cache
+                for item in sessions.values():
+                    if item.get("token"):
+                        sess_info = item
+                        break
+            if not sess_info or not sess_info.get("token"):
+                return False
+
+            self.token = _clean_arlo_token(str(sess_info["token"]))
+            if sess_info.get("user_id"):
+                self.user_id = str(sess_info["user_id"])
+            if sess_info.get("email") and not self.email:
+                self.email = str(sess_info["email"])
+
+            if not test_connection:
+                self.status = "connected"
+                return True
+
+            await self.async_fetch_devices()
+            return True
+        except Exception as err:
+            _LOGGER.debug("[%s] Could not adopt .aarlo session: %s", self.account_id, err)
+            return False
+        finally:
+            self._adopting_from_aarlo = False
 
     def _mobile_device_headers(self) -> dict[str, str]:
         """Return native Arlo Android app headers extracted from APK v7.5.1."""
@@ -263,10 +515,101 @@ class ArloCloudAccountSession:
             headers["Cookie"] = self.cookie
         return headers
 
+    @classmethod
+    def _sync_http_request(
+        cls,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any] | None = None,
+        cookie_objs: list[dict[str, Any]] | None = None,
+    ) -> tuple[int, dict[str, Any], str] | None:
+        """Execute HTTP request via curl_cffi or cloudscraper (executor thread only)."""
+        def _parse_resp(status_code: int, text: str) -> tuple[int, dict[str, Any], str]:
+            try:
+                data = json.loads(text) if text else {}
+            except Exception:
+                data = {}
+            return status_code, data, text
+
+        def _chrome_web_headers(orig_headers: dict[str, str]) -> dict[str, str]:
+            h = dict(orig_headers)
+            h.pop("User-Agent", None)
+            h.pop("x-user-device-id", None)
+            h.pop("x-user-device-name", None)
+            h.pop("x-user-device-type", None)
+            h["Origin"] = "https://my.arlo.com"
+            h["Referer"] = "https://my.arlo.com/"
+            h["Source"] = "arloCamWeb"
+            return h
+
+        # Level 1: curl_cffi TLS browser impersonation
+        try:
+            from curl_cffi import requests as cffi_requests  # type: ignore[import-not-found]
+
+            cookies_dict = {c["name"]: c["value"] for c in (cookie_objs or []) if c.get("name")}
+            req_kwargs: dict[str, Any] = {
+                "headers": headers,
+                "cookies": cookies_dict or None,
+                "impersonate": "chrome131",
+                "timeout": 15,
+            }
+            if payload is not None:
+                req_kwargs["json"] = payload
+            resp = cffi_requests.request(method, url, **req_kwargs)
+            if cls._is_cloudflare_block(resp.status_code, resp.text) and ARLO_AUTH_HOST in url:
+                req_kwargs["headers"] = _chrome_web_headers(headers)
+                resp = cffi_requests.request(method, url, **req_kwargs)
+            return _parse_resp(resp.status_code, resp.text)
+        except ImportError:
+            pass
+        except Exception as err:
+            _LOGGER.debug("curl_cffi request error (%s): %s", url, err)
+
+        # Level 2: cloudscraper with prime256v1 (installed alongside pyaarlo on HA)
+        try:
+            import cloudscraper  # type: ignore[import-not-found]
+
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "linux", "mobile": False},
+                ecdhCurve="prime256v1",
+            )
+            for c in cookie_objs or []:
+                if c.get("name"):
+                    scraper.cookies.set(
+                        c["name"],
+                        c["value"],
+                        domain=c.get("domain", ""),
+                        path=c.get("path", "/"),
+                    )
+            req_kwargs = {"headers": headers, "timeout": 15}
+            if payload is not None:
+                req_kwargs["json"] = payload
+            resp = scraper.request(method, url, **req_kwargs)
+            if cls._is_cloudflare_block(resp.status_code, resp.text) and ARLO_AUTH_HOST in url:
+                req_kwargs["headers"] = _chrome_web_headers(headers)
+                resp = scraper.request(method, url, **req_kwargs)
+            return _parse_resp(resp.status_code, resp.text)
+        except ImportError:
+            pass
+        except Exception as err:
+            _LOGGER.debug("cloudscraper request error (%s): %s", url, err)
+
+        return None
+
     async def _post_json(
         self, url: str, payload: dict[str, Any], headers: dict[str, str]
     ) -> tuple[int, dict[str, Any], str]:
-        """Execute a POST JSON request safely and capture HTTP status + text fallback."""
+        """Execute a POST JSON request via Cloudflare-capable backend or aiohttp fallback."""
+        if self._session is None and self.hass is not None and hasattr(self.hass, "async_add_executor_job"):
+            if not self._aarlo_cache_loaded:
+                await self.async_load_local_aarlo_cache()
+            res = await self.hass.async_add_executor_job(
+                self._sync_http_request, "POST", url, headers, payload, self._aarlo_cookies
+            )
+            if res is not None:
+                return res
+
         session = await self._get_session()
         async with session.post(url, json=payload, headers=headers) as resp:
             text = await resp.text()
@@ -279,7 +622,16 @@ class ArloCloudAccountSession:
     async def _get_json(
         self, url: str, headers: dict[str, str]
     ) -> tuple[int, dict[str, Any], str]:
-        """Execute a GET JSON request safely and capture HTTP status + text fallback."""
+        """Execute a GET JSON request via Cloudflare-capable backend or aiohttp fallback."""
+        if self._session is None and self.hass is not None and hasattr(self.hass, "async_add_executor_job"):
+            if not self._aarlo_cache_loaded:
+                await self.async_load_local_aarlo_cache()
+            res = await self.hass.async_add_executor_job(
+                self._sync_http_request, "GET", url, headers, None, self._aarlo_cookies
+            )
+            if res is not None:
+                return res
+
         session = await self._get_session()
         async with session.get(url, headers=headers) as resp:
             text = await resp.text()
@@ -307,6 +659,18 @@ class ArloCloudAccountSession:
             return {"status": "error", "error": "Adresse e-mail et mot de passe requis."}
 
         self.last_error = ""
+
+        # Reuse HA's active .aarlo session for the same email if valid, avoiding
+        # Cloudflare challenges on ocapi-app.arlo.com and Arlo single-session kickouts.
+        if await self.async_try_adopt_local_aarlo_session(test_connection=True):
+            return {
+                "status": "connected",
+                "session_id": self.account_id,
+                "email": self.email,
+                "devices": self.devices,
+                "adopted_from_aarlo": True,
+            }
+
         url = f"{ARLO_AUTH_HOST}/api/auth"
         body = {
             "email": self.email,
@@ -528,18 +892,34 @@ class ArloCloudAccountSession:
             status, resp_json, raw_text = await self._get_json(url, self._hmsweb_headers())
 
             if status in (401, 403):
+                # Check if .aarlo already refreshed the single active token on disk
+                if await self._async_refresh_token_from_aarlo_cache():
+                    status, resp_json, raw_text = await self._get_json(url, self._hmsweb_headers())
+
+            if status in (401, 403):
                 self.status = "token_expired"
                 self.last_error = f"Jeton Arlo expiré ou refusé (HTTP {status})."
                 raise RuntimeError(self.last_error)
 
+            raw_devices: list[Any] = []
             if status >= 400 or not resp_json.get("success", False):
-                err = resp_json.get("data", {}).get("message") or resp_json.get("data", {}).get("reason") or f"HTTP {status}"
-                self.last_error = f"Erreur synchronisation Arlo: {err}"
-                if not raw_text:
-                    self.last_error = f"Réponse vide d'Arlo (HTTP {status})"
-                raise RuntimeError(self.last_error)
+                cache = await self.async_load_local_aarlo_cache()
+                fallback_raw = cache.get("devices_raw") or []
+                if fallback_raw:
+                    raw_devices = list(fallback_raw)
+                else:
+                    err = (
+                        resp_json.get("data", {}).get("message")
+                        or resp_json.get("data", {}).get("reason")
+                        or f"HTTP {status}"
+                    )
+                    self.last_error = f"Erreur synchronisation Arlo: {err}"
+                    if not raw_text:
+                        self.last_error = f"Réponse vide d'Arlo (HTTP {status})"
+                    raise RuntimeError(self.last_error)
+            else:
+                raw_devices = resp_json.get("data") or []
 
-            raw_devices = resp_json.get("data") or []
             normalized: list[dict[str, Any]] = []
             for raw_dev in raw_devices:
                 if not isinstance(raw_dev, dict):
@@ -645,7 +1025,16 @@ class ArloCloudAccountSession:
                         continue
                     res = str(evt.get("resource") or "")
                     props = evt.get("properties") or {}
-                    candidate_url = props.get("url") or evt.get("url")
+                    props_dict = props if isinstance(props, dict) else {}
+                    local_uri = (
+                        props_dict.get("localURI")
+                        or props_dict.get("localUri")
+                        or evt.get("localURI")
+                        or evt.get("localUri")
+                    )
+                    if local_uri and (not device_id or device_id in res or not res):
+                        self._last_local_uri[device_id] = str(local_uri)
+                    candidate_url = props_dict.get("url") or evt.get("url")
                     if candidate_url and (not device_id or device_id in res or not res):
                         if not result_future.done():
                             result_future.set_result(str(candidate_url))
@@ -683,6 +1072,7 @@ class ArloCloudAccountSession:
             },
         }
 
+        self._last_local_uri.pop(device_id, None)
         loop = asyncio.get_running_loop()
         sse_future: asyncio.Future[str] = loop.create_future()
         sse_task = asyncio.create_task(
@@ -695,14 +1085,22 @@ class ArloCloudAccountSession:
             status, resp_json, _ = await self._post_json(
                 url, body, self._hmsweb_headers(target_xcloud)
             )
+            if status in (401, 403) and await self._async_refresh_token_from_aarlo_cache():
+                status, resp_json, _ = await self._post_json(
+                    url, body, self._hmsweb_headers(target_xcloud)
+                )
             if status in (401, 403):
                 self.status = "token_expired"
                 self.last_error = f"Jeton Arlo expiré (HTTP {status})."
                 return None
 
             data = resp_json.get("data") or {}
-            if isinstance(data, dict) and data.get("url"):
-                return str(data["url"])
+            if isinstance(data, dict):
+                local_uri = data.get("localURI") or data.get("localUri")
+                if local_uri:
+                    self._last_local_uri[device_id] = str(local_uri)
+                if data.get("url"):
+                    return str(data["url"])
 
             if status == 200 and resp_json.get("success", True):
                 try:
@@ -722,6 +1120,64 @@ class ArloCloudAccountSession:
                     pass
 
         return None
+
+    async def _probe_local_rtsp_port(
+        self, host: str, port: int = 554, timeout: float = 0.8
+    ) -> bool:
+        """Probe whether the Arlo camera exposes its local RTSP/RTSPS port on the LAN."""
+        if not host:
+            return False
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=timeout,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    async def async_get_stream_candidates(
+        self,
+        device_id: str,
+        parent_id: str = "",
+        xcloud_id: str = "",
+        local_ip: str = "",
+    ) -> list[tuple[str, str]]:
+        """Wake camera via Cloud startStream (Option 2) and prioritize local LAN URLs."""
+        cloud_url = await self.async_start_camera_stream(
+            device_id,
+            parent_id=parent_id,
+            xcloud_id=xcloud_id,
+        )
+
+        candidates: list[tuple[str, str]] = []
+        seen_urls: set[str] = set()
+
+        def _append(u: str, mode: str) -> None:
+            u_clean = str(u or "").strip()
+            if u_clean and u_clean not in seen_urls:
+                seen_urls.add(u_clean)
+                candidates.append((u_clean, mode))
+
+        explicit_local = self._last_local_uri.get(device_id, "")
+        if explicit_local and explicit_local.startswith(("rtsp://", "rtsps://")):
+            _append(explicit_local, "local_lan")
+
+        dev = self.get_device_info(device_id) or {}
+        target_ip = str(local_ip or dev.get("local_ip") or "").strip()
+        if target_ip and await self._probe_local_rtsp_port(target_ip, 554, timeout=0.8):
+            _append(f"rtsps://{target_ip}:554/{device_id}/tcp/avc", "local_lan")
+            _append(f"rtsp://{target_ip}:554/{device_id}/tcp/avc", "local_lan")
+
+        if cloud_url:
+            _append(cloud_url, "cloud_hybrid")
+
+        return candidates
 
     async def async_stop_camera_stream(
         self, device_id: str, parent_id: str = "", xcloud_id: str = ""
@@ -776,6 +1232,8 @@ class ArloCloudDriver(BaseCameraDriver):
         )
         self.parent_id: str = str(config.get("parent_id") or self.arlo_device_id)
         self.xcloud_id: str = str(config.get("xcloud_id") or "")
+        self.local_ip: str = str(config.get("local_ip") or "")
+        self._active_stream_mode: str = "idle"
         self._stream_task: asyncio.Task[None] | None = None
         self._poll_task: asyncio.Task[None] | None = None
         self._ha_delegate: HaProxyDriver | None = None
@@ -922,32 +1380,40 @@ class ArloCloudDriver(BaseCameraDriver):
         return self.last_snapshot
 
     async def _stream_loop(self) -> None:
-        """Open on-demand Arlo RTSPS stream and transcode MJPEG frames via FFmpeg."""
+        """Wake Arlo camera via Cloud (Option 2), try local LAN RTSP(S), then Cloud fallback."""
         session = self._resolve_session()
         try:
             while self.is_streaming:
-                stream_url: str | None = None
+                stream_ok = False
                 if session and session.token:
-                    stream_url = await session.async_start_camera_stream(
+                    candidates = await session.async_get_stream_candidates(
                         self.arlo_device_id,
                         parent_id=self.parent_id,
                         xcloud_id=self.xcloud_id,
+                        local_ip=self.local_ip,
                     )
-
-                if stream_url:
-                    self._stream_url = stream_url
-                    ok = await self.async_stream_ffmpeg_mjpeg(stream_url)
-                    if ok and not self.is_streaming:
+                    for cand_url, cand_mode in candidates:
+                        if not self.is_streaming:
+                            break
+                        self._active_stream_mode = cand_mode
+                        self._stream_url = cand_url
+                        ok = await self.async_stream_ffmpeg_mjpeg(cand_url)
+                        if ok:
+                            stream_ok = True
+                            break
+                    if stream_ok and not self.is_streaming:
                         break
 
-                # Hybrid fallback via linked HA entity (e.g. aarlo) if cloud stream failed
+                # Hybrid fallback via linked HA entity (e.g. aarlo) if direct/cloud stream failed
                 if self.is_streaming and self._ha_delegate:
+                    self._active_stream_mode = "ha_hybrid"
                     await self._ha_delegate.async_start_stream()
                     while self.is_streaming and self._ha_delegate.is_streaming:
                         await asyncio.sleep(0.5)
                     break
 
                 if self.is_streaming:
+                    self._active_stream_mode = "snapshot_fallback"
                     snap = await self.async_get_snapshot()
                     if snap:
                         self.notify_frame(snap)
@@ -956,6 +1422,9 @@ class ArloCloudDriver(BaseCameraDriver):
             raise
         except Exception as err:
             _LOGGER.debug("[%s] Arlo live stream loop error: %s", self.camera_id, err)
+        finally:
+            if not self.is_streaming:
+                self._active_stream_mode = "idle"
 
     async def async_start_stream(self) -> None:
         """Start on-demand live video stream (wakes Arlo camera only when viewed)."""
@@ -969,6 +1438,7 @@ class ArloCloudDriver(BaseCameraDriver):
         """Stop FFmpeg pipeline and instruct Arlo Cloud to put camera back to sleep."""
         was_streaming = self.is_streaming
         self.is_streaming = False
+        self._active_stream_mode = "idle"
         self.status = STATUS_ONLINE if self.is_connected else STATUS_OFFLINE
         self._stream_url = None
         self.stop_ffmpeg_process()
@@ -989,13 +1459,22 @@ class ArloCloudDriver(BaseCameraDriver):
                 )
 
     def get_capabilities(self) -> dict[str, Any]:
-        """Return rich Arlo device capabilities including battery and RF signal."""
+        """Return rich Arlo device capabilities including battery, RF signal and LAN info."""
         session = self._resolve_session()
         dev = session.get_device_info(self.arlo_device_id) if session else None
         dev = dev or {}
+        local_ip = str(dev.get("local_ip") or self.local_ip or self.config.get("local_ip") or "")
+        wifi_ssid = str(dev.get("wifi_ssid") or self.config.get("wifi_ssid") or "")
+        wifi_rssi = (
+            dev.get("wifi_rssi")
+            if dev.get("wifi_rssi") is not None
+            else self.config.get("wifi_rssi")
+        )
+        mac_addr = str(dev.get("mac_address") or self.config.get("mac_address") or "")
+        local_supported = bool(local_ip or dev.get("local_streaming_supported"))
         return {
             "driver_type": DRIVER_ARLO_CLOUD,
-            "protocol": "Arlo Cloud Direct (RTSPS / HMSWeb)",
+            "protocol": "Arlo Hybride (Réveil Cloud + LAN/RTSPS)",
             "night_vision": False,
             "ptz": False,
             "audio": True,
@@ -1009,4 +1488,10 @@ class ArloCloudDriver(BaseCameraDriver):
             "battery_level": dev.get("battery_level"),
             "signal_strength": dev.get("signal_strength"),
             "charging_state": dev.get("charging_state"),
+            "local_ip": local_ip,
+            "wifi_ssid": wifi_ssid,
+            "wifi_rssi": wifi_rssi,
+            "mac_address": mac_addr,
+            "local_streaming_supported": local_supported,
+            "stream_mode": self._active_stream_mode,
         }

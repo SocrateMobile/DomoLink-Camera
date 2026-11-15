@@ -2840,6 +2840,14 @@ class DomolinkCameraPanel extends HTMLElement {
 
             const batLevel = cam.capabilities && cam.capabilities.battery_level;
             const hasBattery = batLevel !== undefined && batLevel !== null && batLevel !== "";
+            const localIp = (cam.capabilities && cam.capabilities.local_ip) || cam.local_ip || "";
+            const streamMode = cam.capabilities && cam.capabilities.stream_mode;
+            const streamModeBadge =
+              isLive && streamMode === "local_lan"
+                ? `<span class="driver-badge" style="background: rgba(16,185,129,0.18); color: #6ee7b7;" title="Flux vidéo direct sur le réseau local">⚡ Local LAN</span>`
+                : isLive && (streamMode === "cloud_hybrid" || streamMode === "ha_hybrid")
+                ? `<span class="driver-badge" title="Flux hybride réveil Cloud + relai">☁️ Hybride</span>`
+                : "";
 
             return `
             <div class="camera-card"
@@ -2853,6 +2861,8 @@ class DomolinkCameraPanel extends HTMLElement {
                   <div class="status-dot ${isLive ? "streaming" : statusClass}"></div>
                   <div class="card-name">${this._escapeHtml(cam.name)}</div>
                   <span class="driver-badge">${driverLabel}</span>
+                  ${streamModeBadge}
+                  ${localIp ? `<span class="driver-badge" title="IP locale sur le réseau LAN">🏠 ${this._escapeHtml(localIp)}</span>` : ""}
                   ${hasBattery ? `<span class="driver-badge" title="Niveau batterie">${Number(batLevel) <= 20 ? "🪫" : "🔋"} ${this._escapeHtml(batLevel)}%</span>` : ""}
                 </div>
                 <div style="font-size: 12px; color: #8b949e; cursor: grab;" title="Glisser pour réorganiser">⠿</div>
@@ -3423,6 +3433,7 @@ class DomolinkCameraPanel extends HTMLElement {
                               <div style="font-size: 11px; color: #8b949e;">
                                 ${this._escapeHtml(dev.model_id || "Arlo")}
                                 ${dev.battery_level !== null && dev.battery_level !== undefined ? ` • 🔋 ${this._escapeHtml(dev.battery_level)}%` : ""}
+                                ${dev.local_ip ? ` • 🏠 ${this._escapeHtml(dev.local_ip)}` : ""}
                               </div>
                             </div>
                             ${
@@ -4270,4 +4281,6 @@ class DomolinkCameraPanel extends HTMLElement {
   }
 }
 
-customElements.define("domolink-camera-panel", DomolinkCameraPanel);
+if (!customElements.get("domolink-camera-panel")) {
+  customElements.define("domolink-camera-panel", DomolinkCameraPanel);
+}
