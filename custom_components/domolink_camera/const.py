@@ -2,7 +2,7 @@
 
 DOMAIN = "domolink_camera"
 NAME = "DomoLink Camera"
-VERSION = "1.5.2"
+VERSION = "1.6.0"
 
 # Storage
 STORAGE_KEY = "domolink_camera_data"
@@ -10,17 +10,33 @@ STORAGE_VERSION = 1
 
 # Supported camera drivers
 DRIVER_ARLO_CLOUD = "arlo_cloud"
+DRIVER_TUYA_HYBRID = "tuya_hybrid"
+DRIVER_REOLINK_HYBRID = "reolink_hybrid"
+DRIVER_EZVIZ_HYBRID = "ezviz_hybrid"
+DRIVER_BLINK_HYBRID = "blink_hybrid"
 DRIVER_YSXLITE_PPPP = "ysxlite_pppp"
 DRIVER_GENERIC_RTSP = "generic_rtsp"
 DRIVER_GENERIC_MJPEG = "generic_mjpeg"
 DRIVER_HA_PROXY = "ha_proxy"
 
+HYBRID_PROXY_DRIVERS = (
+    DRIVER_HA_PROXY,
+    DRIVER_TUYA_HYBRID,
+    DRIVER_REOLINK_HYBRID,
+    DRIVER_EZVIZ_HYBRID,
+    DRIVER_BLINK_HYBRID,
+)
+
 SUPPORTED_DRIVERS = {
     DRIVER_ARLO_CLOUD: "Arlo Cloud Direct (Caméras & Sonnettes Arlo)",
+    DRIVER_TUYA_HYBRID: "Tuya / Tuya OEM Hybride (Local LAN + Fallback Cloud)",
+    DRIVER_REOLINK_HYBRID: "Reolink Hybride (RTSP/FLV Local + Fallback HA)",
+    DRIVER_EZVIZ_HYBRID: "Ezviz Hybride (RTSP Local + Fallback HA)",
+    DRIVER_BLINK_HYBRID: "Blink Hybride (Économie Batterie + Fallback Cloud)",
     DRIVER_YSXLITE_PPPP: "YsxLite / A9 / PPPP (Wi-Fi Mini Cam)",
     DRIVER_GENERIC_RTSP: "RTSP / ONVIF (Standard IP Camera)",
     DRIVER_GENERIC_MJPEG: "MJPEG / HTTP (Webcam & ESP32-CAM)",
-    DRIVER_HA_PROXY: "Passerelle Home Assistant (Tuya, Arlo, Xiaomi, Blink...)",
+    DRIVER_HA_PROXY: "Passerelle Home Assistant (Xiaomi, ONVIF, Universel...)",
 }
 
 # Network defaults

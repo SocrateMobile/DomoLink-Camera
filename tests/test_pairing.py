@@ -54,8 +54,12 @@ from custom_components.domolink_camera.const import (
     CAMERA_AP_SSID_PREFIXES,
     DEFAULT_PPPP_DISCOVERY_PORT,
     DRIVER_ARLO_CLOUD,
+    DRIVER_BLINK_HYBRID,
+    DRIVER_EZVIZ_HYBRID,
     DRIVER_GENERIC_MJPEG,
     DRIVER_HA_PROXY,
+    DRIVER_REOLINK_HYBRID,
+    DRIVER_TUYA_HYBRID,
     ILNK_MAGIC,
     MAX_UDP_FRAME_BUFFER,
     PPPP_CMD_WIFI_SET,
@@ -800,6 +804,124 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mgr2.cameras["cam_cuisine_old"]["driver"], DRIVER_ARLO_CLOUD)
         self.assertEqual(mgr2.cameras["cam_cuisine_old"]["ha_entity_id"], "camera.aarlo_cuisine")
         self.assertEqual(mgr2.cameras["cam_cuisine_old"]["local_ip"], "192.168.1.150")
+
+    async def test_hybrid_tuya_reolink_ezviz_blink_stream_candidates_and_enrichment(self) -> None:
+        """Verify Option 2 hybrid discovery, LAN-first candidates, battery safety, and auto-enrichment."""
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage_dir = os.path.join(tmpdir, ".storage")
+            os.makedirs(storage_dir, exist_ok=True)
+            with open(os.path.join(storage_dir, "domolink_tuya_oem_overrides"), "w", encoding="utf-8") as f:
+                json.dump({
+                    "version": 1,
+                    "data": {
+                        "bf439132f8834cb05fluss": {
+                            "ip": "192.168.1.175",
+                            "custom_name": "Lampe Jardin",
+                            "rtsp_url": "",
+                        }
+                    },
+                }, f)
+
+            self.mock_hass.config.path = MagicMock(return_value=tmpdir)
+
+            # Tuya OEM coordinator mock
+            mock_coord = MagicMock()
+            mock_coord.devices = {"bf439132f8834cb05fluss": MagicMock(ip="192.168.1.175", product_name="LSC Floodlight", mac="aa:bb:cc:dd:ee:01")}
+            mock_coord.overrides = {}
+            mock_coord.local_devices = {"bf439132f8834cb05fluss": {"ip": "192.168.1.175", "mac": "aa:bb:cc:dd:ee:01"}}
+            mock_coord.find_linked_camera_entity = MagicMock(return_value="camera.lampe_jardin_oem")
+            mock_coord.async_get_camera_stream = AsyncMock(return_value="rtsps://cloud.tuya.example/stream1")
+            self.mock_hass.data["domolink_tuya_oem"] = {"entry1": {"coordinator": mock_coord}}
+
+            # States + registries covering Tuya duplicate dedup, Reolink, Ezviz, Blink, and ghost entity
+            s_tuya_std = MagicMock(entity_id="camera.lampe_jardin_std", state="idle", attributes={"friendly_name": "Lampe Jardin"})
+            s_tuya_oem = MagicMock(entity_id="camera.lampe_jardin_oem", state="idle", attributes={"friendly_name": "Lampe Jardin OEM"})
+            s_reolink = MagicMock(entity_id="camera.reolink_portail", state="idle", attributes={"friendly_name": "Portail Reolink", "ip_address": "192.168.1.60"})
+            s_ezviz = MagicMock(entity_id="camera.ezviz_garage", state="idle", attributes={"friendly_name": "Garage Ezviz", "local_ip": "192.168.1.61"})
+            s_blink = MagicMock(entity_id="camera.blink_entree", state="idle", attributes={"friendly_name": "Blink Entrée", "battery_level": 90})
+            s_ghost = MagicMock(entity_id="camera.fantome_2", state="unavailable", attributes={"friendly_name": "Ghost", "restored": True})
+
+            self.mock_hass.states.async_all.return_value = [s_tuya_std, s_tuya_oem, s_reolink, s_ezviz, s_blink, s_ghost]
+            state_map = {s.entity_id: s for s in [s_tuya_std, s_tuya_oem, s_reolink, s_ezviz, s_blink, s_ghost]}
+            self.mock_hass.states.get.side_effect = state_map.get
+
+            self.mock_hass.data["entity_registry"] = MagicMock(entities={
+                "camera.lampe_jardin_std": MagicMock(platform="tuya", unique_id="tuya.bf439132f8834cb05fluss", device_id="d_std"),
+                "camera.lampe_jardin_oem": MagicMock(platform="domolink_tuya_oem", unique_id="domolink_tuya_oem_bf439132f8834cb05fluss", device_id="d_oem"),
+                "camera.reolink_portail": MagicMock(platform="reolink", unique_id="reo_1", device_id="d_reo"),
+                "camera.ezviz_garage": MagicMock(platform="ezviz", unique_id="ez_1", device_id="d_ez"),
+                "camera.blink_entree": MagicMock(platform="blink", unique_id="851098423-camera", device_id="d_blink"),
+                "camera.fantome_2": MagicMock(platform="tuya", unique_id="old", device_id=None),
+            })
+            self.mock_hass.data["entity_registry"].async_get.side_effect = lambda eid: self.mock_hass.data["entity_registry"].entities.get(eid)
+
+            compatible, _ = await self.engine._scan_ha_camera_entities()
+            by_host = {c["host"]: c for c in compatible}
+
+            self.assertNotIn("camera.fantome_2", by_host)
+            self.assertNotIn("camera.lampe_jardin_std", by_host)  # Deduped in favor of active OEM entity
+            self.assertIn("camera.lampe_jardin_oem", by_host)
+            self.assertEqual(by_host["camera.lampe_jardin_oem"]["driver"], DRIVER_TUYA_HYBRID)
+            self.assertEqual(by_host["camera.lampe_jardin_oem"]["local_ip"], "192.168.1.175")
+            self.assertEqual(by_host["camera.reolink_portail"]["driver"], DRIVER_REOLINK_HYBRID)
+            self.assertEqual(by_host["camera.ezviz_garage"]["driver"], DRIVER_EZVIZ_HYBRID)
+            self.assertEqual(by_host["camera.blink_entree"]["driver"], DRIVER_BLINK_HYBRID)
+
+            # 1. Reolink Option 2 LAN RTSP priority over Cloud fallback
+            reo_drv = HaProxyDriver("c_reo", {"host": "camera.reolink_portail", "driver": DRIVER_REOLINK_HYBRID, "local_ip": "192.168.1.60", "username": "admin", "password": "pw"}, hass=self.mock_hass)
+            reo_drv.async_probe_tcp_port = AsyncMock(side_effect=lambda h, p, timeout=0.65: p == 554)
+            reo_cands = await reo_drv.async_get_hybrid_stream_candidates()
+            self.assertEqual(reo_cands[0]["mode"], "local_lan")
+            self.assertEqual(reo_cands[0]["url"], "rtsp://admin:pw@192.168.1.60:554/h264Preview_01_sub")
+
+            # 2. Ezviz Option 2 LAN RTSP with default admin + verification code
+            ez_drv = HaProxyDriver("c_ez", {"host": "camera.ezviz_garage", "driver": DRIVER_EZVIZ_HYBRID, "local_ip": "192.168.1.61", "verification_code": "ABCDEF"}, hass=self.mock_hass)
+            ez_drv.async_probe_tcp_port = AsyncMock(side_effect=lambda h, p, timeout=0.65: p == 554)
+            ez_cands = await ez_drv.async_get_hybrid_stream_candidates()
+            self.assertEqual(ez_cands[0]["mode"], "local_lan")
+            self.assertEqual(ez_cands[0]["url"], "rtsp://admin:ABCDEF@192.168.1.61:554/h264/ch1/sub/av_stream")
+
+            # 3. Blink battery-safe mode never hammers LAN RTSP ports
+            blink_drv = HaProxyDriver("c_bl", {"host": "camera.blink_entree", "driver": DRIVER_BLINK_HYBRID, "local_ip": "192.168.1.70"}, hass=self.mock_hass)
+            blink_drv.async_probe_tcp_port = AsyncMock(return_value=True)
+            blink_cands = await blink_drv.async_get_hybrid_stream_candidates()
+            self.assertTrue(blink_drv.battery_protected_mode)
+            blink_drv.async_probe_tcp_port.assert_not_awaited()
+            self.assertEqual(blink_cands, [])
+
+            # 4. Tuya P2P camera (554/8554 closed) falls back cleanly to domolink_tuya_oem Cloud Bridge
+            tuya_drv = HaProxyDriver("c_ty", {"host": "camera.lampe_jardin_std", "driver": DRIVER_TUYA_HYBRID}, hass=self.mock_hass)
+            tuya_drv.async_probe_tcp_port = AsyncMock(return_value=False)
+            ty_cands = await tuya_drv.async_get_hybrid_stream_candidates()
+            self.assertEqual(tuya_drv.local_ip, "192.168.1.175")
+            self.assertEqual(ty_cands[0]["mode"], "cloud_hybrid")
+            self.assertEqual(ty_cands[0]["source"], "domolink_tuya_oem_bridge")
+
+            # 5. HTTP FFmpeg reconnect flags & Manager auto-enrichment upgrading existing ha_proxy Tuya cam
+            http_attempts = tuya_drv._ffmpeg_input_attempts("https://ha.local:8123/api/hls/abc/master.m3u8")
+            self.assertIn("-reconnect", http_attempts[0][1])
+            self.assertIn("-rw_timeout", http_attempts[0][1])
+
+            mgr = CameraManager(self.mock_hass)
+            mgr.store.async_save = AsyncMock()
+            mgr.cameras["lampe_old"] = {
+                "id": "lampe_old",
+                "name": "Lampe Jardin",
+                "driver": DRIVER_HA_PROXY,
+                "host": "camera.lampe_jardin_std",
+                "order": 0,
+                "linked_entities": [],
+            }
+            mgr._init_driver("lampe_old", mgr.cameras["lampe_old"])
+            upgraded = await mgr.async_auto_enrich_hybrid_cameras()
+            self.assertEqual(upgraded, 1)
+            self.assertEqual(mgr.cameras["lampe_old"]["driver"], DRIVER_TUYA_HYBRID)
+            self.assertEqual(mgr.cameras["lampe_old"]["tuya_device_id"], "bf439132f8834cb05fluss")
+            self.assertEqual(mgr.cameras["lampe_old"]["local_ip"], "192.168.1.175")
+            self.assertEqual(mgr.cameras["lampe_old"]["tuya_oem_entity_id"], "camera.lampe_jardin_oem")
 
 
 if __name__ == "__main__":

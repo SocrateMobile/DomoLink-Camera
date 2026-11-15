@@ -120,16 +120,38 @@ class BaseCameraDriver(abc.ABC):
             except Exception:
                 pass
 
+    async def async_probe_tcp_port(
+        self, host: str, port: int = 554, timeout: float = 0.75
+    ) -> bool:
+        """Fast non-blocking TCP connect probe to test local LAN camera ports."""
+        clean_host = (host or "").strip()
+        if not clean_host or port <= 0:
+            return False
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(clean_host, int(port)),
+                timeout=timeout,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
     def _ffmpeg_input_attempts(self, url: str) -> list[tuple[str | None, list[str]]]:
         """Build ordered FFmpeg input option attempts for RTSP, RTSPS, HTTP, or HLS URLs."""
         lower = url.lower()
         if lower.startswith("rtsps://"):
             rtsp_flags = [
                 "-rtsp_transport", "tcp",
+                "-rw_timeout", "5000000",
                 "-fflags", "nobuffer+genpts+discardcorrupt",
                 "-flags", "low_delay",
-                "-probesize", "500000",
-                "-analyzeduration", "500000",
+                "-probesize", "327680",
+                "-analyzeduration", "400000",
             ]
             # Try with -tls_verify 0 first (needed for some Arlo/cloud RTSPS certs), then plain TCP
             return [
@@ -139,18 +161,34 @@ class BaseCameraDriver(abc.ABC):
         if lower.startswith("rtsp://"):
             pref = self.config.get("rtsp_transport", "tcp")
             transports = [pref] + [t for t in ("tcp", "udp") if t != pref]
+            attempts: list[tuple[str | None, list[str]]] = []
+            for t in transports:
+                flags = ["-rtsp_transport", t]
+                if t == "tcp":
+                    flags.extend(["-rw_timeout", "5000000"])
+                flags.extend([
+                    "-fflags", "nobuffer+genpts+discardcorrupt",
+                    "-flags", "low_delay",
+                    "-probesize", "327680",
+                    "-analyzeduration", "400000",
+                ])
+                attempts.append((t, flags))
+            return attempts
+        if lower.startswith(("http://", "https://")):
             return [
                 (
-                    t,
+                    "http_reconnect",
                     [
-                        "-rtsp_transport", t,
-                        "-fflags", "nobuffer+genpts+discardcorrupt",
+                        "-rw_timeout", "6000000",
+                        "-reconnect", "1",
+                        "-reconnect_streamed", "1",
+                        "-reconnect_delay_max", "2",
+                        "-fflags", "nobuffer+discardcorrupt",
                         "-flags", "low_delay",
-                        "-probesize", "500000",
-                        "-analyzeduration", "500000",
+                        "-probesize", "327680",
+                        "-analyzeduration", "400000",
                     ],
                 )
-                for t in transports
             ]
         return [(None, ["-fflags", "nobuffer+discardcorrupt"])]
 
@@ -228,6 +266,10 @@ class BaseCameraDriver(abc.ABC):
                 "-i",
                 url,
                 "-an",
+                "-threads",
+                "2",
+                "-vf",
+                "scale='min(1280,iw)':-2",
                 "-f",
                 "image2pipe",
                 "-vcodec",
