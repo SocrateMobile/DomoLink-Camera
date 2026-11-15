@@ -2,7 +2,7 @@
 
 DOMAIN = "domolink_camera"
 NAME = "DomoLink Camera"
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # Storage
 STORAGE_KEY = "domolink_camera_data"
@@ -165,3 +165,8 @@ WS_TYPE_ARLO_VERIFY_2FA = f"{DOMAIN}/arlo_verify_2fa"
 WS_TYPE_ARLO_SAVE_TOKEN = f"{DOMAIN}/arlo_save_token"
 WS_TYPE_ARLO_SYNC_ACCOUNT = f"{DOMAIN}/arlo_sync_account"
 WS_TYPE_ARLO_DELETE_ACCOUNT = f"{DOMAIN}/arlo_delete_account"
+WS_TYPE_GET_PROVIDER_ACCOUNTS = f"{DOMAIN}/get_provider_accounts"
+WS_TYPE_PROVIDER_LOGIN = f"{DOMAIN}/provider_login"
+WS_TYPE_PROVIDER_VERIFY_2FA = f"{DOMAIN}/provider_verify_2fa"
+WS_TYPE_PROVIDER_SYNC_ACCOUNT = f"{DOMAIN}/provider_sync_account"
+WS_TYPE_PROVIDER_DELETE_ACCOUNT = f"{DOMAIN}/provider_delete_account"

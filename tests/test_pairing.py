@@ -923,6 +923,231 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mgr.cameras["lampe_old"]["local_ip"], "192.168.1.175")
             self.assertEqual(mgr.cameras["lampe_old"]["tuya_oem_entity_id"], "camera.lampe_jardin_oem")
 
+    async def test_multi_provider_accounts_tuya_blink_ezviz_reolink_and_ha_auto_import(self):
+        """Verify Multi-Brand Cloud/LAN login, 2FA, Reolink CGI, and HA config auto-import."""
+        import json
+        import tempfile
+        from custom_components.domolink_camera.drivers.cloud_accounts import (
+            TUYA_OEM_PROFILES,
+            ProviderAccountSession,
+            get_tuya_oem_brands_list,
+        )
+        from custom_components.domolink_camera.const import (
+            DRIVER_BLINK_HYBRID,
+            DRIVER_EZVIZ_HYBRID,
+            DRIVER_REOLINK_HYBRID,
+        )
+        from custom_components.domolink_camera.manager import CameraManager
+
+        # 1. Tuya OEM profiles deobfuscation
+        self.assertEqual(len(TUYA_OEM_PROFILES), 8)
+        for bid in ("smartlife", "tuya", "lsc", "lidlhome", "nedis", "calex", "konyks", "thanks"):
+            self.assertIn(bid, TUYA_OEM_PROFILES)
+            self.assertTrue(len(TUYA_OEM_PROFILES[bid]["client_id"]) >= 10)
+            self.assertTrue(len(TUYA_OEM_PROFILES[bid]["secret"]) >= 16)
+        self.assertEqual(len(get_tuya_oem_brands_list()), 8)
+
+        # Fake network dispatcher for Blink, Ezviz, Reolink & Tuya
+        async def fake_http(session_obj, method, url, *, headers=None, json_data=None, form_data=None, ssl=None):
+            if "api/v5/account/login" in url:
+                return (
+                    200,
+                    {
+                        "auth": {"token": "blink_tok_v5"},
+                        "account": {
+                            "account_id": 112233,
+                            "client_id": 445566,
+                            "tier": "u001",
+                            "client_verification_required": True,
+                        },
+                    },
+                )
+            if "/pin/verify" in url:
+                pin = (json_data or {}).get("pin")
+                return (200, {"valid": pin == "654321"})
+            if "/homescreen" in url:
+                if (headers or {}).get("TOKEN-AUTH") == "expired_tok":
+                    return (401, {"message": "Unauthorized"})
+                return (
+                    200,
+                    {
+                        "cameras": [
+                            {
+                                "id": 9001,
+                                "name": "Blink Jardin",
+                                "serial": "G8T999",
+                                "type": "xt2",
+                                "status": "done",
+                                "battery": 92,
+                                "network_id": 7,
+                            }
+                        ],
+                        "owls": [],
+                    },
+                )
+            if "/v3/users/login/v5" in url:
+                return (
+                    200,
+                    {
+                        "meta": {"code": 200},
+                        "loginSession": {"sessionId": "ez_sess_1", "userId": "u_ez_1"},
+                        "loginArea": {"apiDomain": "apiieu.ezvizlife.com"},
+                    },
+                )
+            if "/v3/userdevices/v1/resources/pagelist" in url:
+                return (
+                    200,
+                    {
+                        "deviceInfos": [
+                            {
+                                "deviceSerial": "EZ1234567",
+                                "name": "Terrasse Ezviz",
+                                "deviceType": "CS-C6N",
+                                "localIp": "192.168.1.180",
+                                "status": 1,
+                            }
+                        ]
+                    },
+                )
+            if "/cgi-bin/api.cgi" in url:
+                if "cmd=Login" in url:
+                    return (200, [{"cmd": "Login", "code": 0, "value": {"Token": {"name": "reo_tok_9"}}}])
+                if "cmd=Logout" in url:
+                    return (200, [{"cmd": "Logout", "code": 0, "value": {}}])
+                return (
+                    200,
+                    [
+                        {"cmd": "GetDevInfo", "code": 0, "value": {"DevInfo": {"name": "Reolink Entrée", "model": "RLC-810A"}}},
+                        {"cmd": "GetChannelstatus", "code": 0, "value": {"status": [{"channel": 0, "name": "Reolink Entrée", "online": 1}]}},
+                    ],
+                )
+            return (404, {})
+
+        self.mock_hass.states.async_all = MagicMock(return_value=[])
+        cam_blink_ent = MagicMock()
+        cam_blink_ent.entity_id = "camera.camera_1"
+        cam_blink_ent.platform = "blink"
+        cam_blink_ent.unique_id = "blink_cam_1"
+        cam_blink_ent.disabled_by = None
+        cam_blink_ent.original_name = "Camera 1"
+        self.mock_hass.data["entity_registry"] = MagicMock(entities={"camera.camera_1": cam_blink_ent})
+        self.mock_hass.data["entity_registry"].async_get.side_effect = (
+            lambda eid: self.mock_hass.data["entity_registry"].entities.get(eid)
+        )
+
+        with patch.object(ProviderAccountSession, "_http_request", autospec=True, side_effect=fake_http):
+            mgr = CameraManager(self.mock_hass)
+            mgr.store.async_save = AsyncMock()
+
+            # 2. Blink 2FA flow
+            blink_res = await mgr.async_provider_start_login(
+                {
+                    "provider": "blink",
+                    "name": "Mon Blink",
+                    "username": "user@example.com",
+                    "password": "secret",
+                    "auto_add": True,
+                }
+            )
+            self.assertEqual(blink_res["status"], "2fa_required")
+            v_res = await mgr.async_provider_verify_2fa(blink_res["session_id"], "654321", auto_add=True)
+            self.assertEqual(v_res["status"], "connected")
+            self.assertEqual(v_res["imported_count"], 2)
+            blink_cams = [c for c in mgr.cameras.values() if c.get("driver") == DRIVER_BLINK_HYBRID]
+            self.assertEqual(len(blink_cams), 2)
+            self.assertTrue(any(c["name"] == "Blink Jardin" for c in blink_cams))
+            sync_res = await mgr.async_provider_sync_account(blink_res["session_id"], auto_add=True, refresh_remote=True)
+            self.assertEqual(sync_res["status"], "synced")
+
+            # 3. Ezviz Cloud login + LAN IP propagation
+            ez_res = await mgr.async_provider_start_login(
+                {
+                    "provider": "ezviz",
+                    "username": "ez@example.com",
+                    "password": "secret",
+                    "region": "eu",
+                    "verification_code": "ABCDEF",
+                    "auto_add": True,
+                }
+            )
+            self.assertEqual(ez_res["status"], "connected")
+            self.assertEqual(ez_res["imported_count"], 1)
+            ez_cams = [c for c in mgr.cameras.values() if c.get("driver") == DRIVER_EZVIZ_HYBRID]
+            self.assertEqual(len(ez_cams), 1)
+            self.assertEqual(ez_cams[0]["local_ip"], "192.168.1.180")
+            self.assertEqual(ez_cams[0]["verification_code"], "ABCDEF")
+
+            # 4. Reolink CGI local login
+            reo_res = await mgr.async_provider_start_login(
+                {
+                    "provider": "reolink",
+                    "host": "192.168.1.190",
+                    "port": 80,
+                    "rtsp_port": 554,
+                    "username": "admin",
+                    "password": "admin_pw",
+                    "auto_add": True,
+                }
+            )
+            self.assertEqual(reo_res["status"], "connected")
+            self.assertEqual(reo_res["imported_count"], 1)
+            reo_cams = [c for c in mgr.cameras.values() if c.get("driver") == DRIVER_REOLINK_HYBRID]
+            self.assertEqual(len(reo_cams), 1)
+            self.assertEqual(reo_cams[0]["local_ip"], "192.168.1.190")
+
+            # 5. Auto-import existing HA config entries (.storage/core.config_entries)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                storage_dir = os.path.join(tmpdir, ".storage")
+                os.makedirs(storage_dir, exist_ok=True)
+                with open(os.path.join(storage_dir, "core.config_entries"), "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "data": {
+                                "entries": [
+                                    {
+                                        "entry_id": "e_tuya",
+                                        "domain": "domolink_tuya_oem",
+                                        "title": "Smart Life (jfl@example.com)",
+                                        "data": {"username": "jfl@example.com", "brand": "smartlife", "country_code": "33"},
+                                    },
+                                    {
+                                        "entry_id": "e_blink",
+                                        "domain": "blink",
+                                        "title": "blink_ha",
+                                        "data": {"username": "blink@example.com", "token": "expired_tok", "account_id": "77", "region_id": "u001"},
+                                    },
+                                ]
+                            }
+                        },
+                        f,
+                    )
+
+                mgr2 = CameraManager(self.mock_hass)
+                mgr2.store.async_save = AsyncMock()
+                self.mock_hass.config = MagicMock()
+                self.mock_hass.config.path = MagicMock(return_value=tmpdir)
+
+                async def run_exec(func, *args):
+                    return func(*args)
+
+                self.mock_hass.async_add_executor_job = AsyncMock(side_effect=run_exec)
+                # Test _blink_base_url normalization ("e002.immedia-semi.com" -> "https://rest-e002.immedia-semi.com")
+                norm_sess = ProviderAccountSession(account_id="b_norm", provider="blink", host="e002.immedia-semi.com")
+                self.assertEqual(norm_sess._blink_base_url(), "https://rest-e002.immedia-semi.com")
+
+                # Dormant Blink camera present only in entity_registry (hass.states empty) must still import
+                self.mock_hass.states.async_all = MagicMock(return_value=[])
+
+                imported = await mgr2.async_auto_import_ha_provider_accounts(delay=0.0)
+                self.assertEqual(imported, 2)
+                listing = mgr2.get_provider_accounts_list()
+                self.assertEqual(len(listing["accounts"]), 2)
+                providers = {a["provider"] for a in listing["accounts"]}
+                self.assertEqual(providers, {"tuya_oem", "blink"})
+                ha_blink = [c for c in mgr2.cameras.values() if c.get("ha_entity_id") == "camera.camera_1"]
+                self.assertEqual(len(ha_blink), 1)
+                self.assertEqual(ha_blink[0]["driver"], DRIVER_BLINK_HYBRID)
+
 
 if __name__ == "__main__":
     unittest.main()

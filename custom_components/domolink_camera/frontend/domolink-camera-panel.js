@@ -21,6 +21,27 @@ class DomolinkCameraPanel extends HTMLElement {
     this._hass = null;
     this._cameras = [];
     this._arloAccounts = [];
+    this._providerAccounts = [];
+    this._tuyaOemBrands = [];
+    this._wizardProvider = "arlo";
+    this._providerWizard = {
+      step: "login",
+      loading: false,
+      error: "",
+      message: "",
+      sessionId: "",
+      accountName: "",
+      brand: "smartlife",
+      countryCode: "33",
+      username: "",
+      password: "",
+      otpCode: "",
+      host: "",
+      port: "80",
+      rtspPort: "554",
+      verificationCode: "",
+      region: "eu",
+    };
     this._arloWizard = {
       open: false,
       mode: "credentials",
@@ -493,14 +514,199 @@ class DomolinkCameraPanel extends HTMLElement {
   async _fetchArloAccounts(renderAfter = true) {
     if (!this._hass) return;
     try {
-      const resp = await this._hass.callWS({ type: "domolink_camera/get_arlo_accounts" });
-      if (resp && Array.isArray(resp.accounts)) {
-        this._arloAccounts = resp.accounts;
-        if (renderAfter) this.render();
+      const [arloResp, provResp] = await Promise.all([
+        this._hass.callWS({ type: "domolink_camera/get_arlo_accounts" }),
+        this._hass.callWS({ type: "domolink_camera/get_provider_accounts" }).catch(() => null),
+      ]);
+      if (arloResp && Array.isArray(arloResp.accounts)) {
+        this._arloAccounts = arloResp.accounts;
       }
+      if (provResp) {
+        if (Array.isArray(provResp.accounts)) this._providerAccounts = provResp.accounts;
+        if (Array.isArray(provResp.tuya_oem_brands)) this._tuyaOemBrands = provResp.tuya_oem_brands;
+      }
+      if (renderAfter) this.render();
     } catch (e) {
-      console.error("[DomoLink-Camera] Failed to fetch Arlo accounts:", e);
+      console.error("[DomoLink-Camera] Failed to fetch cloud accounts:", e);
     }
+  }
+
+  _resetProviderWizard(provider = "tuya_oem") {
+    this._wizardProvider = provider;
+    this._providerWizard = {
+      step: "login",
+      loading: false,
+      error: "",
+      message: "",
+      sessionId: "",
+      accountName: "",
+      brand: "smartlife",
+      countryCode: "33",
+      username: "",
+      password: "",
+      otpCode: "",
+      host: "",
+      port: "80",
+      rtspPort: "554",
+      verificationCode: "",
+      region: "eu",
+    };
+  }
+
+  async _startProviderLogin() {
+    const p = this._wizardProvider;
+    const pw = this._providerWizard;
+    if (p === "reolink" && !pw.host.trim()) {
+      pw.error = "Veuillez saisir l'adresse IP ou hôte de la caméra / NVR Reolink.";
+      this.render();
+      return;
+    }
+    if (p !== "reolink" && (!pw.username.trim() || !pw.password)) {
+      pw.error = "Veuillez saisir votre e-mail/identifiant et votre mot de passe.";
+      this.render();
+      return;
+    }
+
+    pw.loading = true;
+    pw.error = "";
+    pw.message = "";
+    this.render();
+
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/provider_login",
+        provider: p,
+        account_name: pw.accountName.trim(),
+        username: pw.username.trim(),
+        password: pw.password,
+        brand: pw.brand || "smartlife",
+        country_code: pw.countryCode.trim() || "33",
+        host: pw.host.trim(),
+        port: parseInt(pw.port || "80", 10) || 80,
+        rtsp_port: parseInt(pw.rtspPort || "554", 10) || 554,
+        verification_code: pw.verificationCode.trim(),
+        region: pw.region.trim() || "eu",
+        auto_add: true,
+      });
+      pw.loading = false;
+      if (resp.status === "connected") {
+        this._arloWizard.open = false;
+        pw.password = "";
+        this._showToast(`Compte ${p.toUpperCase()} connecté ! ${resp.imported_count || 0} caméra(s) importée(s).`);
+        await Promise.all([this._fetchArloAccounts(false), this._fetchCameras(false)]);
+      } else if (resp.status === "2fa_required") {
+        pw.step = "otp";
+        pw.sessionId = resp.session_id || "";
+        pw.message = resp.message || "Validation 2FA requise. Saisissez le code reçu.";
+      } else {
+        pw.error = resp.error || "Échec de connexion au fournisseur.";
+      }
+    } catch (err) {
+      pw.loading = false;
+      pw.error = err?.message || String(err);
+    }
+    this.render();
+  }
+
+  async _verifyProvider2faCode() {
+    const pw = this._providerWizard;
+    if (!pw.otpCode.trim()) {
+      pw.error = "Veuillez saisir le code PIN / OTP reçu.";
+      this.render();
+      return;
+    }
+    pw.loading = true;
+    pw.error = "";
+    this.render();
+
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/provider_verify_2fa",
+        session_id: pw.sessionId,
+        otp_code: pw.otpCode.trim(),
+        auto_add: true,
+      });
+      pw.loading = false;
+      if (resp.status === "connected") {
+        this._arloWizard.open = false;
+        this._resetProviderWizard(this._wizardProvider);
+        this._showToast(`Compte validé ! ${resp.imported_count || 0} caméra(s) importée(s).`);
+        await Promise.all([this._fetchArloAccounts(false), this._fetchCameras(false)]);
+      } else {
+        pw.error = resp.error || "Code 2FA refusé.";
+      }
+    } catch (err) {
+      pw.loading = false;
+      pw.error = err?.message || String(err);
+    }
+    this.render();
+  }
+
+  async _syncProviderAccount(accountId, autoAdd = true) {
+    this._showToast("Synchronisation du compte en cours...");
+    try {
+      const resp = await this._hass.callWS({
+        type: "domolink_camera/provider_sync_account",
+        account_id: accountId,
+        auto_add: autoAdd,
+      });
+      if (resp.status === "synced") {
+        this._showToast(`Synchro réussie : ${resp.total_devices} caméra(s), ${resp.imported_count} nouvelle(s) !`);
+        await Promise.all([this._fetchArloAccounts(false), this._fetchCameras(false)]);
+      } else {
+        this._showToast(`Erreur synchro : ${resp.error || "Échec"}`);
+      }
+    } catch (err) {
+      this._showToast(`Erreur synchro : ${err?.message || err}`);
+    }
+    this.render();
+  }
+
+  async _deleteProviderAccount(accountId) {
+    if (!confirm("Voulez-vous supprimer ce compte de DomoLink ?")) return;
+    const delCams = confirm("Souhaitez-vous également supprimer les caméras liées à ce compte ?");
+    try {
+      await this._hass.callWS({
+        type: "domolink_camera/provider_delete_account",
+        account_id: accountId,
+        delete_cameras: delCams,
+      });
+      this._showToast("Compte supprimé.");
+      await Promise.all([this._fetchArloAccounts(false), this._fetchCameras(false)]);
+    } catch (err) {
+      this._showToast("Erreur lors de la suppression du compte");
+    }
+    this.render();
+  }
+
+  async _addProviderCameraFromAccount(acc, dev) {
+    const driverMap = {
+      tuya_oem: "tuya_hybrid",
+      blink: "blink_hybrid",
+      ezviz: "ezviz_hybrid",
+      reolink: "reolink_hybrid",
+    };
+    const newCam = {
+      name: dev.name || `${acc.provider_label || acc.provider} ${dev.device_id}`,
+      description: `${acc.provider_label || acc.provider} • ${dev.model_id || ""}`.trim(),
+      driver: driverMap[acc.provider] || "ha_proxy",
+      host: dev.ha_entity_id || dev.tuya_oem_entity_id || dev.local_ip || dev.device_id || acc.host || "",
+      port: dev.rtsp_port || 554,
+      provider_account_id: acc.id,
+      device_id: dev.device_id || "",
+      tuya_device_id: dev.tuya_device_id || "",
+      tuya_oem_entity_id: dev.tuya_oem_entity_id || "",
+      ha_entity_id: dev.ha_entity_id || "",
+      local_ip: dev.local_ip || "",
+      mac_address: dev.mac_address || "",
+      local_key: dev.local_key || "",
+      rtsp_url: dev.rtsp_url || "",
+      model_id: dev.model_id || "",
+      brand: (acc.provider || "").toUpperCase(),
+      linked_entities: [],
+    };
+    await this._saveCamera(newCam);
+    await this._fetchArloAccounts(true);
   }
 
   async _startArloLogin() {
@@ -3254,27 +3460,79 @@ class DomolinkCameraPanel extends HTMLElement {
 
   _renderArloAccountsSection() {
     const w = this._arloWizard;
-    const accounts = this._arloAccounts || [];
+    const pw = this._providerWizard;
+    const prov = this._wizardProvider || "arlo";
+    const arloAccounts = this._arloAccounts || [];
+    const provAccounts = this._providerAccounts || [];
+    const totalAccounts = arloAccounts.length + provAccounts.length;
+    const brands =
+      this._tuyaOemBrands && this._tuyaOemBrands.length > 0
+        ? this._tuyaOemBrands
+        : [
+            { key: "smartlife", name: "Smart Life (Officiel)" },
+            { key: "tuya", name: "Tuya Smart (Officiel)" },
+            { key: "lsc", name: "Action LSC Smart Connect" },
+            { key: "lidlhome", name: "Lidl Home (Silvercrest)" },
+            { key: "nedis", name: "Nedis SmartLife" },
+            { key: "calex", name: "Calex Smart" },
+            { key: "konyks", name: "Konyks" },
+            { key: "thanks", name: "Thank's (GiFi)" },
+          ];
+
+    const providerIcon = (p) =>
+      p === "tuya_oem"
+        ? "⚡"
+        : p === "blink"
+        ? "🔋"
+        : p === "ezviz"
+        ? "📹"
+        : p === "reolink"
+        ? "🎥"
+        : "🛡️";
 
     return `
-        <!-- Section 0: Multi-Account Arlo Cloud Protocol -->
+        <!-- Section 0: Multi-Brand Cloud & LAN Account Manager -->
         <div class="settings-card">
           <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 12px; margin-bottom: 16px;">
             <h3 style="margin: 0; border-bottom: none; padding-bottom: 0;">
-              <span>☁️</span> Comptes Caméras Cloud — Arlo (Multi-Comptes)
+              <span>☁️</span> Comptes Caméras Multi-Marques (Arlo, Tuya / OEM, Blink, Ezviz, Reolink)
             </h3>
             <button class="btn-primary" id="btn-arlo-open-wizard">
-              ${w.open ? "✕ Fermer l'assistant" : "➕ Ajouter un compte Arlo"}
+              ${w.open ? "✕ Fermer l'assistant" : "➕ Ajouter un compte Caméra"}
             </button>
           </div>
           <p style="color: #8b949e; font-size: 13px; margin: 0 0 16px 0;">
-            Connectez un ou plusieurs comptes Arlo en natif (snapshots économie d'énergie &amp; flux RTSPS live à la demande) ou associez des caméras externes déjà présentes dans Home Assistant.
+            Connectez vos comptes <strong>Arlo</strong>, <strong>Tuya / SmartLife / LSC / OEM</strong>, <strong>Blink</strong>, <strong>Ezviz</strong> ou vos caméras/NVR <strong>Reolink</strong>. Mode Hybride Option 2 : priorité au flux direct LAN et repli automatique sur le Cloud.
           </p>
 
           ${
             w.open
               ? `
             <div style="background: rgba(13, 17, 23, 0.78); border: 1px solid rgba(59, 130, 246, 0.35); border-radius: 12px; padding: 18px; margin-bottom: 20px;">
+              <div style="font-size: 12px; color: #94a3b8; font-weight: 600; margin-bottom: 10px;">
+                1. Choisissez la marque / le protocole :
+              </div>
+              <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 14px;">
+                <button class="btn-cloud-provider-tab ${prov === "arlo" ? "btn-primary" : "btn-secondary"}" data-provider="arlo">
+                  🛡️ Arlo Cloud
+                </button>
+                <button class="btn-cloud-provider-tab ${prov === "tuya_oem" ? "btn-primary" : "btn-secondary"}" data-provider="tuya_oem">
+                  ⚡ Tuya / Tuya OEM
+                </button>
+                <button class="btn-cloud-provider-tab ${prov === "blink" ? "btn-primary" : "btn-secondary"}" data-provider="blink">
+                  🔋 Blink
+                </button>
+                <button class="btn-cloud-provider-tab ${prov === "ezviz" ? "btn-primary" : "btn-secondary"}" data-provider="ezviz">
+                  📹 Ezviz
+                </button>
+                <button class="btn-cloud-provider-tab ${prov === "reolink" ? "btn-primary" : "btn-secondary"}" data-provider="reolink">
+                  🎥 Reolink (Local / NVR)
+                </button>
+              </div>
+
+              ${
+                prov === "arlo"
+                  ? `
               <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px;">
                 <button class="btn-arlo-mode-tab ${w.mode === "credentials" ? "btn-primary" : "btn-secondary"}" data-mode="credentials">
                   🔐 Email + Mot de passe + 2FA
@@ -3390,19 +3648,196 @@ class DomolinkCameraPanel extends HTMLElement {
                 </div>
               `
               }
+              `
+                  : `
+              ${
+                pw.error
+                  ? `<div style="background: rgba(239,68,68,0.18); border: 1px solid rgba(239,68,68,0.45); color: #fca5a5; padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px;">⚠️ ${this._escapeHtml(pw.error)}</div>`
+                  : ""
+              }
+              ${
+                pw.message
+                  ? `<div style="background: rgba(59,130,246,0.18); border: 1px solid rgba(59,130,246,0.45); color: #93c5fd; padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px;">ℹ️ ${this._escapeHtml(pw.message)}</div>`
+                  : ""
+              }
+              ${
+                pw.step === "otp"
+                  ? `
+                <div class="form-grid">
+                  <div class="form-group">
+                    <label for="prov-otp-code">Code PIN / OTP 2FA (${this._escapeHtml(prov.toUpperCase())})</label>
+                    <input type="text" id="prov-otp-code" class="form-input" placeholder="Ex: 123456" value="${this._escapeHtml(pw.otpCode)}" />
+                  </div>
+                </div>
+                <div style="margin-top: 14px; display: flex; gap: 10px;">
+                  <button class="btn-primary" id="btn-prov-verify-otp" ${pw.loading ? "disabled" : ""}>
+                    ${pw.loading ? "⏳ Validation..." : "✅ Valider le code &amp; Importer"}
+                  </button>
+                  <button class="btn-secondary" id="btn-prov-back-login">← Retour</button>
+                </div>
+              `
+                  : prov === "tuya_oem"
+                  ? `
+                <div style="font-size: 12px; color: #94a3b8; margin-bottom: 12px;">
+                  💡 Connexion directe via passerelle mobile APK (clés extraites : Tuya Smart, Smart Life, Action LSC, Lidl Home, Nedis, Calex, Konyks, Thank's GiFi). Si DomoLink Tuya OEM est déjà configuré dans HA, laissez le mot de passe vide ou saisissez-le pour forcer une synchro directe.
+                </div>
+                <div class="form-grid">
+                  <div class="form-group">
+                    <label for="prov-brand">Application Tuya / OEM</label>
+                    <select id="prov-brand" class="form-select">
+                      ${brands
+                        .map(
+                          (b) =>
+                            `<option value="${this._escapeHtml(b.key)}" ${pw.brand === b.key ? "selected" : ""}>${this._escapeHtml(b.name)}</option>`
+                        )
+                        .join("")}
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-account-name">Libellé du compte</label>
+                    <input type="text" id="prov-account-name" class="form-input" placeholder="Ex: Maison LSC / SmartLife" value="${this._escapeHtml(pw.accountName)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-username">Adresse e-mail / Téléphone</label>
+                    <input type="text" id="prov-username" class="form-input" placeholder="prenom.nom@exemple.com" value="${this._escapeHtml(pw.username)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-password">Mot de passe</label>
+                    <input type="password" id="prov-password" class="form-input" placeholder="••••••••" value="${this._escapeHtml(pw.password)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-country">Indicatif pays</label>
+                    <input type="text" id="prov-country" class="form-input" placeholder="33" value="${this._escapeHtml(pw.countryCode)}" />
+                  </div>
+                </div>
+                <div style="margin-top: 14px; display: flex; gap: 10px;">
+                  <button class="btn-primary" id="btn-prov-login-submit" ${pw.loading ? "disabled" : ""}>
+                    ${pw.loading ? "⏳ Connexion Tuya OEM..." : "⚡ Connecter &amp; Synchroniser Tuya OEM"}
+                  </button>
+                </div>
+              `
+                  : prov === "blink"
+                  ? `
+                <div style="font-size: 12px; color: #94a3b8; margin-bottom: 12px;">
+                  💡 Connexion API REST Blink avec gestion automatique de la validation 2FA par code PIN et mode Économie Batterie intégré.
+                </div>
+                <div class="form-grid">
+                  <div class="form-group">
+                    <label for="prov-account-name">Libellé du compte</label>
+                    <input type="text" id="prov-account-name" class="form-input" placeholder="Ex: Blink Maison" value="${this._escapeHtml(pw.accountName)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-username">Adresse e-mail Blink</label>
+                    <input type="email" id="prov-username" class="form-input" placeholder="prenom.nom@exemple.com" value="${this._escapeHtml(pw.username)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-password">Mot de passe Blink</label>
+                    <input type="password" id="prov-password" class="form-input" placeholder="••••••••" value="${this._escapeHtml(pw.password)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-region">Région Blink</label>
+                    <select id="prov-region" class="form-select">
+                      <option value="prod" ${pw.region === "prod" || pw.region === "eu" ? "selected" : ""}>Automatique (prod / prde)</option>
+                      <option value="prde" ${pw.region === "prde" ? "selected" : ""}>Europe (prde)</option>
+                      <option value="prsg" ${pw.region === "prsg" ? "selected" : ""}>Asie / Pacifique</option>
+                    </select>
+                  </div>
+                </div>
+                <div style="margin-top: 14px; display: flex; gap: 10px;">
+                  <button class="btn-primary" id="btn-prov-login-submit" ${pw.loading ? "disabled" : ""}>
+                    ${pw.loading ? "⏳ Connexion à Blink..." : "🔋 Se connecter à Blink"}
+                  </button>
+                </div>
+              `
+                  : prov === "ezviz"
+                  ? `
+                <div style="font-size: 12px; color: #94a3b8; margin-bottom: 12px;">
+                  💡 Connectez votre compte Ezviz. Renseignez le <strong>Code de vérification</strong> inscrit sur l'étiquette sous la caméra (6 lettres majuscules) pour débloquer le flux RTSP local direct.
+                </div>
+                <div class="form-grid">
+                  <div class="form-group">
+                    <label for="prov-account-name">Libellé du compte</label>
+                    <input type="text" id="prov-account-name" class="form-input" placeholder="Ex: Ezviz Garage" value="${this._escapeHtml(pw.accountName)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-username">E-mail ou téléphone Ezviz</label>
+                    <input type="text" id="prov-username" class="form-input" placeholder="prenom.nom@exemple.com" value="${this._escapeHtml(pw.username)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-password">Mot de passe Ezviz</label>
+                    <input type="password" id="prov-password" class="form-input" placeholder="••••••••" value="${this._escapeHtml(pw.password)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-verif-code">Code de vérification RTSP (optionnel)</label>
+                    <input type="text" id="prov-verif-code" class="form-input" placeholder="Ex: ABCDEF (étiquette caméra)" value="${this._escapeHtml(pw.verificationCode)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-region">Région Cloud Ezviz</label>
+                    <select id="prov-region" class="form-select">
+                      <option value="eu" ${pw.region === "eu" ? "selected" : ""}>Europe (apiieu.ezvizlife.com)</option>
+                      <option value="us" ${pw.region === "us" ? "selected" : ""}>Amériques (apiius.ezvizlife.com)</option>
+                      <option value="global" ${pw.region === "global" ? "selected" : ""}>Asie / Global (apiisgp.ezvizlife.com)</option>
+                    </select>
+                  </div>
+                </div>
+                <div style="margin-top: 14px; display: flex; gap: 10px;">
+                  <button class="btn-primary" id="btn-prov-login-submit" ${pw.loading ? "disabled" : ""}>
+                    ${pw.loading ? "⏳ Connexion à Ezviz..." : "📹 Se connecter à Ezviz"}
+                  </button>
+                </div>
+              `
+                  : `
+                <div style="font-size: 12px; color: #94a3b8; margin-bottom: 12px;">
+                  💡 Connexion directe sans Cloud vers votre caméra ou NVR <strong>Reolink</strong> sur le réseau local (CGI HTTP/HTTPS + flux RTSP Sub/Main haute fluidité).
+                </div>
+                <div class="form-grid">
+                  <div class="form-group">
+                    <label for="prov-account-name">Nom de la caméra / du NVR</label>
+                    <input type="text" id="prov-account-name" class="form-input" placeholder="Ex: Portail Reolink" value="${this._escapeHtml(pw.accountName)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-host">Adresse IP locale ou Hôte</label>
+                    <input type="text" id="prov-host" class="form-input" placeholder="192.168.1.50" value="${this._escapeHtml(pw.host)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-username">Identifiant (admin par défaut)</label>
+                    <input type="text" id="prov-username" class="form-input" placeholder="admin" value="${this._escapeHtml(pw.username || "admin")}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-password">Mot de passe caméra</label>
+                    <input type="password" id="prov-password" class="form-input" placeholder="••••••••" value="${this._escapeHtml(pw.password)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-port">Port HTTP / HTTPS CGI</label>
+                    <input type="text" id="prov-port" class="form-input" placeholder="80" value="${this._escapeHtml(pw.port)}" />
+                  </div>
+                  <div class="form-group">
+                    <label for="prov-rtsp-port">Port RTSP</label>
+                    <input type="text" id="prov-rtsp-port" class="form-input" placeholder="554" value="${this._escapeHtml(pw.rtspPort)}" />
+                  </div>
+                </div>
+                <div style="margin-top: 14px; display: flex; gap: 10px;">
+                  <button class="btn-primary" id="btn-prov-login-submit" ${pw.loading ? "disabled" : ""}>
+                    ${pw.loading ? "⏳ Connexion Reolink..." : "🎥 Connecter Reolink en Local"}
+                  </button>
+                </div>
+              `
+              }
+              `
+              }
             </div>
           `
               : ""
           }
 
           ${
-            accounts.length === 0
+            totalAccounts === 0
               ? `<div style="padding: 16px; border: 1px dashed rgba(255,255,255,0.12); border-radius: 10px; color: #8b949e; font-size: 13px; text-align: center;">
-                  Aucun compte Arlo Cloud configuré pour le moment. Cliquez sur <strong>➕ Ajouter un compte Arlo</strong> ci-dessus.
+                  Aucun compte caméra configuré pour le moment. Cliquez sur <strong>➕ Ajouter un compte Caméra</strong> ci-dessus.
                 </div>`
               : `
             <div class="discovered-list">
-              ${accounts
+              ${arloAccounts
                 .map((acc) => {
                   const isOk = acc.status === "connected";
                   const statusLabel = isOk
@@ -3418,6 +3853,7 @@ class DomolinkCameraPanel extends HTMLElement {
                       <div>
                         <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                           <span class="badge-protocol ${isOk ? "badge-green" : "badge-orange"}">${statusLabel}</span>
+                          <span class="driver-badge">🛡️ Arlo</span>
                           <strong style="color: #f0f6fc; font-size: 15px;">${this._escapeHtml(acc.name || acc.email || acc.id)}</strong>
                           ${acc.email ? `<span style="color: #8b949e; font-size: 12px;">(${this._escapeHtml(acc.email)})</span>` : ""}
                         </div>
@@ -3453,6 +3889,72 @@ class DomolinkCameraPanel extends HTMLElement {
                               dev.already_added
                                 ? `<span class="badge-already-added" style="font-size: 11px; padding: 3px 8px;">✓ Intégrée</span>`
                                 : `<button class="btn-primary btn-arlo-add-dev" data-account-id="${this._escapeHtml(acc.id)}" data-device-id="${this._escapeHtml(dev.device_id)}" style="padding: 5px 10px; font-size: 11px;">+ Ajouter</button>`
+                            }
+                          </div>
+                        `
+                          )
+                          .join("")}
+                      </div>
+                    `
+                        : ""
+                    }
+                  </div>
+                `;
+                })
+                .join("")}
+
+              ${provAccounts
+                .map((acc) => {
+                  const isOk = acc.status === "connected";
+                  const statusLabel = isOk
+                    ? "🟢 Connecté"
+                    : acc.status === "token_expired"
+                    ? "🟠 Jeton expiré"
+                    : "🔴 Déconnecté";
+                  const syncStr = acc.last_sync ? this._formatTime(acc.last_sync) : "Jamais";
+                  const devs = acc.devices || [];
+                  const ident = acc.username || acc.host || "";
+                  return `
+                  <div class="discovered-item" style="flex-direction: column; align-items: stretch; gap: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+                      <div>
+                        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                          <span class="badge-protocol ${isOk ? "badge-green" : "badge-orange"}">${statusLabel}</span>
+                          <span class="driver-badge">${providerIcon(acc.provider)} ${this._escapeHtml(acc.provider_label || acc.provider)}</span>
+                          <strong style="color: #f0f6fc; font-size: 15px;">${this._escapeHtml(acc.name || ident || acc.id)}</strong>
+                          ${ident ? `<span style="color: #8b949e; font-size: 12px;">(${this._escapeHtml(ident)})</span>` : ""}
+                        </div>
+                        <div style="font-size: 12px; color: #8b949e; margin-top: 4px;">
+                          ${acc.camera_count || devs.length} caméra(s) détectée(s) • Dernière synchro : ${this._escapeHtml(syncStr)}
+                          ${acc.last_error ? `<span style="color: #fca5a5;"> • ⚠️ ${this._escapeHtml(acc.last_error)}</span>` : ""}
+                        </div>
+                      </div>
+                      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        <button class="btn-secondary btn-prov-sync" data-account-id="${this._escapeHtml(acc.id)}" title="Synchroniser et importer les caméras">🔄 Synchroniser</button>
+                        <button class="btn-danger btn-prov-delete-acc" data-account-id="${this._escapeHtml(acc.id)}" title="Supprimer ce compte">🗑️</button>
+                      </div>
+                    </div>
+
+                    ${
+                      devs.length > 0
+                        ? `
+                      <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 10px;">
+                        ${devs
+                          .map(
+                            (dev) => `
+                          <div style="background: rgba(15,23,42,0.7); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+                            <div style="min-width: 0;">
+                              <div style="font-weight: 600; color: #f0f6fc; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${this._escapeHtml(dev.name)}</div>
+                              <div style="font-size: 11px; color: #8b949e;">
+                                ${this._escapeHtml(dev.model_id || acc.provider_label || acc.provider)}
+                                ${dev.battery_level !== null && dev.battery_level !== undefined ? ` • 🔋 ${this._escapeHtml(dev.battery_level)}%` : ""}
+                                ${dev.local_ip ? ` • 🏠 ${this._escapeHtml(dev.local_ip)}` : ""}
+                              </div>
+                            </div>
+                            ${
+                              dev.already_added
+                                ? `<span class="badge-already-added" style="font-size: 11px; padding: 3px 8px;">✓ Intégrée</span>`
+                                : `<button class="btn-primary btn-prov-add-dev" data-account-id="${this._escapeHtml(acc.id)}" data-device-id="${this._escapeHtml(dev.device_id)}" style="padding: 5px 10px; font-size: 11px;">+ Ajouter</button>`
                             }
                           </div>
                         `
@@ -4145,6 +4647,7 @@ class DomolinkCameraPanel extends HTMLElement {
   _bindArloEvents() {
     const root = this.shadowRoot;
     const w = this._arloWizard;
+    const pw = this._providerWizard;
 
     const openBtn = root.querySelector("#btn-arlo-open-wizard");
     if (openBtn) {
@@ -4153,6 +4656,20 @@ class DomolinkCameraPanel extends HTMLElement {
         this.render();
       };
     }
+
+    root.querySelectorAll(".btn-cloud-provider-tab").forEach((btn) => {
+      btn.onclick = () => {
+        const targetProv = btn.dataset.provider || "arlo";
+        this._wizardProvider = targetProv;
+        w.error = "";
+        w.message = "";
+        pw.step = "login";
+        pw.error = "";
+        pw.message = "";
+        if (targetProv === "reolink" && !pw.username) pw.username = "admin";
+        this.render();
+      };
+    });
 
     root.querySelectorAll(".btn-arlo-mode-tab").forEach((btn) => {
       btn.onclick = () => {
@@ -4179,6 +4696,63 @@ class DomolinkCameraPanel extends HTMLElement {
     bindInput("#arlo-token", "token");
     bindInput("#arlo-userid", "userId");
     bindInput("#arlo-xcloudid", "xcloudId");
+
+    const bindProvInput = (sel, key) => {
+      const el = root.querySelector(sel);
+      if (el) {
+        const ev = el.tagName === "SELECT" ? "onchange" : "oninput";
+        el[ev] = (e) => {
+          pw[key] = e.target.value;
+        };
+      }
+    };
+    bindProvInput("#prov-brand", "brand");
+    bindProvInput("#prov-account-name", "accountName");
+    bindProvInput("#prov-username", "username");
+    bindProvInput("#prov-password", "password");
+    bindProvInput("#prov-country", "countryCode");
+    bindProvInput("#prov-region", "region");
+    bindProvInput("#prov-verif-code", "verificationCode");
+    bindProvInput("#prov-host", "host");
+    bindProvInput("#prov-port", "port");
+    bindProvInput("#prov-rtsp-port", "rtspPort");
+    bindProvInput("#prov-otp-code", "otpCode");
+
+    const provLoginBtn = root.querySelector("#btn-prov-login-submit");
+    if (provLoginBtn) provLoginBtn.onclick = () => this._startProviderLogin();
+
+    const provVerifyBtn = root.querySelector("#btn-prov-verify-otp");
+    if (provVerifyBtn) provVerifyBtn.onclick = () => this._verifyProvider2faCode();
+
+    const provBackBtn = root.querySelector("#btn-prov-back-login");
+    if (provBackBtn) {
+      provBackBtn.onclick = () => {
+        pw.step = "login";
+        pw.error = "";
+        pw.message = "";
+        this.render();
+      };
+    }
+
+    root.querySelectorAll(".btn-prov-sync").forEach((btn) => {
+      btn.onclick = () => this._syncProviderAccount(btn.dataset.accountId, true);
+    });
+
+    root.querySelectorAll(".btn-prov-delete-acc").forEach((btn) => {
+      btn.onclick = () => this._deleteProviderAccount(btn.dataset.accountId);
+    });
+
+    root.querySelectorAll(".btn-prov-add-dev").forEach((btn) => {
+      btn.onclick = () => {
+        const accId = btn.dataset.accountId;
+        const devId = btn.dataset.deviceId;
+        const acc = (this._providerAccounts || []).find((a) => a.id === accId);
+        const dev = acc && (acc.devices || []).find((d) => String(d.device_id) === String(devId));
+        if (acc && dev) {
+          this._addProviderCameraFromAccount(acc, dev);
+        }
+      };
+    });
 
     const factorSelect = root.querySelector("#arlo-factor-select");
     if (factorSelect) {
