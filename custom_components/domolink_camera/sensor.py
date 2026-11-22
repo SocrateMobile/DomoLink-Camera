@@ -8,7 +8,7 @@ from typing import Any
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, VERSION
@@ -79,7 +79,7 @@ class DomoLinkCameraStatusSensor(SensorEntity):
         driver = self.manager.drivers.get(self.camera_id)
         if driver:
             caps = driver.get_capabilities() or {}
-            for key in ("battery_level", "signal_strength", "account_email", "model_id"):
+            for key in ("battery_level", "signal_strength", "model_id"):
                 if caps.get(key) is not None and caps.get(key) != "":
                     attrs[key] = caps[key]
         return attrs

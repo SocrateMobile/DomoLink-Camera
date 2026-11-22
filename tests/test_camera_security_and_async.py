@@ -17,7 +17,7 @@ def test_manifest_structure_and_version():
 
     assert manifest["domain"] == "domolink_camera"
     assert manifest["name"] == "DomoLink Camera"
-    assert manifest["version"] == "1.7.1"
+    assert manifest["version"] == "1.8.0"
     assert manifest["codeowners"] == ["@SocrateMobile"]
     assert "socratemobile" in manifest["documentation"].lower()
     assert "SocrateMobile" in manifest["issue_tracker"]
@@ -77,7 +77,8 @@ def test_views_require_auth_and_admin_checks():
                                         requires_auth = item.value.value
                     views[node.name] = requires_auth
 
-    assert len(views) >= 4, f"Expected 4 views, found {len(views)}"
+    assert len(views) == 3, f"Expected 3 views, found {len(views)}: {list(views.keys())}"
+    assert "DomolinkTvProxyView" not in views
     for view_name, req_auth in views.items():
         assert req_auth is True, f"View {view_name} must have requires_auth = True (found {req_auth})"
 
@@ -124,3 +125,130 @@ def test_no_direct_blocking_io_in_async_functions():
                 check_node(item)
 
     assert not violations, f"Blocking calls found: {violations}"
+
+
+def test_local_hls_bundle_and_no_cdn_urls():
+    """Verify hls.min.js is bundled locally and no CDN script URLs exist in panel JS."""
+    hls_path = os.path.join(COMPONENT_DIR, "frontend", "hls.min.js")
+    assert os.path.isfile(hls_path), "frontend/hls.min.js must be bundled locally"
+    assert os.path.getsize(hls_path) > 50_000, "hls.min.js appears incomplete"
+
+    panel_path = os.path.join(COMPONENT_DIR, "frontend", "domolink-camera-panel.js")
+    with open(panel_path, "r", encoding="utf-8") as f:
+        panel_js = f.read()
+
+    assert "cdn.jsdelivr.net" not in panel_js
+    assert "/domolink_camera_panel/hls.min.js" in panel_js
+    assert 'onerror="' not in panel_js
+
+
+def test_no_pickle_storage_or_obfuscation():
+    """Verify removal of pickle.load, third-party .storage reads, and _d() obfuscation."""
+    forbidden_patterns = (
+        "pickle.load",
+        ".storage/core.config_entries",
+        ".storage/xiaomi_miot",
+        ".storage/domolink_tuya_oem_overrides",
+        "def _d(",
+        "DomolinkTvProxyView",
+    )
+    for root, _, files in os.walk(COMPONENT_DIR):
+        for file in files:
+            if not file.endswith(".py"):
+                continue
+            path = os.path.join(root, file)
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            for pat in forbidden_patterns:
+                assert pat not in content, f"Forbidden pattern '{pat}' found in {path}"
+
+
+def test_all_websocket_commands_require_admin():
+    """Verify every WebSocket command in api.py has @websocket_api.require_admin."""
+    api_path = os.path.join(COMPONENT_DIR, "api.py")
+    with open(api_path, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=api_path)
+
+    ws_funcs = []
+    missing_admin = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name.startswith("ws_"):
+            ws_funcs.append(node.name)
+            dec_names = []
+            for dec in node.decorator_list:
+                if isinstance(dec, ast.Attribute):
+                    dec_names.append(dec.attr)
+                elif isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute):
+                    dec_names.append(dec.func.attr)
+            if "require_admin" not in dec_names:
+                missing_admin.append(node.name)
+
+    assert len(ws_funcs) >= 20, f"Expected >=20 ws_* handlers, found {len(ws_funcs)}"
+    assert not missing_admin, f"WS handlers missing @require_admin: {missing_admin}"
+
+
+def test_secret_sanitization_and_pairing_validation():
+    """Verify secrets are stripped from public payloads and pairing validates SSID/IP."""
+    from unittest.mock import MagicMock
+    import tests.test_pairing  # noqa: F401 - initializes HA module stubs
+    from custom_components.domolink_camera.manager import _sanitize_camera_public
+    from custom_components.domolink_camera.drivers.cloud_accounts import ProviderAccountSession
+    from custom_components.domolink_camera.pairing import _validate_camera_ssid, _validate_private_ap_ip
+
+    sanitized = _sanitize_camera_public({
+        "id": "cam1",
+        "name": "Front",
+        "password": "my_secret_password",
+        "local_key": "secret_tuya_key",
+        "verification_code": "ABCDEF",
+        "access_token": "tok_123",
+        "stream_url": "rtsp://admin:my_secret_password@192.168.1.50:554/stream1",
+    })
+    for key in ("password", "local_key", "verification_code", "access_token"):
+        assert key not in sanitized
+    assert "my_secret_password" not in sanitized["stream_url"]
+    assert "***:***@" in sanitized["stream_url"]
+
+    sess = ProviderAccountSession(
+        account_id="p1",
+        provider="ezviz",
+        devices=[{"device_id": "d1", "local_key": "k1", "verification_code": "V1", "rtsp_url": "rtsp://u:p@192.168.1.10/h264"}],
+        hass=MagicMock(),
+    )
+    pub = sess.to_public_dict()
+    assert "local_key" not in pub["devices"][0]
+    assert "verification_code" not in pub["devices"][0]
+    assert "u:p@" not in pub["devices"][0]["rtsp_url"]
+
+    assert _validate_camera_ssid("AYS-123456") == "AYS-123456"
+    assert _validate_camera_ssid("-malicious") is None
+    assert _validate_camera_ssid("bad\nssid") is None
+    assert _validate_private_ap_ip("192.168.1.1") == "192.168.1.1"
+    for bad_ip in ("127.0.0.1", "169.254.169.254", "8.8.8.8", "not-an-ip"):
+        with pytest.raises(ValueError):
+            _validate_private_ap_ip(bad_ip)
+
+
+def test_options_flow_no_arg_instantiation():
+    """Verify DomoLinkCameraOptionsFlow instantiates without config_entry argument."""
+    import sys
+    from unittest.mock import MagicMock
+    import tests.test_pairing  # noqa: F401 - initializes HA module stubs
+
+    class _StubConfigFlow:
+        def __init_subclass__(cls, **kwargs):
+            pass
+
+    sys.modules["homeassistant.config_entries"].ConfigFlow = _StubConfigFlow
+    sys.modules["homeassistant.config_entries"].OptionsFlow = type("OptionsFlow", (), {})
+    sys.modules["homeassistant.config_entries"].ConfigFlowResult = dict
+
+    from custom_components.domolink_camera.config_flow import (
+        DomoLinkCameraConfigFlow,
+        DomoLinkCameraOptionsFlow,
+    )
+
+    flow = DomoLinkCameraOptionsFlow()
+    assert flow is not None
+    flow2 = DomoLinkCameraConfigFlow.async_get_options_flow(MagicMock())
+    assert isinstance(flow2, DomoLinkCameraOptionsFlow)

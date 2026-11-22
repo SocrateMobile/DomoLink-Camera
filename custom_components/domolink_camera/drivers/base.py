@@ -13,6 +13,22 @@ from ..const import DEFAULT_STREAM_FPS, MAX_UDP_FRAME_BUFFER, STATUS_STREAMING
 
 _LOGGER = logging.getLogger(__name__)
 
+_FFMPEG_PATH: str | None = None
+_FFMPEG_CHECKED: bool = False
+
+
+async def async_has_ffmpeg(hass: Any = None) -> bool:
+    """Resolve and cache ffmpeg binary availability without blocking the event loop."""
+    global _FFMPEG_PATH, _FFMPEG_CHECKED
+    if _FFMPEG_CHECKED:
+        return bool(_FFMPEG_PATH)
+    if hass is not None and hasattr(hass, "async_add_executor_job"):
+        _FFMPEG_PATH = await hass.async_add_executor_job(shutil.which, "ffmpeg")
+    else:
+        _FFMPEG_PATH = await asyncio.to_thread(shutil.which, "ffmpeg")
+    _FFMPEG_CHECKED = True
+    return bool(_FFMPEG_PATH)
+
 
 def extract_jpegs_from_buffer(buf: bytearray) -> list[bytes]:
     """Extract complete JPEG frames (SOI..EOI) from a rolling byte buffer."""
@@ -196,7 +212,7 @@ class BaseCameraDriver(abc.ABC):
         self, url: str, timeout_s: float = 8.0
     ) -> bytes | None:
         """Extract a single JPEG frame from an RTSP, RTSPS, HTTP, or HLS stream via FFmpeg."""
-        if not url or not shutil.which("ffmpeg"):
+        if not url or not await async_has_ffmpeg(getattr(self, "hass", None)):
             return None
         if not url.lower().startswith(("rtsp://", "rtsps://", "http://", "https://")):
             return None
@@ -251,7 +267,7 @@ class BaseCameraDriver(abc.ABC):
         self, url: str, fps: int = DEFAULT_STREAM_FPS, quality: int = 5
     ) -> bool:
         """Transcode an RTSP/RTSPS/HLS stream into JPEG frames via FFmpeg pipe."""
-        if not url or not shutil.which("ffmpeg"):
+        if not url or not await async_has_ffmpeg(getattr(self, "hass", None)):
             return False
 
         for label, extra_args in self._ffmpeg_input_attempts(url):

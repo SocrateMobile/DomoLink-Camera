@@ -38,11 +38,13 @@ for mod in ha_mods:
 # Mock Store and callback
 sys.modules["homeassistant.helpers.storage"].Store = MagicMock()
 sys.modules["homeassistant.helpers.aiohttp_client"].async_get_clientsession = MagicMock()
+sys.modules["homeassistant.helpers.entity_registry"].async_get = lambda hass: hass.data.get("entity_registry") if isinstance(getattr(hass, "data", None), dict) else None
 sys.modules["homeassistant.exceptions"].Unauthorized = type("Unauthorized", (Exception,), {})
 sys.modules["homeassistant.core"].callback = lambda f: f
 sys.modules["homeassistant.core"].HomeAssistant = MagicMock
 sys.modules["homeassistant.config_entries"].ConfigEntry = MagicMock
 sys.modules["homeassistant.components.http"].HomeAssistantView = MagicMock
+sys.modules["homeassistant.components.http"].StaticPathConfig = MagicMock
 sys.modules["homeassistant.components.websocket_api"].websocket_command = lambda schema: lambda f: f
 sys.modules["homeassistant.components.websocket_api"].async_response = lambda f: f
 sys.modules["homeassistant.components.websocket_api"].require_admin = lambda f: f
@@ -211,8 +213,9 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
         mock_session.get.return_value.__aenter__.return_value = mock_resp
         mock_session.post.return_value.__aenter__.return_value = mock_resp
 
-        with patch("custom_components.domolink_camera.pairing.os.environ.get", return_value="mock_token"):
-            self.mock_hass.helpers.aiohttp_client.async_get_clientsession.return_value = mock_session
+        with patch("custom_components.domolink_camera.pairing.os.environ.get", return_value="mock_token"), patch(
+            "custom_components.domolink_camera.pairing.async_get_clientsession", return_value=mock_session
+        ):
             aps = await self.engine.async_scan_camera_aps()
             self.assertTrue(len(aps) >= 2)
             # The detected camera APs must be flagged is_camera = True
@@ -632,83 +635,55 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cands_cloud, [("rtsps://cloud.arlo.com/stream", "cloud_hybrid")])
 
     async def test_arlo_aarlo_session_adoption_and_401_refresh(self) -> None:
-        """Verify .aarlo session reuse avoids OCAPI Cloudflare and auto-refreshes stale 401 tokens."""
-        import pickle
-        import tempfile
+        """Verify token-based Arlo session handles 401 expiration cleanly without reading .aarlo pickle files."""
+        sess = ArloCloudAccountSession(
+            account_id="acc_token",
+            email="user@example.com",
+            token="VALID_TOK",
+            hass=self.mock_hass,
+        )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            aarlo_dir = os.path.join(tmpdir, ".aarlo")
-            os.makedirs(aarlo_dir, exist_ok=True)
-            with open(os.path.join(aarlo_dir, "session.pickle"), "wb") as f:
-                pickle.dump(
-                    {
-                        "user@example.com": {
-                            "token": "FRESH_AARLO_TOK",
-                            "user_id": "UID_42",
+        async def ok_devices(self_obj, url, headers):
+            if headers.get("Authorization") == "VALID_TOK":
+                return 200, {
+                    "success": True,
+                    "data": [
+                        {
+                            "deviceId": "DEV_LAN",
+                            "deviceName": "Cuisine",
+                            "deviceType": "camera",
+                            "modelId": "VMC3050A",
+                            "properties": {
+                                "connectivity": [{"ipAddr": "192.168.1.90", "connected": True}]
+                            },
                         }
-                    },
-                    f,
-                )
-            with open(os.path.join(aarlo_dir, "cookies.txt"), "w", encoding="utf-8") as f:
-                f.write("#LWP-Cookies-2.0\n")
+                    ],
+                }, "{}"
+            return 401, {"success": False}, "{}"
 
-            self.mock_hass.config.path = MagicMock(side_effect=lambda p: os.path.join(tmpdir, p))
+        with patch.object(
+            ArloCloudAccountSession,
+            "_get_json",
+            autospec=True,
+            side_effect=ok_devices,
+        ):
+            devs = await sess.async_fetch_devices()
 
-            sess = ArloCloudAccountSession(
-                account_id="acc_aarlo",
-                email="user@example.com",
-                hass=self.mock_hass,
-            )
+        self.assertEqual(len(devs), 1)
+        self.assertEqual(sess.status, "connected")
 
-            async def ok_devices(self_obj, url, headers):
-                if headers.get("Authorization") == "FRESH_AARLO_TOK":
-                    return 200, {
-                        "success": True,
-                        "data": [
-                            {
-                                "deviceId": "DEV_LAN",
-                                "deviceName": "Cuisine",
-                                "deviceType": "camera",
-                                "modelId": "VMC3050A",
-                                "properties": {
-                                    "connectivity": [{"ipAddr": "192.168.1.90", "connected": True}]
-                                },
-                            }
-                        ],
-                    }, "{}"
-                return 401, {"success": False}, "{}"
+        # Expired token must transition cleanly to token_expired
+        sess.token = "EXPIRED_TOK"
+        with patch.object(
+            ArloCloudAccountSession,
+            "_get_json",
+            autospec=True,
+            side_effect=ok_devices,
+        ):
+            with self.assertRaises(RuntimeError):
+                await sess.async_fetch_devices()
 
-            with patch.object(
-                ArloCloudAccountSession,
-                "_get_json",
-                autospec=True,
-                side_effect=ok_devices,
-            ), patch.object(
-                ArloCloudAccountSession,
-                "_post_json",
-                autospec=True,
-                side_effect=AssertionError("OCAPI /api/auth should not be called when .aarlo is valid"),
-            ):
-                login_res = await sess.async_start_login("password123")
-
-            self.assertEqual(login_res["status"], "connected")
-            self.assertTrue(login_res.get("adopted_from_aarlo"))
-            self.assertEqual(sess.token, "FRESH_AARLO_TOK")
-            self.assertEqual(len(sess.devices), 1)
-
-            # Now test stale token auto-refresh on 401
-            sess.token = "STALE_BROWSER_TOK"
-            with patch.object(
-                ArloCloudAccountSession,
-                "_get_json",
-                autospec=True,
-                side_effect=ok_devices,
-            ):
-                devs = await sess.async_fetch_devices()
-
-            self.assertEqual(sess.token, "FRESH_AARLO_TOK")
-            self.assertEqual(len(devs), 1)
-            self.assertEqual(devs[0]["local_ip"], "192.168.1.90")
+        self.assertEqual(sess.status, "token_expired")
 
     async def test_arlo_sync_upgrades_matching_ha_proxy_camera(self) -> None:
         """Verify syncing Arlo upgrades matching ha_proxy camera in-place with LAN info."""
@@ -939,12 +914,13 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
         )
         from custom_components.domolink_camera.manager import CameraManager
 
-        # 1. Tuya OEM profiles deobfuscation
+        # 1. Tuya OEM profiles metadata (no embedded APK secrets)
         self.assertEqual(len(TUYA_OEM_PROFILES), 8)
         for bid in ("smartlife", "tuya", "lsc", "lidlhome", "nedis", "calex", "konyks", "thanks"):
             self.assertIn(bid, TUYA_OEM_PROFILES)
-            self.assertTrue(len(TUYA_OEM_PROFILES[bid]["client_id"]) >= 10)
-            self.assertTrue(len(TUYA_OEM_PROFILES[bid]["secret"]) >= 16)
+            self.assertNotIn("client_id", TUYA_OEM_PROFILES[bid])
+            self.assertNotIn("secret", TUYA_OEM_PROFILES[bid])
+            self.assertTrue(TUYA_OEM_PROFILES[bid]["package"].startswith("com."))
         self.assertEqual(len(get_tuya_oem_brands_list()), 8)
 
         # Fake network dispatcher for Blink, Ezviz, Reolink & Tuya
@@ -1095,58 +1071,13 @@ class TestWifiPairingEngine(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(reo_cams), 1)
             self.assertEqual(reo_cams[0]["local_ip"], "192.168.1.190")
 
-            # 5. Auto-import existing HA config entries (.storage/core.config_entries)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                storage_dir = os.path.join(tmpdir, ".storage")
-                os.makedirs(storage_dir, exist_ok=True)
-                with open(os.path.join(storage_dir, "core.config_entries"), "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "data": {
-                                "entries": [
-                                    {
-                                        "entry_id": "e_tuya",
-                                        "domain": "domolink_tuya_oem",
-                                        "title": "Smart Life (jfl@example.com)",
-                                        "data": {"username": "jfl@example.com", "brand": "smartlife", "country_code": "33"},
-                                    },
-                                    {
-                                        "entry_id": "e_blink",
-                                        "domain": "blink",
-                                        "title": "blink_ha",
-                                        "data": {"username": "blink@example.com", "token": "expired_tok", "account_id": "77", "region_id": "u001"},
-                                    },
-                                ]
-                            }
-                        },
-                        f,
-                    )
-
-                mgr2 = CameraManager(self.mock_hass)
-                mgr2.store.async_save = AsyncMock()
-                self.mock_hass.config = MagicMock()
-                self.mock_hass.config.path = MagicMock(return_value=tmpdir)
-
-                async def run_exec(func, *args):
-                    return func(*args)
-
-                self.mock_hass.async_add_executor_job = AsyncMock(side_effect=run_exec)
-                # Test _blink_base_url normalization ("e002.immedia-semi.com" -> "https://rest-e002.immedia-semi.com")
-                norm_sess = ProviderAccountSession(account_id="b_norm", provider="blink", host="e002.immedia-semi.com")
-                self.assertEqual(norm_sess._blink_base_url(), "https://rest-e002.immedia-semi.com")
-
-                # Dormant Blink camera present only in entity_registry (hass.states empty) must still import
-                self.mock_hass.states.async_all = MagicMock(return_value=[])
-
-                imported = await mgr2.async_auto_import_ha_provider_accounts(delay=0.0)
-                self.assertEqual(imported, 2)
-                listing = mgr2.get_provider_accounts_list()
-                self.assertEqual(len(listing["accounts"]), 2)
-                providers = {a["provider"] for a in listing["accounts"]}
-                self.assertEqual(providers, {"tuya_oem", "blink"})
-                ha_blink = [c for c in mgr2.cameras.values() if c.get("ha_entity_id") == "camera.camera_1"]
-                self.assertEqual(len(ha_blink), 1)
-                self.assertEqual(ha_blink[0]["driver"], DRIVER_BLINK_HYBRID)
+            # 5. Vendor domain validation for Blink and Ezviz base URLs
+            norm_sess = ProviderAccountSession(account_id="b_norm", provider="blink", host="e002.immedia-semi.com")
+            self.assertEqual(norm_sess._blink_base_url(), "https://rest-e002.immedia-semi.com")
+            bad_blink = ProviderAccountSession(account_id="b_bad", provider="blink", host="https://evil.example.com")
+            self.assertEqual(bad_blink._blink_base_url(), "https://rest-prod.immedia-semi.com")
+            bad_ez = ProviderAccountSession(account_id="e_bad", provider="ezviz", region="https://evil.example.com")
+            self.assertEqual(bad_ez._ezviz_base_url(), "https://apiieu.ezvizlife.com")
 
 
 if __name__ == "__main__":

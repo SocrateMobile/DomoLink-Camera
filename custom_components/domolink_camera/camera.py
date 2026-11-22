@@ -9,8 +9,9 @@ from typing import Any
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.network import get_url
 
 from .const import DOMAIN, DRIVER_HA_PROXY, NAME, VERSION
 from .drivers.generic_rtsp import GenericRtspDriver
@@ -58,6 +59,7 @@ class DomoLinkCameraEntity(Camera):
     """Home Assistant camera entity for DomoLink."""
 
     _attr_has_entity_name = True
+    _attr_name = None
     _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, manager: CameraManager, camera_id: str, entry_id: str) -> None:
@@ -72,11 +74,6 @@ class DomoLinkCameraEntity(Camera):
     def _cam(self) -> dict[str, Any]:
         """Resolve live camera configuration dictionary dynamically."""
         return self.manager.cameras.get(self.camera_id, {})
-
-    @property
-    def name(self) -> str:
-        """Return dynamic camera name."""
-        return str(self._cam.get("name", "Caméra"))
 
     @property
     def is_on(self) -> bool:
@@ -95,7 +92,7 @@ class DomoLinkCameraEntity(Camera):
         """Return device info for Home Assistant."""
         return DeviceInfo(
             identifiers={(DOMAIN, self.camera_id)},
-            name=self.name,
+            name=str(self._cam.get("name", "Caméra")),
             manufacturer="Arlo" if self._cam.get("driver") == "arlo_cloud" else "DomoLink",
             model=self._cam.get("model_id") or self._cam.get("driver", "YsxLite PPPP"),
             sw_version=VERSION,
@@ -113,7 +110,7 @@ class DomoLinkCameraEntity(Camera):
         driver = self.manager.drivers.get(self.camera_id)
         if driver:
             caps = driver.get_capabilities() or {}
-            for key in ("battery_level", "signal_strength", "account_email", "model_id"):
+            for key in ("battery_level", "signal_strength", "model_id"):
                 if caps.get(key) is not None and caps.get(key) != "":
                     attrs[key] = caps[key]
         return attrs
@@ -132,8 +129,12 @@ class DomoLinkCameraEntity(Camera):
 
         path = f"/api/domolink_camera/stream/{self.camera_id}"
         try:
+            base_url = get_url(self.hass, allow_internal=True, prefer_external=False).rstrip("/")
+        except Exception:
+            base_url = ""
+        try:
             from homeassistant.components.http.auth import async_sign_path
             signed = async_sign_path(self.hass, path, timedelta(hours=1))
-            return f"http://127.0.0.1:8123{signed}"
+            return f"{base_url}{signed}"
         except Exception:
-            return f"http://127.0.0.1:8123{path}"
+            return f"{base_url}{path}"

@@ -6,6 +6,7 @@ import logging
 import os
 
 from homeassistant.components import frontend
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
@@ -13,7 +14,6 @@ from .api import (
     DomolinkCameraSnapshotView,
     DomolinkCameraStreamView,
     DomolinkTvLiveStreamView,
-    DomolinkTvProxyView,
     register_websocket_handlers,
 )
 from .const import DOMAIN, NAME, VERSION
@@ -39,7 +39,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(DomolinkCameraSnapshotView(hass))
     hass.http.register_view(DomolinkCameraStreamView(hass))
     hass.http.register_view(DomolinkTvLiveStreamView(hass))
-    hass.http.register_view(DomolinkTvProxyView(hass))
 
     # Register WebSocket commands
     register_websocket_handlers(hass)
@@ -48,17 +47,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
 
     # Register static path
-    if hasattr(hass.http, "async_register_static_paths"):
-        from homeassistant.components.http import StaticPathConfig
-        await hass.http.async_register_static_paths([
-            StaticPathConfig("/domolink_camera_panel", frontend_dir, False)
-        ])
-    else:
-        hass.http.register_static_path(
-            "/domolink_camera_panel",
-            frontend_dir,
-            cache_headers=False,
-        )
+    await hass.http.async_register_static_paths([
+        StaticPathConfig("/domolink_camera_panel", frontend_dir, False)
+    ])
 
     try:
         frontend.async_remove_panel(hass, "domolink_camera")
@@ -96,12 +87,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         manager: CameraManager = hass.data[DOMAIN].get("manager")
         if manager:
-            # Disconnect all active camera drivers and close cloud sessions
-            for driver in list(manager.drivers.values()):
-                await driver.async_disconnect()
-            for session in list(getattr(manager, "arlo_sessions", {}).values()):
-                await session.async_close()
-            manager._listeners.clear()
+            await manager.async_close()
 
         hass.data[DOMAIN].pop(entry.entry_id, None)
         try:

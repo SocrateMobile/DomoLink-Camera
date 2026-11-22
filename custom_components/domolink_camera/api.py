@@ -52,6 +52,7 @@ from .const import (
     WS_TYPE_STOP_PAIRING,
     WS_TYPE_TRIGGER_LIVE,
 )
+from .manager import _sanitize_camera_public
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -220,7 +221,6 @@ class DomolinkTvLiveStreamView(HomeAssistantView):
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma": "no-cache",
                 "Connection": "close",
-                "Access-Control-Allow-Origin": "*",
             },
         )
         await response.prepare(request)
@@ -277,58 +277,12 @@ class DomolinkTvLiveStreamView(HomeAssistantView):
         return response
 
 
-class DomolinkTvProxyView(HomeAssistantView):
-    """CORS proxy for web HLS streams and playlists."""
-
-    url = "/api/domolink_camera/tv_proxy"
-    name = "api:domolink_camera:tv_proxy"
-    requires_auth = True
-
-    def __init__(self, hass: HomeAssistant) -> None:
-        """Initialize proxy view."""
-        self.hass = hass
-
-    async def get(self, request: web.Request) -> web.Response:
-        """Proxy external HLS stream bypassing browser CORS constraints."""
-        user = request.get("hass_user")
-        if not user or not user.is_admin:
-            raise Unauthorized()
-
-        url = request.query.get("url")
-        if not url:
-            return web.Response(status=400, text="Paramètre url requis.")
-
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return web.Response(status=400, text="Schéma d'URL non autorisé.")
-
-        hostname = parsed.hostname or ""
-        try:
-            ip = ipaddress.ip_address(hostname)
-            if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-                return web.Response(status=403, text="Adresse IP non autorisée.")
-        except ValueError:
-            pass
-
-        try:
-            session = async_get_clientsession(self.hass)
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8.0)) as resp:
-                data = await resp.read()
-                ct = resp.headers.get("Content-Type", "application/vnd.apple.mpegurl")
-                return web.Response(
-                    body=data,
-                    content_type=ct,
-                    headers={"Access-Control-Allow-Origin": "*"},
-                )
-        except Exception as e:
-            return web.Response(status=502, text=str(e))
-
-
 @callback
 def register_websocket_handlers(hass: HomeAssistant) -> None:
     """Register all DomoLink Camera WebSocket commands."""
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_GET_CAMERAS})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_get_cameras(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -373,7 +327,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
     ) -> None:
         mgr = hass.data[DOMAIN]["manager"]
         saved = await mgr.async_save_camera(msg["camera"])
-        connection.send_result(msg["id"], {"success": True, "camera": saved})
+        connection.send_result(msg["id"], {"success": True, "camera": _sanitize_camera_public(saved)})
 
     @websocket_api.websocket_command({
         vol.Required("type"): WS_TYPE_DELETE_CAMERA,
@@ -433,6 +387,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         connection.send_result(msg["id"], {"aps": aps})
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_PAIR_STATUS})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_pair_status(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -459,6 +414,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         )
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_GET_ENTITIES})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_get_entities(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -484,6 +440,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Required("camera_id"): str,
         vol.Required("live"): bool,
     })
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_trigger_live(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -539,6 +496,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         connection.send_result(msg["id"], {"success": ok})
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_DETECT_BOX})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_detect_box(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -549,6 +507,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         connection.send_result(msg["id"], box_info)
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_GET_TV_CHANNELS})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_get_tv_channels(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -563,6 +522,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         vol.Required("type"): WS_TYPE_GET_TV_STREAM,
         vol.Required("channel_id"): str,
     })
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_get_tv_stream(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -702,11 +662,12 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         asyncio.create_task(driver.async_connect())
         await mgr.async_save()
         mgr._notify_listeners()
-        connection.send_result(msg["id"], {"success": True, "camera": cam_config})
+        connection.send_result(msg["id"], {"success": True, "camera": _sanitize_camera_public(cam_config)})
 
     # --- Multi-Account Arlo Cloud WebSocket Commands ---
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_GET_ARLO_ACCOUNTS})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_get_arlo_accounts(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
@@ -837,6 +798,7 @@ def register_websocket_handlers(hass: HomeAssistant) -> None:
         connection.send_result(msg["id"], {"success": ok})
 
     @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_GET_PROVIDER_ACCOUNTS})
+    @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_get_provider_accounts(
         hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]

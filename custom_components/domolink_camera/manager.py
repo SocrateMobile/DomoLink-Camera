@@ -31,7 +31,6 @@ from .drivers.base import BaseCameraDriver
 from .drivers.cloud_accounts import (
     PROVIDER_DRIVER_MAP,
     ProviderAccountSession,
-    _read_ha_provider_entries_sync,
     get_tuya_oem_brands_list,
 )
 from .drivers.generic_rtsp import GenericRtspDriver
@@ -58,6 +57,45 @@ DEFAULT_PLACEHOLDER_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" width="640
 </svg>"""
 
 
+_SECRET_KEYS = (
+    "password",
+    "local_key",
+    "verification_code",
+    "access_token",
+    "token",
+    "refresh_token",
+    "cookie",
+    "secret",
+)
+
+
+def _mask_url_credentials(url: str) -> str:
+    """Mask embedded user:password@ credentials in RTSP/HTTP URLs."""
+    if not url or "://" not in url:
+        return url
+    masked = re.sub(r"(://)([^/@:\s]+):([^/@\s]+)@", r"\1***:***@", url)
+    return re.sub(r"(://)([^/@:\s]+)@", r"\1***@", masked)
+
+
+def _sanitize_camera_public(cam: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of camera data with secrets removed and URL credentials masked."""
+    clean = dict(cam)
+    for key in _SECRET_KEYS:
+        clean.pop(key, None)
+    for url_key in ("stream_url", "rtsp_url", "hls_url", "web_hls_url"):
+        if isinstance(clean.get(url_key), str) and clean[url_key]:
+            clean[url_key] = _mask_url_credentials(clean[url_key])
+    if isinstance(clean.get("capabilities"), dict):
+        caps = dict(clean["capabilities"])
+        for key in _SECRET_KEYS:
+            caps.pop(key, None)
+        for url_key in ("stream_url", "rtsp_url", "hls_url", "web_hls_url"):
+            if isinstance(caps.get(url_key), str) and caps[url_key]:
+                caps[url_key] = _mask_url_credentials(caps[url_key])
+        clean["capabilities"] = caps
+    return clean
+
+
 class CameraManager:
     """Manages all registered cameras, drivers, pairing, and layout persistence."""
 
@@ -76,6 +114,37 @@ class CameraManager:
         self.pairing_engine = WifiPairingEngine(hass)
         self.box_detector = BoxDetectorService(hass)
         self._listeners: list[Any] = []
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
+
+    def _spawn_bg_task(self, coro: Any) -> asyncio.Task[Any]:
+        """Track background tasks so they can be cancelled cleanly on unload."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    async def async_close(self) -> None:
+        """Cancel background tasks, disconnect drivers, and close all cloud sessions."""
+        for task in list(self._bg_tasks):
+            if not task.done():
+                task.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        self._bg_tasks.clear()
+
+        for driver in list(self.drivers.values()):
+            await driver.async_disconnect()
+        for session in list(self.arlo_sessions.values()):
+            await session.async_close()
+        for session in list(self._pending_arlo_logins.values()):
+            await session.async_close()
+        self._pending_arlo_logins.clear()
+        for session in list(self.provider_sessions.values()):
+            await session.async_close()
+        for session in list(self._pending_provider_logins.values()):
+            await session.async_close()
+        self._pending_provider_logins.clear()
+        self._listeners.clear()
 
     async def async_load(self) -> None:
         """Load Arlo cloud accounts, camera configs, and layout order from persistent storage."""
@@ -142,113 +211,10 @@ class CameraManager:
 
         # Connect drivers in background
         for driver in self.drivers.values():
-            asyncio.create_task(driver.async_connect())
+            self._spawn_bg_task(driver.async_connect())
 
-        # Automatically reuse valid HA .aarlo sessions and upgrade/enrich hybrid cameras
-        if self._has_local_aarlo_dir():
-            asyncio.create_task(self.async_auto_import_aarlo_sessions())
-            asyncio.create_task(self.async_auto_enrich_hybrid_cameras(delay=3.0))
-            asyncio.create_task(self.async_auto_import_ha_provider_accounts(delay=15.0))
-
-    def _has_local_aarlo_dir(self) -> bool:
-        """Return True when running inside HA with a concrete string .aarlo config path."""
-        if self.hass and hasattr(self.hass, "config") and hasattr(self.hass.config, "path"):
-            try:
-                p = self.hass.config.path(".aarlo")
-                return isinstance(p, str) and bool(p)
-            except Exception:
-                return False
-        return False
-
-    async def async_auto_import_aarlo_sessions(self) -> int:
-        """Import or refresh active Arlo sessions from HA's .aarlo cache on startup."""
-        if not self._has_local_aarlo_dir():
-            return 0
-
-        probe = ArloCloudAccountSession(account_id="__aarlo_probe__", email="", hass=self.hass)
-        try:
-            cache = await probe.async_load_local_aarlo_cache()
-        finally:
-            await probe.async_close()
-
-        sessions_map = cache.get("sessions") or {}
-        if not sessions_map:
-            return 0
-
-        updated = 0
-        for email_key, sess_info in sessions_map.items():
-            tok = str(sess_info.get("token") or "").strip()
-            email_val = str(sess_info.get("email") or email_key).strip()
-            if not tok or not email_val:
-                continue
-
-            existing_aid = None
-            for aid, s in self.arlo_sessions.items():
-                if s.email.strip().lower() == email_key:
-                    existing_aid = aid
-                    break
-
-            if existing_aid:
-                sess = self.arlo_sessions[existing_aid]
-                if sess.devices:
-                    await self.async_arlo_sync_account(
-                        existing_aid, auto_add=True, refresh_remote=False
-                    )
-                    updated += 1
-                if sess.token == tok and sess.status == "connected":
-                    try:
-                        await sess.async_fetch_devices()
-                        await self.async_arlo_sync_account(
-                            existing_aid, auto_add=True, refresh_remote=False
-                        )
-                        updated += 1
-                    except Exception as err:
-                        _LOGGER.debug("Existing .aarlo session refresh failed for %s: %s", email_val, err)
-                    continue
-
-                sess.token = tok
-                if sess_info.get("user_id"):
-                    sess.user_id = str(sess_info["user_id"])
-                if cache.get("cookie_header") and not sess.cookie:
-                    sess.cookie = str(cache["cookie_header"])
-                try:
-                    await sess.async_fetch_devices()
-                    await self.async_arlo_sync_account(
-                        existing_aid, auto_add=True, refresh_remote=False
-                    )
-                    updated += 1
-                except Exception as err:
-                    _LOGGER.debug("Skipped .aarlo refresh for %s: %s", email_val, err)
-                continue
-
-            aid = self._make_account_id(email_val)
-            sess = ArloCloudAccountSession(
-                account_id=aid,
-                email=email_val,
-                name=f"Arlo ({email_val})",
-                token=tok,
-                user_id=str(sess_info.get("user_id") or ""),
-                hass=self.hass,
-                cookie=str(cache.get("cookie_header") or ""),
-            )
-            try:
-                await sess.async_fetch_devices()
-            except Exception as err:
-                _LOGGER.debug("Skipping stale .aarlo session for %s: %s", email_val, err)
-                await sess.async_close()
-                continue
-
-            self.arlo_sessions[aid] = sess
-            self.arlo_accounts[aid] = sess.to_dict()
-            await self.async_arlo_sync_account(aid, auto_add=True, refresh_remote=False)
-            _LOGGER.info(
-                "Auto-imported active Arlo session '%s' (%d camera(s)) from .aarlo",
-                email_val,
-                len(sess.devices),
-            )
-            updated += 1
-
-        return updated
+        if self.cameras:
+            self._spawn_bg_task(self.async_auto_enrich_hybrid_cameras(delay=3.0))
 
     async def async_save(self) -> None:
         """Persist cameras, layout, and Cloud accounts to disk."""
@@ -408,7 +374,7 @@ class CameraManager:
                 "snapshot_timestamp": snap_time,
                 "night_vision": c.get("night_vision", False),
             }
-            result.append(item)
+            result.append(_sanitize_camera_public(item))
         return result
 
     async def async_save_layout(self, order_list: list[str]) -> bool:
@@ -1211,93 +1177,3 @@ class CameraManager:
             await self.async_save()
             self._notify_listeners()
         return existed
-
-    async def async_auto_import_ha_provider_accounts(self, delay: float = 0.0) -> int:
-        """Auto-import existing HA config entries for domolink_tuya_oem, blink, ezviz, reolink."""
-        if delay > 0:
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                return 0
-
-        if not self.hass or not hasattr(self.hass, "config") or not hasattr(self.hass.config, "path"):
-            return 0
-        try:
-            cfg_dir = self.hass.config.path()
-        except Exception:
-            return 0
-        if not isinstance(cfg_dir, str) or not cfg_dir:
-            return 0
-
-        if not callable(getattr(self.hass, "async_add_executor_job", None)):
-            return 0
-
-        try:
-            cache = await self.hass.async_add_executor_job(_read_ha_provider_entries_sync, cfg_dir)
-        except Exception as err:
-            _LOGGER.debug("Could not inspect HA config entries for auto-import: %s", err)
-            return 0
-
-        imported = 0
-        for entry in cache.get("entries") or []:
-            domain = entry.get("domain", "")
-            edata = entry.get("data") or {}
-            title = str(entry.get("title") or "").strip()
-
-            if domain == "domolink_tuya_oem":
-                prov = "tuya_oem"
-                uname = str(edata.get("username") or title or "").strip()
-                brand = str(edata.get("brand") or "tuya").strip().lower()
-                aid = self._make_provider_account_id(prov, uname, title or f"Tuya {brand}")
-                if aid not in self.provider_sessions:
-                    sess = ProviderAccountSession(
-                        account_id=aid,
-                        provider=prov,
-                        name=title or f"Tuya OEM ({brand})",
-                        username=uname,
-                        password=str(edata.get("password") or ""),
-                        brand=brand,
-                        country_code=str(edata.get("country_code") or "33"),
-                        uid=str(edata.get("uid") or ""),
-                        status="connected",
-                        hass=self.hass,
-                    )
-                    self.provider_sessions[aid] = sess
-                else:
-                    sess = self.provider_sessions[aid]
-                    sess.hass = self.hass
-                if not sess.devices or aid not in self.provider_accounts:
-                    await self.async_provider_sync_account(aid, auto_add=False, refresh_remote=True)
-                    imported += 1
-
-            elif domain == "blink":
-                prov = "blink"
-                uname = str(edata.get("username") or title or "blink").strip()
-                aid = self._make_provider_account_id(prov, uname, title or "Blink")
-                if aid not in self.provider_sessions:
-                    sess = ProviderAccountSession(
-                        account_id=aid,
-                        provider=prov,
-                        name=title or f"Blink ({uname})",
-                        username=uname,
-                        password=str(edata.get("password") or ""),
-                        host=str(edata.get("host") or ""),
-                        region=str(edata.get("region_id") or "prod"),
-                        token=str(edata.get("token") or ""),
-                        refresh_token=str(edata.get("refresh_token") or ""),
-                        uid=str(edata.get("uid") or ""),
-                        account_num_id=str(edata.get("account_id") or ""),
-                        client_id=str(edata.get("client_id") or ""),
-                        hardware_id=str(edata.get("hardware_id") or ""),
-                        status="connected" if edata.get("token") else "disconnected",
-                        hass=self.hass,
-                    )
-                    self.provider_sessions[aid] = sess
-                else:
-                    sess = self.provider_sessions[aid]
-                    sess.hass = self.hass
-                if not sess.devices or aid not in self.provider_accounts:
-                    await self.async_provider_sync_account(aid, auto_add=True, refresh_remote=True)
-                    imported += 1
-
-        return imported

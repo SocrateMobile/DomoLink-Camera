@@ -28,91 +28,53 @@ from .ha_proxy import _normalize_label, _normalize_mac, extract_tuya_device_id, 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _d(s: str, k: int = 0x5A) -> str:
-    """Deobfuscate embedded mobile app signature fields at runtime."""
-    if not s:
-        return ""
-    return bytes([b ^ k for b in base64.b85decode(s.encode("ascii"))]).decode("utf-8")
-
-
-# Verified mobile profiles extracted from official Tuya & OEM APKs
+# Supported Tuya & OEM mobile brand metadata (no embedded APK secrets; users may use HA's official Tuya integration or supply their own credentials)
 TUYA_OEM_PROFILES: dict[str, dict[str, Any]] = {
     "smartlife": {
         "name": "Smart Life (Officiel)",
-        "package": _d("IW;$QE-xcHbSXDGC@wZLJU;"),
-        "schema": _d("DK|SPE;chfKL"),
-        "client_id": _d("KQT8nEh=L?Zz?o0X)Y)}E-F1E"),
-        "secret": _d("C}}r8Z9OtKA}~KJC@eH8KQ}EmGA(I5A}%{QDl#KI"),
-        "cert_sha256": _d("Y8)A9Y-?j<V;LE08EJ1A8)6$78*gnM8yjzLV`&>`Y8f1FZ*6F8ZE9#A8)9!89&H$DXlP<%Zetu`VqzR0"),
-        "app_key": _d("Fg!hPC@F6-F*hhMZ#N=4GA}(WFF7bFEG=$nE^cBX"),
+        "package": "com.tuya.smartlife",
         "app_version": "7.10.0",
         "mobile_endpoint": "https://a1.tuyaeu.com/api.json",
     },
     "tuya": {
         "name": "Tuya Smart (Officiel)",
-        "package": _d("IW;$QE-xcHbSXDGC@u"),
-        "schema": _d("E-xcH2{$_^E&"),
-        "client_id": _d("X*nVyE@?Y2V<Ks3BQ7i}X)<Fl"),
-        "secret": _d("Z#_OPJ2WsZJZWMqBO);?GGc8xFfBYeD=;!FFfc1S"),
-        "cert_sha256": _d("V`*q>V;mW1ZD}89XliO4ZW|sSA8#COYh!C38EkKC7#nCCXdZ1CXdE1G9%ybE9&c|MZWwH9Z*OX9YaecE"),
-        "app_key": _d("JZUmMZ7M%5ZYpAFF+VpjK0I$ND=9l~E;}qJEN^XN"),
+        "package": "com.tuya.smart",
         "app_version": "7.8.6",
         "mobile_endpoint": "https://a1.tuyaeu.com/api.json",
     },
     "lsc": {
         "name": "Action LSC Smart Connect",
-        "package": _d("IW;$QHYqtNH#;aUIW;siKRGTlH8gZ7H#;aU"),
-        "schema": _d("HYqtNH#;aUIW;siKRGTlH8d$VJ18y"),
-        "client_id": _d("J|iMOH!(djIbtq6Vr@TdX>KuZ"),
-        "secret": _d("J!xV$FEB4MDk(Q_K0G%pGAcY{E-NuDZaX|8E-E`R"),
+        "package": "com.lscsmartconnect.smart",
         "app_version": "3.1.1",
         "mobile_endpoint": "https://a1.tuyaeu.com/api.json",
     },
     "lidlhome": {
         "name": "Lidl Home (Silvercrest)",
-        "package": _d("IW;$QHZwjpGBr0pbSXDGC@u"),
-        "schema": _d("HZwjpGBr0pDK|SPE&"),
-        "client_id": _d("DJ&u`EombwC@nBNJUeeZKQB8Y"),
-        "secret": _d("JSjdoD>82)X*oS@HzPi7GCyuHDJd^MJ~t^bB57$O"),
-        "cert_sha256": _d("ZEtR99Aao_8yFZHZyacEVr?5}Y;9_49vo;M8E9x5VrgP+Y;PWE9B*xGZfI+7Z)tCDZWteFA8TxBVsB}0"),
+        "package": "com.lidl.home",
         "app_version": "3.1.1",
         "mobile_endpoint": "https://a1.tuyaeu.com/api.json",
     },
     "nedis": {
         "name": "Nedis SmartLife",
-        "package": _d("IW;$QG(SEwDRe0}J18zTGdw>"),
-        "schema": _d("G(SEwDJeHQC@wZLJU;"),
-        "client_id": _d("E^RA4FElJHV`(BQKPo>yJ2E3}"),
-        "secret": _d("JZ>~@Ff3^(E;KhgBW@@wZYn4&Z6h!}FF!J3DQ`Y6"),
+        "package": "com.nedis.smartlife",
         "app_version": "3.1.1",
         "mobile_endpoint": "https://a1.tuyaeu.com/api.json",
     },
     "calex": {
         "name": "Calex Smart",
-        "package": _d("IW;$QIXgB#A}KdJC@yp<H#;aU"),
-        "schema": _d("IXgB#A}KdJC@v{CJ18y"),
-        "client_id": _d("Dlk1QFDf}PEj%}EEGr{4Ic{S="),
-        "secret": _d("ZY?P(G$~^!FEA`EZZa%CC@3*4J2!74D?DvIJZ)`1"),
+        "package": "com.calex.smart",
         "app_version": "3.1.1",
         "mobile_endpoint": "https://a1.tuyaeu.com/api.json",
     },
     "konyks": {
         "name": "Konyks",
-        "package": _d("IW;$QF*P(JF)0"),
-        "schema": _d("F*P(JF)0"),
-        "client_id": _d("BReiGFfJ@SV>>i0IV&kYZ80fh"),
-        "secret": _d("DljcAEMhAtDK|SgIWI9XVr?%YZYwKkFf24YDJ^0>"),
+        "package": "com.konyks",
         "app_version": "3.1.1",
         "mobile_endpoint": "https://a1.tuyaeu.com/api.json",
     },
     "thanks": {
         "name": "Thank's (GiFi)",
-        "package": _d("IW;$QE;2hbF)2GLDs(e7E&"),
-        "schema": _d("E;2hbF)2GLDg"),
-        "client_id": _d("EIT4AIU_wQGH!1$GA$@QD=Iy2"),
-        "secret": _d("X>B8IH*G8~DK|83X(}>lB5fl%Ep9X-Fd{i9Z(?pe"),
-        "cert_sha256": _d("9v^BPY#eB9Vq+U`7-}3F8y;_LV`3R%Vs335X&7u{XlZI<8yjkCY-1l{9&2J8Vrm;}A8l!392sk4Z)s_2"),
-        "app_key": _d("X(MhoEN?0?A}A^%DKsNAZa-opKRrETZ8s@xX+0uo"),
+        "package": "com.thanks.smart",
         "app_version": "3.1.1",
         "mobile_endpoint": "https://a1.tuyaeu.com/api.json",
     },
@@ -139,59 +101,6 @@ def get_tuya_oem_brands_list() -> list[dict[str, str]]:
         {"key": k, "name": v["name"], "package": v["package"]}
         for k, v in TUYA_OEM_PROFILES.items()
     ]
-
-
-def _read_ha_provider_entries_sync(config_dir: str) -> dict[str, Any]:
-    """Read HA .storage/core.config_entries & Tuya OEM overrides in executor thread."""
-    result: dict[str, Any] = {
-        "entries": [],
-        "tuya_overrides": {},
-    }
-    if not config_dir or not os.path.isdir(config_dir):
-        return result
-
-    ce_path = os.path.join(config_dir, ".storage", "core.config_entries")
-    if os.path.isfile(ce_path):
-        try:
-            with open(ce_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            entries = raw.get("data", {}).get("entries", [])
-            for item in entries:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("disabled_by"):
-                    continue
-                domain = str(item.get("domain") or "")
-                if domain in ("domolink_tuya_oem", "tuya", "blink", "ezviz", "reolink"):
-                    result["entries"].append({
-                        "entry_id": item.get("entry_id", ""),
-                        "domain": domain,
-                        "title": item.get("title", ""),
-                        "data": dict(item.get("data") or {}),
-                    })
-        except Exception as err:
-            _LOGGER.debug("Could not read core.config_entries: %s", err)
-
-    ov_path = os.path.join(config_dir, ".storage", "domolink_tuya_oem_overrides")
-    if os.path.isfile(ov_path):
-        try:
-            with open(ov_path, "r", encoding="utf-8") as f:
-                raw_ov = json.load(f)
-            payload = raw_ov.get("data", raw_ov) if isinstance(raw_ov, dict) else {}
-            if isinstance(payload, dict):
-                entries = payload.get("overrides") if isinstance(payload.get("overrides"), dict) else payload
-                for dev_id, info in entries.items():
-                    if isinstance(info, dict):
-                        ip_val = str(info.get("local_ip") or info.get("ip") or "").strip()
-                        result["tuya_overrides"][str(dev_id)] = {
-                            "local_ip": ip_val if is_private_lan_ip(ip_val) else "",
-                            "rtsp_url": str(info.get("rtsp_url") or info.get("stream_url") or "").strip(),
-                            "custom_name": str(info.get("custom_name") or "").strip(),
-                        }
-        except Exception:
-            pass
-
-    return result
 
 
 class ProviderAccountSession:
@@ -309,12 +218,12 @@ class ProviderAccountSession:
             "reolink": ("reolink",),
         }.get(self.provider, ())
 
-        ent_reg = self.hass.data.get("entity_registry") if isinstance(getattr(self.hass, "data", None), dict) else None
-        if ent_reg is None and hasattr(getattr(self.hass, "helpers", None), "entity_registry"):
-            try:
-                ent_reg = self.hass.helpers.entity_registry.async_get(self.hass)
-            except Exception:
-                ent_reg = None
+        ent_reg = None
+        try:
+            from homeassistant.helpers import entity_registry as er
+            ent_reg = er.async_get(self.hass)
+        except Exception:
+            ent_reg = None
         ent_map = getattr(ent_reg, "entities", {}) if ent_reg else {}
         if not isinstance(ent_map, dict) and not hasattr(ent_map, "get"):
             ent_map = {}
@@ -540,18 +449,25 @@ class ProviderAccountSession:
                 endpoint="https://a1.tuyaeu.com/api.json",
             )
         else:
+            extra = getattr(self, "extra", None) or {}
+            custom_client_id = str(extra.get("client_id") or "").strip()
+            custom_secret = str(extra.get("secret") or "").strip()
+            if not custom_client_id or not custom_secret:
+                self.last_error = (
+                    "Utilisez l'intégration officielle Home Assistant Tuya (passerelle ha_proxy) "
+                    "ou fournissez vos identifiants développeur Tuya (client_id et secret)."
+                )
+                self.status = "disconnected"
+                return {"status": "error", "error": self.last_error}
             custom_prof = TuyaMobileAppProfile(
                 name=prof_data["name"],
-                app_id=prof_data["client_id"],
-                app_secret=prof_data["secret"],
-                cert_sha256_hex=prof_data.get(
-                    "cert_sha256",
-                    "0FC361999CC0C35BA8ACA57DAA5593A20CF55727702EA85AD7B3228949F888FE",
-                ),
-                app_key=prof_data.get("app_key", prof_data["client_id"]),
+                app_id=custom_client_id,
+                app_secret=custom_secret,
+                cert_sha256_hex=str(extra.get("cert_sha256") or ""),
+                app_key=str(extra.get("app_key") or custom_client_id),
                 package=prof_data["package"],
                 app_version=prof_data.get("app_version", "3.1.1"),
-                ttid=f"sdk_international@{prof_data['client_id']}",
+                ttid=f"sdk_international@{custom_client_id}",
                 sdk_version="5.24.0",
                 device_core_version="5.17.0",
                 os_system="14",
@@ -723,17 +639,27 @@ class ProviderAccountSession:
     # --- 2. Blink ---
 
     def _blink_base_url(self) -> str:
-        """Resolve Blink REST endpoint URL from region/tier or host."""
+        """Resolve Blink REST endpoint URL restricted to official Blink domains."""
         cand = (self.host or self.region or "prod").strip().lower()
-        if cand.startswith("http"):
-            return cand.rstrip("/")
-        if "immedia-semi.com" in cand:
-            host_only = cand.lstrip("/")
+        if cand.startswith("http://") or cand.startswith("https://"):
+            parsed = urlsplit(cand)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme == "https" and (
+                host.endswith(".immedia-semi.com") or host.endswith(".blinkforhome.com")
+            ):
+                return f"https://{host}"
+            return "https://rest-prod.immedia-semi.com"
+        if "immedia-semi.com" in cand or "blinkforhome.com" in cand:
+            host_only = cand.lstrip("/").split("/")[0]
             if not host_only.startswith("rest-"):
                 host_only = f"rest-{host_only}"
-            return f"https://{host_only}"
+            if re.fullmatch(r"[a-z0-9.-]+", host_only) and (
+                host_only.endswith(".immedia-semi.com") or host_only.endswith(".blinkforhome.com")
+            ):
+                return f"https://{host_only}"
+            return "https://rest-prod.immedia-semi.com"
         reg = (self.region or "prod").strip().lower()
-        if reg in ("eu", "global", ""):
+        if reg in ("eu", "global", "") or not re.fullmatch(r"[a-z0-9-]+", reg):
             reg = "prod"
         return f"https://rest-{reg}.immedia-semi.com"
 
@@ -871,12 +797,29 @@ class ProviderAccountSession:
     # --- 3. Ezviz ---
 
     def _ezviz_base_url(self) -> str:
-        """Resolve Ezviz API domain for selected region."""
+        """Resolve Ezviz API domain restricted to official Ezviz domains."""
         reg = (self.region or "eu").strip()
-        if reg.startswith("http"):
-            return reg.rstrip("/")
+        if reg.startswith("http://") or reg.startswith("https://"):
+            parsed = urlsplit(reg)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme == "https" and (
+                host == "ezvizlife.com"
+                or host.endswith(".ezvizlife.com")
+                or host == "ezviz.com"
+                or host.endswith(".ezviz.com")
+            ):
+                return f"https://{host}"
+            return EZVIZ_REGIONS["eu"]
         if "." in reg:
-            return f"https://{reg}"
+            host = reg.strip("/").split("/")[0].lower()
+            if re.fullmatch(r"[a-z0-9.-]+", host) and (
+                host == "ezvizlife.com"
+                or host.endswith(".ezvizlife.com")
+                or host == "ezviz.com"
+                or host.endswith(".ezviz.com")
+            ):
+                return f"https://{host}"
+            return EZVIZ_REGIONS["eu"]
         return EZVIZ_REGIONS.get(reg.lower(), EZVIZ_REGIONS["eu"])
 
     async def _login_ezviz(self, sms_code: str = "") -> dict[str, Any]:
@@ -1169,6 +1112,11 @@ class ProviderAccountSession:
         pub_devs = []
         for dev in self.devices:
             d = dict(dev)
+            for secret_key in ("password", "local_key", "verification_code", "access_token", "token", "refresh_token", "cookie", "secret"):
+                d.pop(secret_key, None)
+            for url_key in ("rtsp_url", "stream_url"):
+                if isinstance(d.get(url_key), str) and "://" in d[url_key]:
+                    d[url_key] = re.sub(r"(://)([^/@:\s]+):([^/@\s]+)@", r"\1***:***@", d[url_key])
             did = str(d.get("device_id") or "")
             tdid = str(d.get("tuya_device_id") or "")
             heid = str(d.get("ha_entity_id") or "")

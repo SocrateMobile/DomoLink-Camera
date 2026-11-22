@@ -17,7 +17,7 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 
-from .base import BaseCameraDriver
+from .base import BaseCameraDriver, async_has_ffmpeg
 from ..const import (
     DRIVER_BLINK_HYBRID,
     DRIVER_EZVIZ_HYBRID,
@@ -85,18 +85,13 @@ def extract_tuya_device_id(*values: Any) -> str:
     return ""
 
 
-def _read_local_hybrid_caches_sync(config_dir: str) -> dict[str, Any]:
-    """Read local ARP table, domolink_tuya_oem overrides, and Xiaomi MIoT cache in executor."""
-    caches: dict[str, Any] = {
+def _read_local_arp_cache_sync() -> dict[str, dict[str, str]]:
+    """Read local Linux ARP table (/proc/net/arp) in executor."""
+    caches: dict[str, dict[str, str]] = {
         "arp_mac_to_ip": {},
         "arp_ip_to_mac": {},
-        "tuya_overrides": {},
-        "xiaomi_by_did": {},
-        "xiaomi_by_mac": {},
-        "xiaomi_by_name": {},
     }
 
-    # 1. Linux ARP cache (/proc/net/arp)
     if os.path.isfile("/proc/net/arp"):
         try:
             with open("/proc/net/arp", "r", encoding="utf-8", errors="ignore") as f:
@@ -109,72 +104,6 @@ def _read_local_hybrid_caches_sync(config_dir: str) -> dict[str, Any]:
                     if mac_addr and mac_addr != "00:00:00:00:00:00" and is_private_lan_ip(ip_addr):
                         caches["arp_mac_to_ip"][mac_addr] = ip_addr
                         caches["arp_ip_to_mac"][ip_addr] = mac_addr
-        except Exception:
-            pass
-
-    if not config_dir or not os.path.isdir(config_dir):
-        return caches
-
-    # 2. domolink_tuya_oem overrides store
-    tuya_store = os.path.join(config_dir, ".storage", "domolink_tuya_oem_overrides")
-    if os.path.isfile(tuya_store):
-        try:
-            with open(tuya_store, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            payload = raw.get("data", raw) if isinstance(raw, dict) else {}
-            if isinstance(payload, dict):
-                # Support both direct {dev_id: {...}} and nested {"overrides": {...}}
-                entries = payload.get("overrides") if isinstance(payload.get("overrides"), dict) else payload
-                for dev_id, info in entries.items():
-                    if not isinstance(info, dict):
-                        continue
-                    ip_val = str(info.get("local_ip") or info.get("ip") or "").strip()
-                    mac_val = _normalize_mac(info.get("mac") or info.get("mac_address"))
-                    rtsp_val = str(info.get("rtsp_url") or info.get("stream_url") or "").strip()
-                    caches["tuya_overrides"][str(dev_id)] = {
-                        "local_ip": ip_val if is_private_lan_ip(ip_val) else "",
-                        "mac": mac_val,
-                        "rtsp_url": rtsp_val,
-                        "custom_name": str(info.get("custom_name") or "").strip(),
-                    }
-        except Exception:
-            pass
-
-    # 3. xiaomi_miot local device caches (.storage/xiaomi_miot/devices-*.json)
-    xiaomi_glob = os.path.join(config_dir, ".storage", "xiaomi_miot", "devices-*.json")
-    for xpath in glob.glob(xiaomi_glob):
-        try:
-            with open(xpath, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            items: list[dict[str, Any]] = []
-            if isinstance(raw, dict):
-                if isinstance(raw.get("data"), dict):
-                    items = [v for v in raw["data"].values() if isinstance(v, dict)]
-                else:
-                    items = [v for v in raw.values() if isinstance(v, dict)]
-            elif isinstance(raw, list):
-                items = [v for v in raw if isinstance(v, dict)]
-
-            for item in items:
-                ip_val = str(item.get("localip") or item.get("ip") or "").strip()
-                mac_val = _normalize_mac(item.get("mac"))
-                did_val = str(item.get("did") or "").strip()
-                name_val = str(item.get("name") or "").strip()
-                if not ip_val and mac_val in caches["arp_mac_to_ip"]:
-                    ip_val = caches["arp_mac_to_ip"][mac_val]
-                entry = {
-                    "local_ip": ip_val if is_private_lan_ip(ip_val) else "",
-                    "mac": mac_val,
-                    "did": did_val,
-                    "model": str(item.get("model") or "").strip(),
-                    "name": name_val,
-                }
-                if did_val:
-                    caches["xiaomi_by_did"][did_val] = entry
-                if mac_val:
-                    caches["xiaomi_by_mac"][mac_val] = entry
-                if name_val:
-                    caches["xiaomi_by_name"][_normalize_label(name_val)] = entry
         except Exception:
             pass
 
@@ -403,17 +332,11 @@ class HaProxyDriver(BaseCameraDriver):
         ent_reg_obj = None
         ent_reg_entry = None
         try:
-            if isinstance(getattr(self.hass, "data", None), dict):
-                cand_reg = self.hass.data.get("entity_registry")
-                if cand_reg and hasattr(cand_reg, "async_get"):
-                    ent_reg_obj = cand_reg
-                    ent_reg_entry = cand_reg.async_get(self.entity_id)
-            if ent_reg_entry is None:
-                from homeassistant.helpers import entity_registry as er
-                er_inst = er.async_get(self.hass)
-                if er_inst and hasattr(er_inst, "async_get"):
-                    ent_reg_obj = ent_reg_obj or er_inst
-                    ent_reg_entry = er_inst.async_get(self.entity_id)
+            from homeassistant.helpers import entity_registry as er
+            er_inst = er.async_get(self.hass)
+            if er_inst and hasattr(er_inst, "async_get"):
+                ent_reg_obj = er_inst
+                ent_reg_entry = er_inst.async_get(self.entity_id)
         except Exception:
             ent_reg_entry = None
 
@@ -502,43 +425,11 @@ class HaProxyDriver(BaseCameraDriver):
 
         # 4. Executor local storage & ARP resolution (.storage caches & /proc/net/arp)
         cfg_dir = ""
-        if hasattr(self.hass, "config") and hasattr(self.hass.config, "path"):
+        if callable(getattr(self.hass, "async_add_executor_job", None)) and (
+            (self.mac_address and not self.local_ip) or (self.local_ip and not self.mac_address)
+        ):
             try:
-                p = self.hass.config.path()
-                if isinstance(p, str):
-                    cfg_dir = p
-            except Exception:
-                cfg_dir = ""
-
-        if cfg_dir and callable(getattr(self.hass, "async_add_executor_job", None)):
-            try:
-                caches = await self.hass.async_add_executor_job(_read_local_hybrid_caches_sync, cfg_dir)
-                if self.tuya_device_id and self.tuya_device_id in caches.get("tuya_overrides", {}):
-                    ov = caches["tuya_overrides"][self.tuya_device_id]
-                    if ov.get("local_ip") and not self.local_ip:
-                        self.local_ip = ov["local_ip"]
-                    if ov.get("mac") and not self.mac_address:
-                        self.mac_address = ov["mac"]
-                    if ov.get("rtsp_url") and not self.custom_rtsp_url:
-                        self.custom_rtsp_url = ov["rtsp_url"]
-
-                xm_item = None
-                if xiaomi_did and xiaomi_did in caches.get("xiaomi_by_did", {}):
-                    xm_item = caches["xiaomi_by_did"][xiaomi_did]
-                elif self.mac_address and self.mac_address in caches.get("xiaomi_by_mac", {}):
-                    xm_item = caches["xiaomi_by_mac"][self.mac_address]
-                elif "xiaomi" in self._resolved_platform or "xiaomi" in self.brand.lower():
-                    lbl = _normalize_label(self.config.get("name") or attrs.get("friendly_name"))
-                    if lbl in caches.get("xiaomi_by_name", {}):
-                        xm_item = caches["xiaomi_by_name"][lbl]
-                if xm_item:
-                    if xm_item.get("local_ip") and not self.local_ip:
-                        self.local_ip = xm_item["local_ip"]
-                    if xm_item.get("mac") and not self.mac_address:
-                        self.mac_address = xm_item["mac"]
-                    if xm_item.get("model") and not self.model_id:
-                        self.model_id = xm_item["model"]
-
+                caches = await self.hass.async_add_executor_job(_read_local_arp_cache_sync)
                 if self.mac_address and not self.local_ip:
                     arp_ip = caches.get("arp_mac_to_ip", {}).get(self.mac_address)
                     if arp_ip:
@@ -548,7 +439,7 @@ class HaProxyDriver(BaseCameraDriver):
                     if arp_mac:
                         self.mac_address = arp_mac
             except Exception as err:
-                _LOGGER.debug("[%s] Local cache lookup failed: %s", self.entity_id, err)
+                _LOGGER.debug("[%s] Local ARP lookup failed: %s", self.entity_id, err)
 
         # Persist enriched fields onto config dict so UI and WS expose them
         for field_name, val in (
@@ -772,21 +663,13 @@ class HaProxyDriver(BaseCameraDriver):
             if url:
                 self._stream_url = url
                 return str(url)
-        except Exception:
-            try:
-                camera_comp = getattr(self.hass.components, "camera", None)
-                if camera_comp and hasattr(camera_comp, "async_request_stream"):
-                    url = await camera_comp.async_request_stream(self.entity_id, fmt="hls")
-                    if url:
-                        self._stream_url = url
-                        return str(url)
-            except Exception as err:
-                _LOGGER.debug("[%s] Stream request to HA failed: %s", self.entity_id, err)
+        except Exception as err:
+            _LOGGER.debug("[%s] Stream request to HA failed: %s", self.entity_id, err)
         return None
 
     async def _live_feed_loop(self) -> None:
         """Stream prioritizing direct Local LAN RTSP/FLV, then Cloud direct, then HA HLS and snapshot poll."""
-        has_ffmpeg = bool(shutil.which("ffmpeg"))
+        has_ffmpeg = await async_has_ffmpeg(self.hass)
 
         if has_ffmpeg:
             candidates = await self.async_get_hybrid_stream_candidates()
@@ -910,19 +793,8 @@ class HaProxyDriver(BaseCameraDriver):
                 self.is_connected = True
                 self.status = STATUS_STREAMING if self.is_streaming else STATUS_ONLINE
                 return image.content
-        except Exception:
-            try:
-                camera_comp = getattr(self.hass.components, "camera", None)
-                if camera_comp and hasattr(camera_comp, "async_get_image"):
-                    image = await camera_comp.async_get_image(self.entity_id, timeout=6.0)
-                    if image and getattr(image, "content", None):
-                        self.last_snapshot = image.content
-                        self.last_snapshot_time = time.time()
-                        self.is_connected = True
-                        self.status = STATUS_STREAMING if self.is_streaming else STATUS_ONLINE
-                        return image.content
-            except Exception as err:
-                _LOGGER.debug("[%s] async_get_image failed: %s", self.entity_id, err)
+        except Exception as err:
+            _LOGGER.debug("[%s] async_get_image failed: %s", self.entity_id, err)
 
         # 2. Secondary fallback: direct entity async_camera_image()
         try:
@@ -996,7 +868,7 @@ class HaProxyDriver(BaseCameraDriver):
                     _LOGGER.debug("[%s] Tuya OEM cloud snapshot fallback failed: %s", self.entity_id, err)
 
         # 5. Quinary fallback: direct LAN RTSP snapshot via FFmpeg (skipped on battery cameras)
-        if not self.battery_protected_mode and self.custom_rtsp_url and shutil.which("ffmpeg"):
+        if not self.battery_protected_mode and self.custom_rtsp_url and await async_has_ffmpeg(self.hass):
             try:
                 data = await self.async_capture_ffmpeg_snapshot(self.custom_rtsp_url)
                 if data and len(data) > 100:
@@ -1055,7 +927,6 @@ class HaProxyDriver(BaseCameraDriver):
             "driver_type": self.driver_type,
             "ha_entity": self.entity_id,
             "entity_picture": attrs.get("entity_picture"),
-            "access_token": attrs.get("access_token"),
             "brand": self.brand or attrs.get("brand") or attrs.get("device_brand") or self._effective_brand().capitalize(),
             "model": self.model_id or attrs.get("model_name") or attrs.get("model_id") or attrs.get("device_model") or "Caméra",
             "local_ip": self.local_ip,

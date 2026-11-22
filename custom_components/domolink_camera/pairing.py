@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
@@ -11,7 +12,9 @@ import struct
 import subprocess
 from typing import Any
 import urllib.parse
-import urllib.request
+
+import aiohttp
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     CAMERA_AP_EXCLUDE,
@@ -37,13 +40,40 @@ from .const import (
 from .drivers.ha_proxy import (
     _normalize_label,
     _normalize_mac,
-    _read_local_hybrid_caches_sync,
+    _read_local_arp_cache_sync,
     extract_tuya_device_id,
     is_private_lan_ip,
 )
 
 _LOGGER = logging.getLogger(__name__)
 _RE_CAMERA_UID = re.compile(CAMERA_AP_UID_REGEX, re.IGNORECASE)
+
+
+def _validate_camera_ssid(ssid: str | None) -> str | None:
+    """Validate camera AP SSID before passing to Supervisor or nmcli."""
+    if not ssid or not isinstance(ssid, str):
+        return None
+    cleaned = ssid.strip()
+    if not cleaned or len(cleaned) > 64 or cleaned.startswith("-"):
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in cleaned):
+        return None
+    return cleaned
+
+
+def _validate_private_ap_ip(ip_str: str) -> str:
+    """Validate that camera AP IP is a private RFC1918 IPv4 address."""
+    addr = ipaddress.ip_address((ip_str or "").strip())
+    if (
+        addr.version != 4
+        or not addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_unspecified
+    ):
+        raise ValueError(f"Non-RFC1918 camera AP IP rejected: {ip_str}")
+    return str(addr)
 
 
 def is_camera_ssid(ssid: str) -> bool:
@@ -503,24 +533,22 @@ class WifiPairingEngine:
         try:
             # Query entity registry to resolve integration platform
             ent_map: dict[str, Any] = {}
-            if "entity_registry" in self.hass.data:
-                er = self.hass.data["entity_registry"]
-                if hasattr(er, "entities"):
-                    ent_map = er.entities
-            elif hasattr(self.hass.helpers, "entity_registry"):
-                er = self.hass.helpers.entity_registry.async_get(self.hass)
-                ent_map = er.entities
+            try:
+                from homeassistant.helpers import entity_registry as er
+                er_inst = er.async_get(self.hass)
+                if er_inst and hasattr(er_inst, "entities"):
+                    ent_map = er_inst.entities
+            except Exception:
+                ent_map = {}
 
             all_states = self.hass.states.async_all()
             existing_eids = {s.entity_id for s in all_states if s.entity_id.startswith("camera.")}
 
-            # Optional one-shot local cache & Tuya OEM lookup for richer hybrid discovery
+            # Optional one-shot local ARP lookup for richer hybrid discovery
             local_caches: dict[str, Any] = {}
-            if hasattr(self.hass, "config") and hasattr(self.hass.config, "path"):
+            if callable(getattr(self.hass, "async_add_executor_job", None)):
                 try:
-                    cfg_dir = self.hass.config.path()
-                    if isinstance(cfg_dir, str) and cfg_dir and callable(getattr(self.hass, "async_add_executor_job", None)):
-                        local_caches = await self.hass.async_add_executor_job(_read_local_hybrid_caches_sync, cfg_dir)
+                    local_caches = await self.hass.async_add_executor_job(_read_local_arp_cache_sync)
                 except Exception:
                     local_caches = {}
 
@@ -634,22 +662,8 @@ class WifiPairingEngine:
                     local_ip = local_ip or meta.get("local_ip", "")
                     mac_addr = mac_addr or meta.get("mac_address", "")
                     oem_entity_id = meta.get("tuya_oem_entity_id", "") or (eid if plat_low == "domolink_tuya_oem" else "")
-                    ov = local_caches.get("tuya_overrides", {}).get(tuya_dev_id, {})
-                    local_ip = local_ip or ov.get("local_ip", "")
-                    mac_addr = mac_addr or ov.get("mac", "")
                     if model == "Caméra Détectée" and meta.get("model_id"):
                         model = meta["model_id"]
-
-                if "xiaomi" in plat_low:
-                    xm = (
-                        local_caches.get("xiaomi_by_mac", {}).get(mac_addr)
-                        or local_caches.get("xiaomi_by_name", {}).get(_normalize_label(friendly_name))
-                        or {}
-                    )
-                    local_ip = local_ip or xm.get("local_ip", "")
-                    mac_addr = mac_addr or xm.get("mac", "")
-                    if model == "Caméra Détectée" and xm.get("model"):
-                        model = xm["model"]
 
                 if mac_addr and not local_ip:
                     local_ip = local_caches.get("arp_mac_to_ip", {}).get(mac_addr, "")
@@ -835,12 +849,7 @@ class WifiPairingEngine:
         seen: set[str] = set()
 
         try:
-            # Import aiohttp or use HA helper
-            if hasattr(self.hass.helpers, "aiohttp_client"):
-                session = self.hass.helpers.aiohttp_client.async_get_clientsession(self.hass)
-            else:
-                import aiohttp
-                session = aiohttp.ClientSession()
+            session = async_get_clientsession(self.hass)
 
             headers = {
                 "Authorization": f"Bearer {token}",
@@ -974,47 +983,43 @@ class WifiPairingEngine:
 
     async def _send_http_cgi_wifi_config(self, ip: str, ssid: str, password: str) -> None:
         """Send HTTP CGI Wi-Fi setup queries commonly supported by IP camera chipsets."""
-        def _request_all() -> None:
-            q_ssid = urllib.parse.quote(ssid)
-            q_pwd = urllib.parse.quote(password)
-            endpoints = [
-                f"http://{ip}/set_wifi.cgi?ssid={q_ssid}&pwd={q_pwd}",
-                f"http://{ip}/wifi_set?ssid={q_ssid}&password={q_pwd}",
-                f"http://{ip}/cgi-bin/hi3510/param.cgi?cmd=setwirelessattr&-wf_ssid={q_ssid}&-wf_key={q_pwd}",
-                f"http://{ip}/config?ssid={q_ssid}&pwd={q_pwd}",
-            ]
-            for url in endpoints:
-                try:
-                    req = urllib.request.Request(
-                        url,
-                        headers={"User-Agent": "DomoLink-Camera-Engine"},
-                    )
-                    with urllib.request.urlopen(req, timeout=0.8):
-                        pass
-                except Exception:
-                    pass
-
         try:
-            await self.hass.async_add_executor_job(_request_all)
-        except Exception:
-            pass
+            validated_ip = _validate_private_ap_ip(ip)
+        except ValueError:
+            return
+        q_ssid = urllib.parse.quote(ssid)
+        q_pwd = urllib.parse.quote(password)
+        endpoints = [
+            f"http://{validated_ip}/set_wifi.cgi?ssid={q_ssid}&pwd={q_pwd}",
+            f"http://{validated_ip}/wifi_set?ssid={q_ssid}&password={q_pwd}",
+            f"http://{validated_ip}/cgi-bin/hi3510/param.cgi?cmd=setwirelessattr&-wf_ssid={q_ssid}&-wf_key={q_pwd}",
+            f"http://{validated_ip}/config?ssid={q_ssid}&pwd={q_pwd}",
+        ]
+        session = async_get_clientsession(self.hass)
+        for url in endpoints:
+            try:
+                async with session.get(
+                    url,
+                    headers={"User-Agent": "DomoLink-Camera-Engine"},
+                    timeout=aiohttp.ClientTimeout(total=0.8),
+                ):
+                    pass
+            except Exception:
+                pass
 
     async def _async_bridge_camera_ap(
         self, camera_ssid: str | None, target_ssid: str, target_pass: str, camera_ap_ip: str
     ) -> bool:
         """Attempt autonomous server-side Wi-Fi bridge to camera AP using secondary interface or Supervisor."""
-        if not camera_ssid:
+        safe_ssid = _validate_camera_ssid(camera_ssid)
+        if not safe_ssid:
             return False
 
         # 1. Try Home Assistant OS Supervisor API bridge
         token = os.environ.get("SUPERVISOR_TOKEN")
         if token:
             try:
-                if hasattr(self.hass.helpers, "aiohttp_client"):
-                    session = self.hass.helpers.aiohttp_client.async_get_clientsession(self.hass)
-                else:
-                    import aiohttp
-                    session = aiohttp.ClientSession()
+                session = async_get_clientsession(self.hass)
 
                 headers = {
                     "Authorization": f"Bearer {token}",
@@ -1026,12 +1031,12 @@ class WifiPairingEngine:
                     "wifi": {
                         "mode": "infrastructure",
                         "auth": "open",
-                        "ssid": camera_ssid,
+                        "ssid": safe_ssid,
                     },
                 }
                 async with session.post(update_url, json=body, headers=headers, timeout=8.0) as resp:
                     if resp.status in (200, 201):
-                        self.add_log(f"📶 [SUPERVISOR WLAN] Interface wlan0 connectée à l'AP '{camera_ssid}' !")
+                        self.add_log(f"📶 [SUPERVISOR WLAN] Interface wlan0 connectée à l'AP '{safe_ssid}' !")
                         return True
             except Exception as e:
                 _LOGGER.debug("Supervisor bridge attempt failed: %s", e)
@@ -1055,7 +1060,7 @@ class WifiPairingEngine:
                     return False
 
                 subprocess.run(
-                    ["nmcli", "dev", "wifi", "connect", camera_ssid, "ifname", wlan_dev],
+                    ["nmcli", "dev", "wifi", "connect", "--", safe_ssid, "ifname", wlan_dev],
                     timeout=8,
                     check=True,
                     stdout=subprocess.DEVNULL,
@@ -1084,6 +1089,13 @@ class WifiPairingEngine:
         camera_ssid: str | None = None,
     ) -> dict[str, Any]:
         """Execute autonomous Wi-Fi pairing routine."""
+        try:
+            camera_ap_ip = _validate_private_ap_ip(camera_ap_ip)
+        except ValueError as err:
+            self._is_pairing = False
+            self._current_step = "error"
+            return {"status": "error", "error": str(err)}
+
         self._is_pairing = True
         self._current_step = "sending_credentials"
         self._pairing_log = []

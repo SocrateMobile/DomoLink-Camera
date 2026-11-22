@@ -14,6 +14,13 @@ class DomolinkCameraPanel extends HTMLElement {
       .replace(/'/g, "&#39;");
   }
 
+  _safeSvgLogo(logo) {
+    if (typeof logo === "string" && logo.startsWith("data:image/svg+xml;")) {
+      return logo;
+    }
+    return "";
+  }
+
 
   constructor() {
     super();
@@ -1196,11 +1203,11 @@ class DomolinkCameraPanel extends HTMLElement {
               <span class="driver-badge">${this._escapeHtml(cam.host || cam.driver)}</span>
             </div>
             <div class="lightbox-actions">
-              <button class="btn-secondary btn-fit-toggle" data-cam-id="${cam.id}">
+              <button class="btn-secondary btn-fit-toggle" data-cam-id="${this._escapeHtml(cam.id)}">
                 ${fitMode === "contain" ? "📐 Remplir" : "📐 Entier"}
               </button>
-              ${hasIr ? `<button class="btn-secondary btn-ir-toggle ${cam.night_vision ? "active" : ""}" data-cam-id="${cam.id}">🌙 IR</button>` : ""}
-              <button class="btn-secondary lb-live-btn ${isLive ? "active" : ""}" data-cam-id="${cam.id}">
+              ${hasIr ? `<button class="btn-secondary btn-ir-toggle ${cam.night_vision ? "active" : ""}" data-cam-id="${this._escapeHtml(cam.id)}">🌙 IR</button>` : ""}
+              <button class="btn-secondary lb-live-btn ${isLive ? "active" : ""}" data-cam-id="${this._escapeHtml(cam.id)}">
                 ${isLive ? "🔴 EN DIRECT" : "▶ LIVE"}
               </button>
               <button class="btn-secondary" id="lb-native-fs">⛶ Plein écran</button>
@@ -1648,7 +1655,7 @@ class DomolinkCameraPanel extends HTMLElement {
       });
     } catch (err) {
       console.error("DomoLink-Camera: Erreur QR Code:", err);
-      container.innerHTML = `<div style="color: #ef4444; font-size: 12px; padding: 12px;">Erreur génération QR : ${err.message || err}</div>`;
+      container.innerHTML = `<div style="color: #ef4444; font-size: 12px; padding: 12px;">Erreur génération QR : ${this._escapeHtml(err.message || err)}</div>`;
     }
   }
 
@@ -1661,7 +1668,7 @@ class DomolinkCameraPanel extends HTMLElement {
         this.shadowRoot.innerHTML = `
           <div style="padding: 40px; color: #ef4444; font-family: sans-serif; background: #0d1117; min-height: 100vh;">
             <h2>⚠️ Erreur d'affichage DomoLink Camera</h2>
-            <pre style="background: rgba(0,0,0,0.5); padding: 16px; border-radius: 8px; color: #f87171; white-space: pre-wrap;">${err.stack || err.message || err}</pre>
+            <pre style="background: rgba(0,0,0,0.5); padding: 16px; border-radius: 8px; color: #f87171; white-space: pre-wrap;">${this._escapeHtml(err.stack || err.message || err)}</pre>
             <button id="btn-reload-panel" style="background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; margin-top: 16px;">Réessayer</button>
           </div>
         `;
@@ -3141,10 +3148,10 @@ class DomolinkCameraPanel extends HTMLElement {
                           const isActive = stateVal === "on";
 
                           return `
-                        <div class="entity-badge ${isActive ? "active" : ""}" data-entity-id="${entId}" title="${friendly} (${entId})">
-                          <span class="badge-icon">${icon}</span>
-                          <span class="badge-name">${friendly}</span>
-                          <span class="badge-state">${stateVal} ${unit}</span>
+                        <div class="entity-badge ${isActive ? "active" : ""}" data-entity-id="${this._escapeHtml(entId)}" title="${this._escapeHtml(friendly)} (${this._escapeHtml(entId)})">
+                          <span class="badge-icon">${this._escapeHtml(icon)}</span>
+                          <span class="badge-name">${this._escapeHtml(friendly)}</span>
+                          <span class="badge-state">${this._escapeHtml(stateVal)} ${this._escapeHtml(unit)}</span>
                         </div>
                       `;
                         })
@@ -3190,7 +3197,7 @@ class DomolinkCameraPanel extends HTMLElement {
     if (window.Hls) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const script = document.createElement("script");
-      script.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js";
+      script.src = "/domolink_camera_panel/hls.min.js";
       script.onload = () => resolve();
       script.onerror = () => reject(new Error("Impossible de charger le moteur HLS"));
       document.head.appendChild(script);
@@ -3372,10 +3379,10 @@ class DomolinkCameraPanel extends HTMLElement {
             <div class="box-icon">${boxIcon}</div>
             <div>
               <div class="box-title">
-                ${box.name}
-                <span class="box-badge">${box.badge || "Connecté"}</span>
+                ${this._escapeHtml(box.name)}
+                <span class="box-badge">${this._escapeHtml(box.badge || "Connecté")}</span>
               </div>
-              <div class="box-desc">${box.description}</div>
+              <div class="box-desc">${this._escapeHtml(box.description)}</div>
             </div>
           </div>
           <div style="text-align: right; color: #8b949e; font-size: 13px;">
@@ -3387,8 +3394,8 @@ class DomolinkCameraPanel extends HTMLElement {
         <div class="tv-player-card">
           <div class="tv-player-header">
             <div class="tv-channel-title">
-              ${ch && ch.num ? `<span class="tv-ch-num">CH ${ch.num}</span>` : ""}
-              <span class="tv-ch-name">${ch ? ch.name : "Aucune chaîne sélectionnée"}</span>
+              ${ch && ch.num ? `<span class="tv-ch-num">CH ${this._escapeHtml(ch.num)}</span>` : ""}
+              <span class="tv-ch-name">${ch ? this._escapeHtml(ch.name) : "Aucune chaîne sélectionnée"}</span>
               <span class="tv-live-tag">🔴 EN DIRECT</span>
             </div>
             <div class="tv-header-actions">
@@ -3416,8 +3423,8 @@ class DomolinkCameraPanel extends HTMLElement {
               ${categories
                 .map(
                   (cat) => `
-                <button class="category-pill ${this._tvFilter === cat ? "active" : ""}" data-category="${cat}">
-                  ${cat === "all" ? "Toutes les chaînes" : cat}
+                <button class="category-pill ${this._tvFilter === cat ? "active" : ""}" data-category="${this._escapeHtml(cat)}">
+                  ${cat === "all" ? "Toutes les chaînes" : this._escapeHtml(cat)}
                 </button>
               `
                 )
@@ -3426,7 +3433,7 @@ class DomolinkCameraPanel extends HTMLElement {
 
             <div class="tv-search-box">
               <span class="tv-search-icon">🔍</span>
-              <input type="text" class="tv-search-input" id="tv-search-input" placeholder="Rechercher une chaîne ou un numéro..." value="${this._tvSearch}" />
+              <input type="text" class="tv-search-input" id="tv-search-input" placeholder="Rechercher une chaîne ou un numéro..." value="${this._escapeHtml(this._tvSearch)}" />
             </div>
           </div>
 
@@ -3436,13 +3443,14 @@ class DomolinkCameraPanel extends HTMLElement {
                 ? filteredChannels
                     .map((item) => {
                       const isActive = ch && ch.id === item.id;
+                      const safeLogo = this._safeSvgLogo(item.logo);
                       return `
-                  <div class="channel-card ${isActive ? "active" : ""}" data-channel-id="${item.id}">
+                  <div class="channel-card ${isActive ? "active" : ""}" data-channel-id="${this._escapeHtml(item.id)}">
                     <div class="channel-logo-box">
                       ${
-                        item.logo
-                          ? `<img src="${item.logo}" class="channel-logo-img" alt="${item.name}" onerror="this.onerror=null; this.src='data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20100%2060%22%3E%3Crect%20width%3D%22100%22%20height%3D%2260%22%20rx%3D%2210%22%20fill%3D%22%231e293b%22/%3E%3Ctext%20x%3D%2250%22%20y%3D%2238%22%20fill%3D%22%2360A5FA%22%20font-family%3D%22sans-serif%22%20font-size%3D%2222%22%20font-weight%3D%22800%22%20text-anchor%3D%22middle%22%3E${item.num || "TV"}%3C/text%3E%3C/svg%3E';" />`
-                          : `<span style="font-weight: 800; color: #3b82f6;">${item.num || "TV"}</span>`
+                        safeLogo
+                          ? `<img src="${this._escapeHtml(safeLogo)}" class="channel-logo-img" data-num="${this._escapeHtml(item.num || "TV")}" alt="${this._escapeHtml(item.name)}" />`
+                          : `<span style="font-weight: 800; color: #3b82f6;">${this._escapeHtml(item.num || "TV")}</span>`
                       }
                     </div>
                     <div class="channel-details">
@@ -3999,17 +4007,17 @@ class DomolinkCameraPanel extends HTMLElement {
           <div class="form-grid">
             <div class="form-group">
               <label for="pair-ssid">SSID de votre Box / Routeur Wi-Fi</label>
-              <input type="text" id="pair-ssid" class="form-input" placeholder="Ex: MonReseauWifi" value="${this._pairSsid || ""}" />
+              <input type="text" id="pair-ssid" class="form-input" placeholder="Ex: MonReseauWifi" value="${this._escapeHtml(this._pairSsid || "")}" />
             </div>
 
             <div class="form-group">
               <label for="pair-pass">Mot de passe du Wi-Fi</label>
-              <input type="password" id="pair-pass" class="form-input" placeholder="••••••••" value="${this._pairPass || ""}" />
+              <input type="password" id="pair-pass" class="form-input" placeholder="••••••••" value="${this._escapeHtml(this._pairPass || "")}" />
             </div>
 
             <div class="form-group">
               <label for="pair-ap-ip">IP de la caméra en mode Point d'Accès (Routeur)</label>
-              <input type="text" id="pair-ap-ip" class="form-input" value="${this._pairApIp || "192.168.1.1"}" placeholder="Ex: 192.168.1.1 ou 192.168.10.1" />
+              <input type="text" id="pair-ap-ip" class="form-input" value="${this._escapeHtml(this._pairApIp || "192.168.1.1")}" placeholder="Ex: 192.168.1.1 ou 192.168.10.1" />
             </div>
           </div>
 
@@ -4018,7 +4026,7 @@ class DomolinkCameraPanel extends HTMLElement {
               ? `
             <div style="font-size: 13px; color: #34d399; margin-top: 10px; display: flex; align-items: center; gap: 8px;">
               <span>🎯 Caméra AP sélectionnée :</span>
-              <strong style="background: rgba(16, 185, 129, 0.2); padding: 3px 8px; border-radius: 4px; color: #6ee7b7;">${this._selectedCameraAp}</strong>
+              <strong style="background: rgba(16, 185, 129, 0.2); padding: 3px 8px; border-radius: 4px; color: #6ee7b7;">${this._escapeHtml(this._selectedCameraAp)}</strong>
               <button id="btn-clear-ap-sel" style="background: transparent; border: 1px solid rgba(255,255,255,0.2); color: #94a3b8; border-radius: 4px; padding: 2px 6px; cursor: pointer; font-size: 11px;">✕ Désélectionner</button>
             </div>
           `
@@ -4038,8 +4046,8 @@ class DomolinkCameraPanel extends HTMLElement {
                   .filter((a) => a.is_camera)
                   .map(
                     (ap) => `
-                  <button class="btn-ap-chip" data-ssid="${ap.ssid}" style="background: ${this._selectedCameraAp === ap.ssid ? "#2563eb" : "rgba(15, 23, 42, 0.85)"}; border: 1px solid ${this._selectedCameraAp === ap.ssid ? "#60a5fa" : "#3b82f6"}; color: #fff; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; transition: all 0.2s ease;">
-                    📶 <strong>${ap.ssid}</strong> (${ap.signal}%)
+                  <button class="btn-ap-chip" data-ssid="${this._escapeHtml(ap.ssid)}" style="background: ${this._selectedCameraAp === ap.ssid ? "#2563eb" : "rgba(15, 23, 42, 0.85)"}; border: 1px solid ${this._selectedCameraAp === ap.ssid ? "#60a5fa" : "#3b82f6"}; color: #fff; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; transition: all 0.2s ease;">
+                    📶 <strong>${this._escapeHtml(ap.ssid)}</strong> (${Number(ap.signal) || 0}%)
                   </button>
                 `
                   )
@@ -4079,7 +4087,7 @@ class DomolinkCameraPanel extends HTMLElement {
               <div style="font-size: 12px; color: #475569; margin-bottom: 12px;">Pointez l'objectif de la caméra vers ce code à 15-20 cm</div>
               <div id="camera-qr-container" style="display: flex; justify-content: center; margin: 12px 0; min-height: 200px;"></div>
               <div style="font-size: 11px; color: #334155; font-family: monospace; background: #f1f5f9; padding: 6px; border-radius: 6px; word-break: break-all;">
-                Réseau : <strong>${this._pairSsid || "Non spécifié"}</strong>
+                Réseau : <strong>${this._escapeHtml(this._pairSsid || "Non spécifié")}</strong>
               </div>
             </div>
           `
@@ -4140,16 +4148,16 @@ class DomolinkCameraPanel extends HTMLElement {
                   <div class="discovered-item compatible">
                     <div style="flex: 1;">
                       <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
-                        <span class="badge-protocol badge-green">${dev.protocol || dev.driver}</span>
+                        <span class="badge-protocol badge-green">${this._escapeHtml(dev.protocol || dev.driver)}</span>
                         <strong style="color: #f0f6fc; font-size: 14px;">${this._escapeHtml(dev.name || dev.model)}</strong>
                       </div>
                       <div style="font-size: 12px; color: #8b949e;">
-                        IP: <code style="color: #60a5fa;">${dev.host}${dev.port ? `:${dev.port}` : ""}</code>
+                        IP: <code style="color: #60a5fa;">${this._escapeHtml(dev.host)}${dev.port ? `:${this._escapeHtml(dev.port)}` : ""}</code>
                         ${dev.model ? ` • Modèle : ${this._escapeHtml(dev.model)}` : ""}
                       </div>
                       ${
                         dev.details
-                          ? `<div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">${dev.details}</div>`
+                          ? `<div style="font-size: 11px; color: #94a3b8; margin-top: 4px;">${this._escapeHtml(dev.details)}</div>`
                           : ""
                       }
                     </div>
@@ -4157,7 +4165,7 @@ class DomolinkCameraPanel extends HTMLElement {
                       ${
                         dev.already_added
                           ? `<span class="badge-already-added">✓ Déjà intégrée</span>`
-                          : `<button class="btn-primary btn-add-discovered" data-host="${dev.host}">+ Ajouter à DomoLink</button>`
+                          : `<button class="btn-primary btn-add-discovered" data-host="${this._escapeHtml(dev.host)}">+ Ajouter à DomoLink</button>`
                       }
                     </div>
                   </div>
@@ -4186,13 +4194,13 @@ class DomolinkCameraPanel extends HTMLElement {
                   <div class="discovered-item incompatible">
                     <div style="flex: 1;">
                       <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap;">
-                        <span class="badge-protocol badge-orange">${dev.platform}</span>
-                        <span class="badge-protocol badge-gray">${dev.protocol}</span>
+                        <span class="badge-protocol badge-orange">${this._escapeHtml(dev.platform)}</span>
+                        <span class="badge-protocol badge-gray">${this._escapeHtml(dev.protocol)}</span>
                         <strong style="color: #f0f6fc; font-size: 14px;">${this._escapeHtml(dev.name)}</strong>
                         ${dev.model ? `<span style="font-size: 12px; color: #8b949e;">(${this._escapeHtml(dev.model)})</span>` : ""}
                       </div>
                       <div style="font-size: 12px; color: #8b949e;">
-                        Entité HA: <code style="color: #e2e8f0;">${dev.entity_id || dev.host}</code>
+                        Entité HA: <code style="color: #e2e8f0;">${this._escapeHtml(dev.entity_id || dev.host)}</code>
                       </div>
                       <div class="reason-box">
                         <strong>⚠️ Raison de non-intégration directe :</strong> ${this._escapeHtml(dev.reason)}
@@ -4239,16 +4247,16 @@ class DomolinkCameraPanel extends HTMLElement {
                         (cam) => `
                     <tr>
                       <td>
-                        <input type="text" class="form-input cam-input-name" data-id="${cam.id}" value="${this._escapeHtml(cam.name)}" style="width: 140px;" />
+                        <input type="text" class="form-input cam-input-name" data-id="${this._escapeHtml(cam.id)}" value="${this._escapeHtml(cam.name)}" style="width: 140px;" />
                       </td>
                       <td>
-                        <input type="text" class="form-input cam-input-desc" data-id="${cam.id}" value="${this._escapeHtml(cam.description || "")}" placeholder="Ex: Salon grand angle" style="width: 200px;" />
+                        <input type="text" class="form-input cam-input-desc" data-id="${this._escapeHtml(cam.id)}" value="${this._escapeHtml(cam.description || "")}" placeholder="Ex: Salon grand angle" style="width: 200px;" />
                       </td>
                       <td>
-                        <input type="text" class="form-input cam-input-host" data-id="${cam.id}" value="${this._escapeHtml(cam.host)}" style="width: 130px;" />
+                        <input type="text" class="form-input cam-input-host" data-id="${this._escapeHtml(cam.id)}" value="${this._escapeHtml(cam.host)}" style="width: 130px;" />
                       </td>
                       <td>
-                        <select class="form-select cam-input-driver" data-id="${cam.id}">
+                        <select class="form-select cam-input-driver" data-id="${this._escapeHtml(cam.id)}">
                           <option value="arlo_cloud" ${cam.driver === "arlo_cloud" ? "selected" : ""}>Arlo Cloud Direct</option>
                           <option value="tuya_hybrid" ${cam.driver === "tuya_hybrid" ? "selected" : ""}>Tuya / OEM Hybride (Local + Cloud)</option>
                           <option value="reolink_hybrid" ${cam.driver === "reolink_hybrid" ? "selected" : ""}>Reolink Hybride (LAN + HA)</option>
@@ -4261,19 +4269,19 @@ class DomolinkCameraPanel extends HTMLElement {
                         </select>
                       </td>
                       <td>
-                        <select multiple class="form-select cam-input-entities" data-id="${cam.id}" style="height: 60px; width: 220px; font-size: 11px;">
+                        <select multiple class="form-select cam-input-entities" data-id="${this._escapeHtml(cam.id)}" style="height: 60px; width: 220px; font-size: 11px;">
                           ${this._availableEntities
                             .map((e) => {
                               const isSelected = cam.linked_entities && cam.linked_entities.includes(e.entity_id);
-                              return `<option value="${e.entity_id}" ${isSelected ? "selected" : ""}>${e.name} (${e.entity_id})</option>`;
+                              return `<option value="${this._escapeHtml(e.entity_id)}" ${isSelected ? "selected" : ""}>${this._escapeHtml(e.name)} (${this._escapeHtml(e.entity_id)})</option>`;
                             })
                             .join("")}
                         </select>
                       </td>
                       <td>
                         <div style="display: flex; gap: 8px;">
-                          <button class="btn-primary btn-save-cam" data-id="${cam.id}" title="Enregistrer">💾</button>
-                          <button class="btn-danger btn-del-cam" data-id="${cam.id}" title="Supprimer">🗑️</button>
+                          <button class="btn-primary btn-save-cam" data-id="${this._escapeHtml(cam.id)}" title="Enregistrer">💾</button>
+                          <button class="btn-danger btn-del-cam" data-id="${this._escapeHtml(cam.id)}" title="Supprimer">🗑️</button>
                         </div>
                       </td>
                     </tr>
@@ -4832,13 +4840,14 @@ class DomolinkCameraPanel extends HTMLElement {
         ? filtered
             .map((item) => {
               const isActive = this._selectedChannel && this._selectedChannel.id === item.id;
+              const safeLogo = this._safeSvgLogo(item.logo);
               return `
-            <div class="channel-card ${isActive ? "active" : ""}" data-channel-id="${item.id}">
+            <div class="channel-card ${isActive ? "active" : ""}" data-channel-id="${this._escapeHtml(item.id)}">
               <div class="channel-logo-box">
                 ${
-                  item.logo
-                    ? `<img src="${item.logo}" class="channel-logo-img" alt="${item.name}" onerror="this.onerror=null; this.src='data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20100%2060%22%3E%3Crect%20width%3D%22100%22%20height%3D%2260%22%20rx%3D%2210%22%20fill%3D%22%231e293b%22/%3E%3Ctext%20x%3D%2250%22%20y%3D%2238%22%20fill%3D%22%2360A5FA%22%20font-family%3D%22sans-serif%22%20font-size%3D%2222%22%20font-weight%3D%22800%22%20text-anchor%3D%22middle%22%3E${item.num || "TV"}%3C/text%3E%3C/svg%3E';" />`
-                    : `<span style="font-weight: 800; color: #3b82f6;">${item.num || "TV"}</span>`
+                  safeLogo
+                    ? `<img src="${this._escapeHtml(safeLogo)}" class="channel-logo-img" data-num="${this._escapeHtml(item.num || "TV")}" alt="${this._escapeHtml(item.name)}" />`
+                    : `<span style="font-weight: 800; color: #3b82f6;">${this._escapeHtml(item.num || "TV")}</span>`
                 }
               </div>
               <div class="channel-details">
@@ -4855,6 +4864,16 @@ class DomolinkCameraPanel extends HTMLElement {
   }
 
   _bindChannelCards() {
+    this.shadowRoot.querySelectorAll(".channel-logo-img").forEach((img) => {
+      img.addEventListener(
+        "error",
+        () => {
+          const numText = this._escapeHtml(img.dataset.num || "TV");
+          img.src = `data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%20100%2060%22%3E%3Crect%20width%3D%22100%22%20height%3D%2260%22%20rx%3D%2210%22%20fill%3D%22%231e293b%22/%3E%3Ctext%20x%3D%2250%22%20y%3D%2238%22%20fill%3D%22%2360A5FA%22%20font-family%3D%22sans-serif%22%20font-size%3D%2222%22%20font-weight%3D%22800%22%20text-anchor%3D%22middle%22%3E${encodeURIComponent(numText)}%3C/text%3E%3C/svg%3E`;
+        },
+        { once: true }
+      );
+    });
     const chCards = this.shadowRoot.querySelectorAll(".channel-card");
     chCards.forEach((card) => {
       card.onclick = () => {

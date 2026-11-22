@@ -9,12 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import http.cookiejar
 import json
 import logging
 import os
-import pickle
-import ssl
 import time
 import urllib.parse
 import uuid
@@ -83,115 +80,6 @@ def _clean_arlo_token(raw_token: str) -> str:
     if tok.lower().startswith("bearer "):
         tok = tok[7:].strip()
     return tok
-
-
-def _extract_aarlo_devices_from_pickle(
-    raw_pickle: dict[str, Any], user_id_filter: str = ""
-) -> list[dict[str, Any]]:
-    """Convert .aarlo/aarlo.pickle key-value store into raw HMSWeb-compatible device dicts."""
-    if not isinstance(raw_pickle, dict):
-        return []
-    grouped: dict[str, dict[str, Any]] = {}
-    for key, val in raw_pickle.items():
-        if not isinstance(key, str):
-            continue
-        parts = key.split("/")
-        if len(parts) != 3:
-            continue
-        _, dev_id, prop = parts
-        grouped.setdefault(dev_id, {"deviceId": dev_id})[prop] = val
-
-    devices: list[dict[str, Any]] = []
-    for dev_id, props in grouped.items():
-        if not props.get("deviceType"):
-            continue
-        if user_id_filter and props.get("userId") and str(props["userId"]) != str(user_id_filter):
-            continue
-        raw = {
-            "deviceId": props.get("deviceId") or dev_id,
-            "parentId": props.get("parentId") or dev_id,
-            "deviceType": props.get("deviceType"),
-            "deviceName": props.get("deviceName") or f"Arlo {dev_id}",
-            "modelId": props.get("modelId") or "Arlo",
-            "xCloudId": props.get("xCloudId") or "",
-            "userId": props.get("userId") or "",
-            "uniqueId": props.get("uniqueId") or "",
-            "presignedLastImageUrl": props.get("presignedLastImageUrl") or "",
-            "presignedFullFrameSnapshotUrl": props.get("presignedFullFrameSnapshotUrl") or "",
-            "properties": {
-                "connectionState": props.get("connectionState") or "available",
-                "batteryLevel": props.get("batteryLevel"),
-                "signalStrength": props.get("signalStrength"),
-                "chargingState": props.get("chargingState"),
-                "connectivity": props.get("connectivity"),
-            },
-        }
-        devices.append(raw)
-    return devices
-
-
-def _read_local_aarlo_cache_sync(aarlo_dir: str) -> dict[str, Any]:
-    """Read Home Assistant's local .aarlo directory caches synchronously (executor-only)."""
-    if not aarlo_dir or not isinstance(aarlo_dir, str) or not os.path.isdir(aarlo_dir):
-        return {}
-
-    result: dict[str, Any] = {
-        "sessions": {},
-        "cookies": [],
-        "cookie_header": "",
-        "devices_raw": [],
-    }
-
-    session_path = os.path.join(aarlo_dir, "session.pickle")
-    if os.path.isfile(session_path):
-        try:
-            with open(session_path, "rb") as f:
-                raw_sess = pickle.load(f)
-            if isinstance(raw_sess, dict):
-                for key, val in raw_sess.items():
-                    if isinstance(val, dict) and val.get("token"):
-                        result["sessions"][str(key).strip().lower()] = {
-                            "email": str(key).strip(),
-                            "token": _clean_arlo_token(str(val.get("token") or "")),
-                            "user_id": str(val.get("user_id") or ""),
-                            "expires_in": val.get("expires_in"),
-                            "device_id": str(val.get("device_id") or ""),
-                            "browser_auth_code": str(val.get("browser_auth_code") or ""),
-                        }
-        except Exception as err:
-            _LOGGER.debug("Failed reading .aarlo/session.pickle: %s", err)
-
-    cookies_path = os.path.join(aarlo_dir, "cookies.txt")
-    if os.path.isfile(cookies_path):
-        cookie_pairs: list[str] = []
-        cookie_objs: list[dict[str, Any]] = []
-        try:
-            jar = http.cookiejar.LWPCookieJar(cookies_path)
-            jar.load(ignore_discard=True, ignore_expires=True)
-            for c in jar:
-                cookie_objs.append({
-                    "name": c.name,
-                    "value": c.value,
-                    "domain": c.domain,
-                    "path": c.path,
-                    "secure": bool(c.secure),
-                })
-                cookie_pairs.append(f"{c.name}={c.value}")
-        except Exception as err:
-            _LOGGER.debug("LWPCookieJar parse failed for %s: %s", cookies_path, err)
-        result["cookies"] = cookie_objs
-        result["cookie_header"] = "; ".join(cookie_pairs)
-
-    aarlo_pickle_path = os.path.join(aarlo_dir, "aarlo.pickle")
-    if os.path.isfile(aarlo_pickle_path):
-        try:
-            with open(aarlo_pickle_path, "rb") as f:
-                raw_aarlo = pickle.load(f)
-            result["devices_raw"] = _extract_aarlo_devices_from_pickle(raw_aarlo)
-        except Exception as err:
-            _LOGGER.debug("Failed reading .aarlo/aarlo.pickle: %s", err)
-
-    return result
 
 
 def normalize_arlo_device(
@@ -313,10 +201,7 @@ class ArloCloudAccountSession:
         self._session: aiohttp.ClientSession | None = None
         self._last_device_refresh: float = 0.0
         self._auth_lock = asyncio.Lock()
-        self._aarlo_cache_loaded: bool = False
-        self._aarlo_cookies: list[dict[str, Any]] = []
         self._last_local_uri: dict[str, str] = {}
-        self._adopting_from_aarlo: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize account metadata and persistent token for Home Assistant Store."""
@@ -340,6 +225,8 @@ class ArloCloudAccountSession:
         enriched_devices = []
         for dev in self.devices:
             d_copy = dict(dev)
+            for secret_key in ("password", "local_key", "verification_code", "access_token", "token", "refresh_token", "cookie", "secret"):
+                d_copy.pop(secret_key, None)
             d_copy["already_added"] = str(dev.get("device_id", "")) in configured
             enriched_devices.append(d_copy)
 
@@ -358,15 +245,16 @@ class ArloCloudAccountSession:
         }
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Return isolated per-account aiohttp session with prime256v1 TLS curve."""
+        """Return isolated per-account aiohttp session using HA's non-blocking SSL context."""
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=15.0)
-            ssl_ctx = ssl.create_default_context()
+            ssl_ctx = None
             try:
-                ssl_ctx.set_ecdh_curve("prime256v1")
+                from homeassistant.util.ssl import client_context
+                ssl_ctx = client_context()
             except Exception:
-                pass
-            connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+                ssl_ctx = None
+            connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx is not None else aiohttp.TCPConnector()
             self._session = aiohttp.ClientSession(
                 timeout=timeout,
                 connector=connector,
@@ -382,104 +270,6 @@ class ArloCloudAccountSession:
             except Exception:
                 pass
         self._session = None
-
-    def _resolve_aarlo_dir(self) -> str:
-        """Safely resolve HA .aarlo folder path if available (returns '' in offline mocks)."""
-        if self.hass and hasattr(self.hass, "config") and hasattr(self.hass.config, "path"):
-            try:
-                path_val = self.hass.config.path(".aarlo")
-                if isinstance(path_val, str):
-                    return path_val
-            except Exception:
-                pass
-        return ""
-
-    async def async_load_local_aarlo_cache(self) -> dict[str, Any]:
-        """Load Home Assistant's .aarlo session/cookies/device cache without blocking the event loop."""
-        aarlo_dir = self._resolve_aarlo_dir()
-        if not aarlo_dir:
-            return {}
-        if self.hass and hasattr(self.hass, "async_add_executor_job"):
-            cache = await self.hass.async_add_executor_job(_read_local_aarlo_cache_sync, aarlo_dir)
-        else:
-            cache = await asyncio.to_thread(_read_local_aarlo_cache_sync, aarlo_dir)
-        if cache.get("cookies"):
-            self._aarlo_cookies = list(cache["cookies"])
-        if cache.get("cookie_header") and not self.cookie:
-            self.cookie = str(cache["cookie_header"])
-        self._aarlo_cache_loaded = True
-        return cache
-
-    async def _async_refresh_token_from_aarlo_cache(self) -> bool:
-        """Adopt a fresher token/cookie from .aarlo/session.pickle if available."""
-        cache = await self.async_load_local_aarlo_cache()
-        sessions = cache.get("sessions") or {}
-        if not sessions:
-            return False
-
-        target_email = self.email.strip().lower()
-        sess_info = sessions.get(target_email) if target_email else None
-        if not sess_info and len(sessions) == 1 and not target_email:
-            sess_info = next(iter(sessions.values()))
-        elif not sess_info and self.user_id:
-            for item in sessions.values():
-                if str(item.get("user_id") or "") == self.user_id:
-                    sess_info = item
-                    break
-
-        if not sess_info or not sess_info.get("token"):
-            return False
-
-        new_tok = _clean_arlo_token(str(sess_info["token"]))
-        if not new_tok or new_tok == self.token:
-            return False
-
-        self.token = new_tok
-        if sess_info.get("user_id"):
-            self.user_id = str(sess_info["user_id"])
-        if sess_info.get("email") and not self.email:
-            self.email = str(sess_info["email"])
-        return True
-
-    async def async_try_adopt_local_aarlo_session(self, test_connection: bool = True) -> bool:
-        """Adopt active .aarlo session for this email (prevents single-session kickouts)."""
-        if self._adopting_from_aarlo:
-            return False
-        self._adopting_from_aarlo = True
-        try:
-            cache = await self.async_load_local_aarlo_cache()
-            sessions = cache.get("sessions") or {}
-            if not sessions:
-                return False
-
-            target_email = self.email.strip().lower()
-            sess_info = sessions.get(target_email) if target_email else None
-            if not sess_info and not target_email:
-                # Pick newest valid token in cache
-                for item in sessions.values():
-                    if item.get("token"):
-                        sess_info = item
-                        break
-            if not sess_info or not sess_info.get("token"):
-                return False
-
-            self.token = _clean_arlo_token(str(sess_info["token"]))
-            if sess_info.get("user_id"):
-                self.user_id = str(sess_info["user_id"])
-            if sess_info.get("email") and not self.email:
-                self.email = str(sess_info["email"])
-
-            if not test_connection:
-                self.status = "connected"
-                return True
-
-            await self.async_fetch_devices()
-            return True
-        except Exception as err:
-            _LOGGER.debug("[%s] Could not adopt .aarlo session: %s", self.account_id, err)
-            return False
-        finally:
-            self._adopting_from_aarlo = False
 
     def _mobile_device_headers(self) -> dict[str, str]:
         """Return native Arlo Android app headers extracted from APK v7.5.1."""
@@ -602,10 +392,8 @@ class ArloCloudAccountSession:
     ) -> tuple[int, dict[str, Any], str]:
         """Execute a POST JSON request via Cloudflare-capable backend or aiohttp fallback."""
         if self._session is None and self.hass is not None and hasattr(self.hass, "async_add_executor_job"):
-            if not self._aarlo_cache_loaded:
-                await self.async_load_local_aarlo_cache()
             res = await self.hass.async_add_executor_job(
-                self._sync_http_request, "POST", url, headers, payload, self._aarlo_cookies
+                self._sync_http_request, "POST", url, headers, payload, None
             )
             if res is not None:
                 return res
@@ -624,10 +412,8 @@ class ArloCloudAccountSession:
     ) -> tuple[int, dict[str, Any], str]:
         """Execute a GET JSON request via Cloudflare-capable backend or aiohttp fallback."""
         if self._session is None and self.hass is not None and hasattr(self.hass, "async_add_executor_job"):
-            if not self._aarlo_cache_loaded:
-                await self.async_load_local_aarlo_cache()
             res = await self.hass.async_add_executor_job(
-                self._sync_http_request, "GET", url, headers, None, self._aarlo_cookies
+                self._sync_http_request, "GET", url, headers, None, None
             )
             if res is not None:
                 return res
@@ -659,17 +445,6 @@ class ArloCloudAccountSession:
             return {"status": "error", "error": "Adresse e-mail et mot de passe requis."}
 
         self.last_error = ""
-
-        # Reuse HA's active .aarlo session for the same email if valid, avoiding
-        # Cloudflare challenges on ocapi-app.arlo.com and Arlo single-session kickouts.
-        if await self.async_try_adopt_local_aarlo_session(test_connection=True):
-            return {
-                "status": "connected",
-                "session_id": self.account_id,
-                "email": self.email,
-                "devices": self.devices,
-                "adopted_from_aarlo": True,
-            }
 
         url = f"{ARLO_AUTH_HOST}/api/auth"
         body = {
@@ -892,31 +667,21 @@ class ArloCloudAccountSession:
             status, resp_json, raw_text = await self._get_json(url, self._hmsweb_headers())
 
             if status in (401, 403):
-                # Check if .aarlo already refreshed the single active token on disk
-                if await self._async_refresh_token_from_aarlo_cache():
-                    status, resp_json, raw_text = await self._get_json(url, self._hmsweb_headers())
-
-            if status in (401, 403):
                 self.status = "token_expired"
                 self.last_error = f"Jeton Arlo expiré ou refusé (HTTP {status})."
                 raise RuntimeError(self.last_error)
 
             raw_devices: list[Any] = []
             if status >= 400 or not resp_json.get("success", False):
-                cache = await self.async_load_local_aarlo_cache()
-                fallback_raw = cache.get("devices_raw") or []
-                if fallback_raw:
-                    raw_devices = list(fallback_raw)
-                else:
-                    err = (
-                        resp_json.get("data", {}).get("message")
-                        or resp_json.get("data", {}).get("reason")
-                        or f"HTTP {status}"
-                    )
-                    self.last_error = f"Erreur synchronisation Arlo: {err}"
-                    if not raw_text:
-                        self.last_error = f"Réponse vide d'Arlo (HTTP {status})"
-                    raise RuntimeError(self.last_error)
+                err = (
+                    resp_json.get("data", {}).get("message")
+                    or resp_json.get("data", {}).get("reason")
+                    or f"HTTP {status}"
+                )
+                self.last_error = f"Erreur synchronisation Arlo: {err}"
+                if not raw_text:
+                    self.last_error = f"Réponse vide d'Arlo (HTTP {status})"
+                raise RuntimeError(self.last_error)
             else:
                 raw_devices = resp_json.get("data") or []
 
@@ -1085,10 +850,6 @@ class ArloCloudAccountSession:
             status, resp_json, _ = await self._post_json(
                 url, body, self._hmsweb_headers(target_xcloud)
             )
-            if status in (401, 403) and await self._async_refresh_token_from_aarlo_cache():
-                status, resp_json, _ = await self._post_json(
-                    url, body, self._hmsweb_headers(target_xcloud)
-                )
             if status in (401, 403):
                 self.status = "token_expired"
                 self.last_error = f"Jeton Arlo expiré (HTTP {status})."

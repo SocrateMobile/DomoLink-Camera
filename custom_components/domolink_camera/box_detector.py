@@ -9,9 +9,9 @@ import re
 import socket
 from typing import Any
 import urllib.parse
-import urllib.request
 
 import aiohttp
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,7 +41,6 @@ CHANNEL_SVG_THEMES: dict[str, tuple[str, str, str, str, int]] = {
     "bfmtv": ("#00428A", "#FFFFFF", "BFM", "TV", 22),
     "cnews": ("#1E252B", "#FFFFFF", "CNEWS", "", 18),
     "cstar": ("#111827", "#38BDF8", "C★", "STAR", 22),
-    "gulli": ("#7DBE00", "#FFFFFF", "gulli", "", 24),
     "tf1 séries films": ("#7B2CBF", "#FFFFFF", "TF1", "SÉRIES", 20),
     "l'équipe": ("#ED1C24", "#FFFFFF", "L'EQ", "SPORT", 20),
     "la chaîne l'equipe": ("#ED1C24", "#FFFFFF", "L'EQ", "SPORT", 20),
@@ -273,28 +272,28 @@ class BoxDetectorService:
     async def _probe_freebox(self) -> dict[str, Any] | None:
         """Test if a Freebox is present on the network."""
         urls = [FREEBOX_API_URL, FREEBOX_API_IP]
+        session = async_get_clientsession(self.hass)
         for url in urls:
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=1.5) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            model_name = data.get("box_model_name", "Freebox")
-                            device_type = data.get("device_type", "Freebox Server")
-                            api_ver = data.get("api_version", "")
-                            return {
-                                "brand": "free",
-                                "name": f"Freebox ({model_name})",
-                                "model": model_name,
-                                "device_type": device_type,
-                                "api_version": api_ver,
-                                "multiposte_supported": True,
-                                "has_web_tv": True,
-                                "badge": "Freebox TV Multiposte Actif ⚡",
-                                "description": f"{model_name} détectée avec succès. Accès direct aux flux vidéo Multiposte locaux en qualité maximale.",
-                                "ip": "192.168.1.254",
-                                "m3u_url": FREEBOX_M3U_URL,
-                            }
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=1.5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        model_name = data.get("box_model_name", "Freebox")
+                        device_type = data.get("device_type", "Freebox Server")
+                        api_ver = data.get("api_version", "")
+                        return {
+                            "brand": "free",
+                            "name": f"Freebox ({model_name})",
+                            "model": model_name,
+                            "device_type": device_type,
+                            "api_version": api_ver,
+                            "multiposte_supported": True,
+                            "has_web_tv": True,
+                            "badge": "Freebox TV Multiposte Actif ⚡",
+                            "description": f"{model_name} détectée avec succès. Accès direct aux flux vidéo Multiposte locaux en qualité maximale.",
+                            "ip": "192.168.1.254",
+                            "m3u_url": FREEBOX_M3U_URL,
+                        }
             except Exception:
                 continue
         return None
@@ -302,19 +301,22 @@ class BoxDetectorService:
     async def _probe_livebox(self) -> dict[str, Any] | None:
         """Probe for Orange Livebox."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("http://192.168.1.1/sysbus/NMC:getWANStatus", timeout=0.8) as resp:
-                    if resp.status in (200, 401, 403):
-                        return {
-                            "brand": "orange",
-                            "name": "Orange Livebox",
-                            "model": "Livebox",
-                            "multiposte_supported": False,
-                            "has_web_tv": True,
-                            "badge": "Orange Livebox (TNT Web)",
-                            "description": "Livebox Orange détectée. Accès aux flux TNT Web légaux HD.",
-                            "ip": "192.168.1.1",
-                        }
+            session = async_get_clientsession(self.hass)
+            async with session.get(
+                "http://192.168.1.1/sysbus/NMC:getWANStatus",
+                timeout=aiohttp.ClientTimeout(total=0.8),
+            ) as resp:
+                if resp.status in (200, 401, 403):
+                    return {
+                        "brand": "orange",
+                        "name": "Orange Livebox",
+                        "model": "Livebox",
+                        "multiposte_supported": False,
+                        "has_web_tv": True,
+                        "badge": "Orange Livebox (TNT Web)",
+                        "description": "Livebox Orange détectée. Accès aux flux TNT Web légaux HD.",
+                        "ip": "192.168.1.1",
+                    }
         except Exception:
             pass
         return None
@@ -322,21 +324,24 @@ class BoxDetectorService:
     async def _probe_sfr(self) -> dict[str, Any] | None:
         """Probe for SFR Box."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("http://192.168.1.1/api/1.0/?method=system.getInfo", timeout=0.8) as resp:
-                    if resp.status == 200:
-                        text = await resp.text()
-                        if "sfr" in text.lower() or "neufbox" in text.lower() or "nb6" in text.lower():
-                            return {
-                                "brand": "sfr",
-                                "name": "SFR Box",
-                                "model": "Box SFR / Neufbox",
-                                "multiposte_supported": False,
-                                "has_web_tv": True,
-                                "badge": "Box SFR (TNT Web)",
-                                "description": "Box SFR détectée. Accès au bouquet direct TNT Web HD.",
-                                "ip": "192.168.1.1",
-                            }
+            session = async_get_clientsession(self.hass)
+            async with session.get(
+                "http://192.168.1.1/api/1.0/?method=system.getInfo",
+                timeout=aiohttp.ClientTimeout(total=0.8),
+            ) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    if "sfr" in text.lower() or "neufbox" in text.lower() or "nb6" in text.lower():
+                        return {
+                            "brand": "sfr",
+                            "name": "SFR Box",
+                            "model": "Box SFR / Neufbox",
+                            "multiposte_supported": False,
+                            "has_web_tv": True,
+                            "badge": "Box SFR (TNT Web)",
+                            "description": "Box SFR détectée. Accès au bouquet direct TNT Web HD.",
+                            "ip": "192.168.1.1",
+                        }
         except Exception:
             pass
         return None
@@ -344,19 +349,23 @@ class BoxDetectorService:
     async def _probe_bbox(self) -> dict[str, Any] | None:
         """Probe for Bouygues Bbox."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://mabbox.bytel.fr/api/v1/device", timeout=0.8, ssl=False) as resp:
-                    if resp.status in (200, 401):
-                        return {
-                            "brand": "bouygues",
-                            "name": "Bouygues Bbox",
-                            "model": "Bbox Fibre / ADSL",
-                            "multiposte_supported": False,
-                            "has_web_tv": True,
-                            "badge": "Bouygues Bbox (TNT Web)",
-                            "description": "Bbox détectée. Accès au bouquet TNT Web HD.",
-                            "ip": "192.168.1.254",
-                        }
+            session = async_get_clientsession(self.hass)
+            async with session.get(
+                "https://mabbox.bytel.fr/api/v1/device",
+                timeout=aiohttp.ClientTimeout(total=0.8),
+                ssl=False,
+            ) as resp:
+                if resp.status in (200, 401):
+                    return {
+                        "brand": "bouygues",
+                        "name": "Bouygues Bbox",
+                        "model": "Bbox Fibre / ADSL",
+                        "multiposte_supported": False,
+                        "has_web_tv": True,
+                        "badge": "Bouygues Bbox (TNT Web)",
+                        "description": "Bbox détectée. Accès au bouquet TNT Web HD.",
+                        "ip": "192.168.1.254",
+                    }
         except Exception:
             pass
         return None
@@ -416,19 +425,18 @@ class BoxDetectorService:
 
     async def _fetch_freebox_playlist(self) -> list[dict[str, Any]]:
         """Fetch and parse Freebox TV M3U playlist from local gateway."""
-        def _download_m3u() -> str:
-            req = urllib.request.Request(
-                FREEBOX_M3U_URL,
-                headers={"User-Agent": "DomoLink-Camera/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=4.0) as response:
-                content = response.read()
-                try:
-                    return content.decode("utf-8")
-                except UnicodeDecodeError:
-                    return content.decode("latin-1", errors="replace")
+        session = async_get_clientsession(self.hass)
+        async with session.get(
+            FREEBOX_M3U_URL,
+            headers={"User-Agent": "DomoLink-Camera/1.0"},
+            timeout=aiohttp.ClientTimeout(total=4.0),
+        ) as response:
+            content = await response.read()
+            try:
+                raw_text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                raw_text = content.decode("latin-1", errors="replace")
 
-        raw_text = await self.hass.async_add_executor_job(_download_m3u)
         lines = raw_text.splitlines()
 
         parsed: dict[str, dict[str, Any]] = {}
